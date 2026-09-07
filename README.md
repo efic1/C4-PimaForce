@@ -167,8 +167,6 @@ alarm.
   documentation confirmed the zone-status bit layout, the arm `order` value,
   the real heartbeat cadence and the ACK-without-apply bypass failure mode.
 - PIMA Electronic Systems — the *Force Interface JSON Format Specification*.
-- Konnected's Security System Mirror driver — the reference for Control4's
-  own security proxy behaviour.
 
 ## License
 
