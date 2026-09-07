@@ -1,0 +1,920 @@
+<devicedata>
+	<copyright>Provided as a starting point for Efi's own use - not an official PIMA or Control4 product.</copyright>
+	<manufacturer>PIMA (community driver)</manufacturer>
+	<name>PIMA FORCE Alarm Panel</name>
+	<model>FORCE Series</model>
+	<creator>Community</creator>
+	<created>09/04/2026 00:00</created>
+	<modified>09/07/2026 14:14</modified>
+	<version>29</version>
+	<small>devices_sm/c4.gif</small>
+	<large>devices_lg/c4.gif</large>
+	<control>lua_gen</control>
+	<driver>DriverWorks</driver>
+	<proxies qty="4">
+		<proxy proxybindingid="5001">securitypanel</proxy>
+		<proxy proxybindingid="5002">security</proxy>
+		<proxy proxybindingid="5003">security</proxy>
+		<proxy proxybindingid="5004">security</proxy>
+	</proxies>
+	<capabilities>
+		<can_set_time>false</can_set_time>
+		<can_activate_partitions>false</can_activate_partitions>
+
+		<ui_version>2</ui_version>
+		<has_fire>false</has_fire>
+		<has_medical>false</has_medical>
+		<has_police>false</has_police>
+		<has_panic>false</has_panic>
+		<star_label>*</star_label>
+		<pound_label>#</pound_label>
+		<button_A>
+			<visible>False</visible>
+			<label>A</label>
+		</button_A>
+		<button_B>
+			<visible>False</visible>
+			<label>B</label>
+		</button_B>
+		<button_C>
+			<visible>False</visible>
+			<label>C</label>
+		</button_C>
+		<button_D>
+			<visible>False</visible>
+			<label>D</label>
+		</button_D>
+
+		<arm_states>Away (Full Arm),Stay (Home1),Night (Home2)</arm_states>
+		<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles</functions>
+	</capabilities>
+	<config>
+		<script file="driver.lua"></script>
+		<documentation><![CDATA[
+PIMA FORCE Control4 Integration Driver
+=======================================
+
+Talks the PIMA FORCE panel's local "Force Interface using JSON format 2.4"
+CMS protocol. The PANEL dials OUT to this driver (same model as any
+CMS/monitoring-station receiver) - this driver listens on a TCP port and
+waits for the panel to connect in. There is no "panel IP address" property
+because the driver does not initiate the connection.
+
+Setup on the panel (Installer Code -> System Configuration -> CMS &
+Communication -> Monitoring Station -> CMS2 or CMS3 -> Comm.Paths ->
+Network):
+  - IP/host: this Control4 controller's IP address
+  - Port: must match the "Listen Port" property (default 7780)
+  - Protocol: JSON
+  - Account ID: must match the "Account ID" property
+  - Zone/Output Toggle: ON (required for zone open/close events)
+  - Remote Disarm: ON (required for this driver to disarm)
+
+See the driver's README.md (shipped alongside the source) for the full
+setup walkthrough, property/action/event reference, and a list of what has
+been verified against the vendor protocol spec vs. what to double-check
+against Composer Pro's Lua Output on first deploy.
+
+Change log:
+  v1 - initial version
+]]></documentation>
+		<properties>
+			<property>
+				<name>Listen Port</name>
+				<type>RANGED_INTEGER</type>
+				<minimum>1</minimum>
+				<maximum>65535</maximum>
+				<default>7780</default>
+				<readonly>false</readonly>
+				<description>TCP port this driver listens on for the panel to dial into. Must match the port set in the panel CMS network comm path (Installer Code -&gt; System Configuration -&gt; CMS &amp; Communication -&gt; Monitoring Station -&gt; CMS2/3 -&gt; Comm.Paths -&gt; Network), with Protocol set to JSON.</description>
+			</property>
+			<property>
+				<name>Account ID</name>
+				<type>RANGED_INTEGER</type>
+				<minimum>0</minimum>
+				<maximum>999999</maximum>
+				<default>1234</default>
+				<readonly>false</readonly>
+				<description>Account ID configured on the panel CMS path for this comm path. Use an ID not shared with any other CMS/monitoring-station path on the panel.</description>
+			</property>
+			<property>
+				<name>Partitions Config</name>
+				<type>STRING</type>
+				<default>1,Main,1234,ASN</default>
+				<readonly>false</readonly>
+				<description>One entry per partition, separated by ";": id,name,userCode,modes. modes is any combination of A(way) S(tay/Home1) N(ight/Home2) - Disarm is always allowed. Example: 1,Main,1234,ASN;2,Garage,9876,A</description>
+			</property>
+			<property>
+				<name>Zones Config</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>false</readonly>
+				<description>One entry per zone, separated by ";": zone,name,type,partition. type sets the icon shown in the app only (never affects panel behavior) and is one of: contact, door, window, interior, motion, fire, gas, co, heat, leak/water, smoke, pressure, glass, gate, garage - anything else (including a typo) falls back to contact. partition is optional/informational. Use "Discover Zone Names" (Actions) to pull zone names from the panel, then copy from the Discovered Zones property into this one. Example: 1,Front Door,contact,1;13,Kitchen Smoke,smoke,1</description>
+			</property>
+			<property>
+				<name>Zone Bypass Auto-Clear Minutes</name>
+				<type>RANGED_INTEGER</type>
+				<minimum>0</minimum>
+				<maximum>1440</maximum>
+				<default>30</default>
+				<readonly>false</readonly>
+				<description>When a zone is bypassed via the "Bypass Zone" action, automatically clear the bypass after this many minutes so a forgotten bypass does not leave a detector permanently disabled. 0 disables auto-clear.</description>
+			</property>
+			<property>
+				<name>Zone/User Name Encoding</name>
+				<type>LIST</type>
+				<items>
+					<item>Windows-1255</item>
+					<item>UTF-8</item>
+				</items>
+				<default>Windows-1255</default>
+				<readonly>false</readonly>
+				<description>Text encoding the panel uses for zone/user names returned by "Discover Zone Names". Windows-1255 is correct for Israeli FORCE panels with Hebrew names (the default). Use UTF-8 for English-only/non-Hebrew panels. If discovered names show as garbled text or "?", try switching this.</description>
+			</property>
+			<property>
+				<name>Reverse Zone/User Names</name>
+				<type>LIST</type>
+				<items>
+					<item>Off</item>
+					<item>On</item>
+				</items>
+				<default>Off</default>
+				<readonly>false</readonly>
+				<description>Some panels store names in "visual order" (LCD left-to-right pixel order) rather than logical reading order, which comes out letter-reversed for Hebrew once decoded. Turn On only if names from "Discover Zone Names" come back backwards.</description>
+			</property>
+			<property>
+				<name>Log Level</name>
+				<type>LIST</type>
+				<items>
+					<item>Error</item>
+					<item>Warning</item>
+					<item>Info</item>
+					<item>Debug</item>
+				</items>
+				<default>Info</default>
+				<readonly>false</readonly>
+				<description>How much this driver writes to Composer Pro's Lua Output and Director's log. Error: only things that failed. Warning: also things that look wrong but were handled. Info (default): also connection, arming and event activity. Debug: also a full frame-level trace of everything sent to and received from the panel, and it un-hides the read-only diagnostic properties. User codes are redacted at every level, so traces are safe to share.</description>
+			</property>
+			<property>
+				<name>Non-Bypassable Zones</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>false</readonly>
+				<description>Zones that must NEVER be bypassed, as a comma-separated list of zone NUMBERS and/or type words - for example "smoke,fire" or "13,14". Life-safety detectors (smoke, fire, gas, co, heat) are the usual entries. This is enforced by the driver wherever a bypass comes from: the Functions menu's "Bypass Open Zones" skips these zones and says so, and a bypass requested from the Actions tab or from programming is refused and reported. Clearing a bypass is never blocked, whatever is listed here, so a zone bypassed at the panel keypad can always be restored. It also sets each zone's can_bypass flag in the zone document - note that the Control4 app's Zones screen has no per-zone bypass control to hide or show, so that flag currently changes nothing visible; the enforcement above is the part that matters. Leave empty (the default) to allow every zone to be bypassed.</description>
+			</property>
+			<property>
+				<name>Quiet Zones</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>false</readonly>
+				<description>Zones that should NOT report open/close to the app, as a comma-separated list of zone NUMBERS and/or type words - for example "motion" or "4,12" or "motion,12". The Control4 app builds its History list from the same notifications that drive the live zone list, and the protocol has no way to say "update the status but do not log this", so a house with motion detectors fills History with open/close rows. A quiet zone still appears in the zone list (shown permanently as Normal), still tracks its state internally, and still fires its Control4 programming events, so automations keep working - it just stops pushing updates, which is what stops the History rows. Zone numbers are the reliable form: the app draws motion and interior zones with the same icon, so a type word may not match what Zones Config actually says. On every reload the log states which zones matched, or warns that none did. Leave empty to report every zone.</description>
+			</property>
+			<property>
+				<name>Zone State Reporting</name>
+				<type>LIST</type>
+				<items>
+					<item>Partition + Panel</item>
+					<item>Partition only</item>
+					<item>Panel only</item>
+					<item>Off</item>
+				</items>
+				<default>Partition + Panel</default>
+				<readonly>false</readonly>
+				<description>Which proxy notifications carry live zone open/close. CONFIRMED ON REAL HARDWARE: ZONE_STATE (sent to the partition) drives BOTH the app History rows and the live open/closed indication in the zone list, while PANEL_ZONE_STATE (sent to the panel) drives neither - setting this to "Panel only" produced a clean History and a zone list with no open indication at all. So History noise and live zone status cannot be separated with this setting: they are the same notification. Use "Quiet Zones" instead to silence individual noisy zones while the rest stay live. "Partition only" is the efficient choice (half the proxy traffic, no observed loss); "Panel only" and "Off" both cost you live zone status.</description>
+			</property>
+			<property>
+				<name>Partition Display Text</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>false</readonly>
+				<description>EXPERIMENTAL, and a test you can run in one edit. If the Zones tab in the app shows a bare "UNKNOWN" heading above the zone list, set this to any text (for example "Home") and watch that heading. It sends the partition proxy a DISPLAY_TEXT notification - the one remaining Control4 partition notify whose purpose is putting text on a partition screen, with its call shape copied from Control4's own shipped proxy template. If the heading changes to your text, that was the cause and this property is now the control for it. If the heading still reads UNKNOWN, DISPLAY_TEXT is ruled out and nothing further on the driver side will change that label. Leave empty to send nothing.</description>
+			</property>
+			<property>
+				<name>Link Timeout Seconds</name>
+				<type>RANGED_INTEGER</type>
+				<minimum>0</minimum>
+				<maximum>3600</maximum>
+				<default>600</default>
+				<readonly>false</readonly>
+				<description>Treat the panel as disconnected if nothing at all arrives from it for this many seconds. The panel normally sends traffic (a heartbeat, at minimum) about every 4 minutes, so silence past that means the link is gone - but a socket left half-open (panel powered off, cable pulled, network dropped) never reports a TCP disconnect, and without this the driver would keep reporting Connected forever and no alarm would ever reach Control4. The default of 600 leaves a comfortable margin over the normal ~240s cadence; do not set this below about 300 or ordinary heartbeat gaps risk being flagged as a dropped link. 0 disables the check, which is not recommended.</description>
+			</property>
+			<property>
+				<name>Connection Status</name>
+				<type>STRING</type>
+				<default>Not Connected</default>
+				<readonly>true</readonly>
+				<description>Not Connected / Client Connected (awaiting verification) / Connected.</description>
+			</property>
+			<property>
+				<name>Panel Verified Account</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Account ID the currently-connected panel presented, once verified.</description>
+			</property>
+			<property>
+				<name>Discovered Zones</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Preview of what the "Discover Zone Names" action found. For a long zone list this shows only the first part - the complete list is held in memory and written by the "Apply Discovered Zones" action, which is the intended way to use it. Copying from here by hand is only reliable when no "preview shows N of M" note is present. A discovery does not survive a driver reload; re-run it if you reload before applying.</description>
+			</property>
+			<property>
+				<name>Last Event Type</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Raw CID event type code of the last panel event (Appendix A of the PIMA JSON spec).</description>
+			</property>
+			<property>
+				<name>Last Event Qualifier</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Raw qualifier of the last panel event (1=new/alarm/disarm, 3=restore/arm).</description>
+			</property>
+			<property>
+				<name>Last Event Zone</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Zone field of the last panel event.</description>
+			</property>
+			<property>
+				<name>Last Event Partition</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Partition field of the last panel event.</description>
+			</property>
+			<property>
+				<name>Last Event Summary</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Human-readable summary of the last event this driver did not have a specific mapping for.</description>
+			</property>
+			<property>
+				<name>Last Zone Number</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Zone number from the most recent zone open/close/bypass event.</description>
+			</property>
+			<property>
+				<name>Last Zone Name</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Zone name (from Zones Config) for Last Zone Number.</description>
+			</property>
+			<property>
+				<name>Last Zone Partition</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Partition reported by the panel for the most recent zone event.</description>
+			</property>
+			<property>
+				<name>Last Output Number</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Output number from the most recent output activated/deactivated event.</description>
+			</property>
+			<property>
+				<name>Last NAK Reason</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Reason string from the most recent NAK the panel sent (Appendix D).</description>
+			</property>
+			<property>
+				<name>Recent Activity</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Rolling log of the last 25 security-relevant events (connection changes, arm/disarm, alarms, troubles, command failures), newest first, with timestamps. Deliberately excludes routine zone open/close so arm/disarm/alarm activity is not buried - use the Zones tab or Control4's own History for per-zone traffic. In-memory only: cleared on every driver reload. User codes are redacted.</description>
+			</property>
+			<property>
+				<name>Last Command Result</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Outcome of the most recent arm/disarm/bypass command this driver sent to the panel: whether the panel accepted it, or why it failed (wrong code, no connection, timeout). Check this first when a command appears to do nothing.</description>
+			</property>
+			<property>
+				<name>Last Raw Frame In</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+				<description>Most recent frame received from the panel, re-encoded as JSON. For diagnostics.</description>
+			</property>
+			<property>
+				<name>Driver Version</name>
+				<type>STRING</type>
+				<default></default>
+				<readonly>true</readonly>
+			</property>
+			<property>
+				<name>Partition 1 State</name>
+				<type>STRING</type>
+				<default>Unknown</default>
+				<readonly>true</readonly>
+				<description>Current known state of partition 1: Unknown / Disarmed / Armed Away (Full Arm) / Armed Stay (Home1) / Armed Night (Home2) / Armed / Alarm. Mode names carry both the Control4 term and PIMA's own name for the same mode.</description>
+			</property>
+			<property>
+				<name>Partition 2 State</name>
+				<type>STRING</type>
+				<default>Unknown</default>
+				<readonly>true</readonly>
+				<description>Current known state of partition 2: Unknown / Disarmed / Armed Away (Full Arm) / Armed Stay (Home1) / Armed Night (Home2) / Armed / Alarm. Mode names carry both the Control4 term and PIMA's own name for the same mode.</description>
+			</property>
+			<property>
+				<name>Partition 3 State</name>
+				<type>STRING</type>
+				<default>Unknown</default>
+				<readonly>true</readonly>
+				<description>Current known state of partition 3: Unknown / Disarmed / Armed Away (Full Arm) / Armed Stay (Home1) / Armed Night (Home2) / Armed / Alarm. Mode names carry both the Control4 term and PIMA's own name for the same mode.</description>
+			</property>
+		</properties>
+		<commands>
+			<command>
+				<name>Arm Away (Full Arm)</name>
+				<description>Arm the given partition in Away mode - PIMA calls this Full Arm.</description>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Arm Stay (Home1)</name>
+				<description>Arm the given partition in Stay mode - PIMA calls this Home 1.</description>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Arm Night (Home2)</name>
+				<description>Arm the given partition in Night mode - PIMA calls this Home 2.</description>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Disarm</name>
+				<description>Disarm the given partition.</description>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Bypass Zone</name>
+				<description>Bypass a single zone (parameter 2150). The only way to suppress a 24-hour zone (smoke/flood).</description>
+				<params>
+					<param>
+						<name>ZONE</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>144</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Clear Bypass</name>
+				<description>Clear a zone bypass.</description>
+				<params>
+					<param>
+						<name>ZONE</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>144</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Activate Output</name>
+				<description>Activate a panel output (1=external siren, 2=internal siren, 34-41=controlled outputs 1-8).</description>
+				<params>
+					<param>
+						<name>OUTPUT</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>41</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Deactivate Output</name>
+				<description>Deactivate a panel output.</description>
+				<params>
+					<param>
+						<name>OUTPUT</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>41</maximum>
+					</param>
+				</params>
+			</command>
+			<command>
+				<name>Sync Partition States</name>
+				<description>Ask the panel for the current arm state of every configured partition and update the driver to match. Runs automatically when the panel connects; use this to re-sync without reloading the driver.</description>
+			</command>
+			<command>
+				<name>Discover Zone Names</name>
+				<description>Query the panel for all configured zone names and populate the Discovered Zones property.</description>
+			</command>
+			<command>
+				<name>Apply Discovered Zones</name>
+				<description>Copy the contents of the Discovered Zones property into Zones Config, and push the updated zone list to the Control4 app. Run "Discover Zone Names" first. Zones are assigned to partition 1 by default - edit Zones Config afterwards if a zone belongs elsewhere.</description>
+			</command>
+			<command>
+				<name>Request Zone Status</name>
+				<description>Query current zone status bitfields (parameter 2149) and log a summary.</description>
+			</command>
+			<command>
+				<name>Request Faults</name>
+				<description>Query current system faults (parameter 2250) and log a summary.</description>
+			</command>
+		</commands>
+		<actions>
+			<action>
+				<name>Arm Away (Full Arm)</name>
+				<command>Arm Away (Full Arm)</command>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Arm Stay (Home1)</name>
+				<command>Arm Stay (Home1)</command>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Arm Night (Home2)</name>
+				<command>Arm Night (Home2)</command>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Disarm</name>
+				<command>Disarm</command>
+				<params>
+					<param>
+						<name>PARTITION</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>16</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Bypass Zone</name>
+				<command>Bypass Zone</command>
+				<params>
+					<param>
+						<name>ZONE</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>144</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Clear Bypass</name>
+				<command>Clear Bypass</command>
+				<params>
+					<param>
+						<name>ZONE</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>144</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Activate Output</name>
+				<command>Activate Output</command>
+				<params>
+					<param>
+						<name>OUTPUT</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>41</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Deactivate Output</name>
+				<command>Deactivate Output</command>
+				<params>
+					<param>
+						<name>OUTPUT</name>
+						<type>RANGED_INTEGER</type>
+						<minimum>1</minimum>
+						<maximum>41</maximum>
+					</param>
+				</params>
+			</action>
+			<action>
+				<name>Sync Partition States</name>
+				<command>Sync Partition States</command>
+			</action>
+			<action>
+				<name>Discover Zone Names</name>
+				<command>Discover Zone Names</command>
+			</action>
+			<action>
+				<name>Apply Discovered Zones</name>
+				<command>Apply Discovered Zones</command>
+			</action>
+			<action>
+				<name>Request Zone Status</name>
+				<command>Request Zone Status</command>
+			</action>
+			<action>
+				<name>Request Faults</name>
+				<command>Request Faults</command>
+			</action>
+		</actions>
+	</config>
+	<events>
+		<event>
+			<id>1</id>
+			<name>Partition 1 Armed Away (Full Arm)</name>
+			<description>Partition 1 was armed in Away mode (PIMA: Full Arm).</description>
+		</event>
+		<event>
+			<id>2</id>
+			<name>Partition 1 Armed Stay (Home1)</name>
+			<description>Partition 1 was armed in Stay mode (PIMA: Home 1).</description>
+		</event>
+		<event>
+			<id>3</id>
+			<name>Partition 1 Armed Night (Home2)</name>
+			<description>Partition 1 was armed in Night mode (PIMA: Home 2).</description>
+		</event>
+		<event>
+			<id>4</id>
+			<name>Partition 1 Armed</name>
+			<description>Partition 1 was armed in another mode (Home 3/4, Shabbat) or the mode could not be determined.</description>
+		</event>
+		<event>
+			<id>5</id>
+			<name>Partition 1 Disarmed</name>
+			<description>Partition 1 was disarmed.</description>
+		</event>
+		<event>
+			<id>6</id>
+			<name>Partition 1 Alarm</name>
+			<description>Partition 1 is in burglary alarm.</description>
+		</event>
+		<event>
+			<id>7</id>
+			<name>Partition 1 Alarm Restored</name>
+			<description>Partition 1 burglary alarm restored.</description>
+		</event>
+		<event>
+			<id>8</id>
+			<name>Partition 2 Armed Away (Full Arm)</name>
+			<description>Partition 2 was armed in Away mode (PIMA: Full Arm).</description>
+		</event>
+		<event>
+			<id>9</id>
+			<name>Partition 2 Armed Stay (Home1)</name>
+			<description>Partition 2 was armed in Stay mode (PIMA: Home 1).</description>
+		</event>
+		<event>
+			<id>10</id>
+			<name>Partition 2 Armed Night (Home2)</name>
+			<description>Partition 2 was armed in Night mode (PIMA: Home 2).</description>
+		</event>
+		<event>
+			<id>11</id>
+			<name>Partition 2 Armed</name>
+			<description>Partition 2 was armed in another mode (Home 3/4, Shabbat) or the mode could not be determined.</description>
+		</event>
+		<event>
+			<id>12</id>
+			<name>Partition 2 Disarmed</name>
+			<description>Partition 2 was disarmed.</description>
+		</event>
+		<event>
+			<id>13</id>
+			<name>Partition 2 Alarm</name>
+			<description>Partition 2 is in burglary alarm.</description>
+		</event>
+		<event>
+			<id>14</id>
+			<name>Partition 2 Alarm Restored</name>
+			<description>Partition 2 burglary alarm restored.</description>
+		</event>
+		<event>
+			<id>15</id>
+			<name>Partition 3 Armed Away (Full Arm)</name>
+			<description>Partition 3 was armed in Away mode (PIMA: Full Arm).</description>
+		</event>
+		<event>
+			<id>16</id>
+			<name>Partition 3 Armed Stay (Home1)</name>
+			<description>Partition 3 was armed in Stay mode (PIMA: Home 1).</description>
+		</event>
+		<event>
+			<id>17</id>
+			<name>Partition 3 Armed Night (Home2)</name>
+			<description>Partition 3 was armed in Night mode (PIMA: Home 2).</description>
+		</event>
+		<event>
+			<id>18</id>
+			<name>Partition 3 Armed</name>
+			<description>Partition 3 was armed in another mode (Home 3/4, Shabbat) or the mode could not be determined.</description>
+		</event>
+		<event>
+			<id>19</id>
+			<name>Partition 3 Disarmed</name>
+			<description>Partition 3 was disarmed.</description>
+		</event>
+		<event>
+			<id>20</id>
+			<name>Partition 3 Alarm</name>
+			<description>Partition 3 is in burglary alarm.</description>
+		</event>
+		<event>
+			<id>21</id>
+			<name>Partition 3 Alarm Restored</name>
+			<description>Partition 3 burglary alarm restored.</description>
+		</event>
+		<event>
+			<id>22</id>
+			<name>Zone Opened</name>
+			<description>A zone opened. See Last Zone Number / Last Zone Name.</description>
+		</event>
+		<event>
+			<id>23</id>
+			<name>Zone Closed</name>
+			<description>A zone closed. See Last Zone Number / Last Zone Name.</description>
+		</event>
+		<event>
+			<id>24</id>
+			<name>Zone Bypassed</name>
+			<description>A zone was bypassed (from the keypad or this driver). See Last Zone Number / Last Zone Name.</description>
+		</event>
+		<event>
+			<id>25</id>
+			<name>Zone Bypass Cleared</name>
+			<description>A zone bypass was cleared. See Last Zone Number / Last Zone Name.</description>
+		</event>
+		<event>
+			<id>26</id>
+			<name>Fire Alarm</name>
+			<description>Fire alarm (zone or pull station).</description>
+		</event>
+		<event>
+			<id>27</id>
+			<name>Fire Alarm Restored</name>
+			<description>Fire alarm restored.</description>
+		</event>
+		<event>
+			<id>28</id>
+			<name>Medical Alarm</name>
+			<description>Medical alarm.</description>
+		</event>
+		<event>
+			<id>29</id>
+			<name>Medical Alarm Restored</name>
+			<description>Medical alarm restored.</description>
+		</event>
+		<event>
+			<id>30</id>
+			<name>Panic Alarm</name>
+			<description>Panic alarm (keypad or silent).</description>
+		</event>
+		<event>
+			<id>31</id>
+			<name>Panic Alarm Restored</name>
+			<description>Panic alarm restored.</description>
+		</event>
+		<event>
+			<id>32</id>
+			<name>Duress Alarm</name>
+			<description>Duress code used.</description>
+		</event>
+		<event>
+			<id>33</id>
+			<name>Duress Alarm Restored</name>
+			<description>Duress alarm restored.</description>
+		</event>
+		<event>
+			<id>34</id>
+			<name>Tamper Alarm</name>
+			<description>Panel or zone tamper.</description>
+		</event>
+		<event>
+			<id>35</id>
+			<name>Tamper Restored</name>
+			<description>Tamper restored.</description>
+		</event>
+		<event>
+			<id>36</id>
+			<name>AC Power Lost</name>
+			<description>Panel AC power lost.</description>
+		</event>
+		<event>
+			<id>37</id>
+			<name>AC Power Restored</name>
+			<description>Panel AC power restored.</description>
+		</event>
+		<event>
+			<id>38</id>
+			<name>Low Battery</name>
+			<description>Panel or zone low battery.</description>
+		</event>
+		<event>
+			<id>39</id>
+			<name>Low Battery Restored</name>
+			<description>Low battery restored.</description>
+		</event>
+		<event>
+			<id>40</id>
+			<name>Communication Trouble</name>
+			<description>CMS communication path trouble.</description>
+		</event>
+		<event>
+			<id>41</id>
+			<name>Communication Restored</name>
+			<description>CMS communication path restored.</description>
+		</event>
+		<event>
+			<id>42</id>
+			<name>Output Activated</name>
+			<description>A panel output (e.g. siren) activated. See Last Output Number.</description>
+		</event>
+		<event>
+			<id>43</id>
+			<name>Output Deactivated</name>
+			<description>A panel output deactivated.</description>
+		</event>
+		<event>
+			<id>44</id>
+			<name>Unmapped Panel Event</name>
+			<description>A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.</description>
+		</event>
+	</events>
+	<connections>
+		<connection>
+			<id>5001</id>
+			<facing>6</facing>
+			<connectionname>Security Panel</connectionname>
+			<type>2</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<classname>SECURITY_PANEL</classname>
+				</class>
+			</classes>
+			<hidden>False</hidden>
+		</connection>
+		<connection>
+			<id>5002</id>
+			<facing>6</facing>
+			<connectionname>Security Partition 1</connectionname>
+			<type>2</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<classname>SECURITY</classname>
+				</class>
+			</classes>
+			<hidden>False</hidden>
+		</connection>
+		<connection proxybindingid="5002">
+			<id>7002</id>
+			<facing>6</facing>
+			<connectionname>Room Selection Partition 1</connectionname>
+			<type>7</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<autobind>True</autobind>
+					<classname>SECURITY_SYSTEM</classname>
+				</class>
+			</classes>
+		</connection>
+		<connection>
+			<id>5003</id>
+			<facing>6</facing>
+			<connectionname>Security Partition 2</connectionname>
+			<type>2</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<classname>SECURITY</classname>
+				</class>
+			</classes>
+			<hidden>False</hidden>
+		</connection>
+		<connection proxybindingid="5003">
+			<id>7003</id>
+			<facing>6</facing>
+			<connectionname>Room Selection Partition 2</connectionname>
+			<type>7</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<autobind>True</autobind>
+					<classname>SECURITY_SYSTEM</classname>
+				</class>
+			</classes>
+		</connection>
+		<connection>
+			<id>5004</id>
+			<facing>6</facing>
+			<connectionname>Security Partition 3</connectionname>
+			<type>2</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<classname>SECURITY</classname>
+				</class>
+			</classes>
+			<hidden>False</hidden>
+		</connection>
+		<connection proxybindingid="5004">
+			<id>7004</id>
+			<facing>6</facing>
+			<connectionname>Room Selection Partition 3</connectionname>
+			<type>7</type>
+			<consumer>False</consumer>
+			<audiosource>False</audiosource>
+			<videosource>False</videosource>
+			<linelevel>False</linelevel>
+			<classes>
+				<class>
+					<autobind>True</autobind>
+					<classname>SECURITY_SYSTEM</classname>
+				</class>
+			</classes>
+		</connection>
+	</connections>
+	<search_types>
+		<type></type>
+	</search_types>
+	<composer_categories>
+		<category>Security</category>
+	</composer_categories>
+</devicedata>
