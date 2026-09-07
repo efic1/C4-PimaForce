@@ -67,13 +67,6 @@ fields are UTF-8), so no decoding is applied there.
 
 ## What is verified, and what is not
 
-Originally this driver was written against
-[homebridge-pima-force](https://github.com/electricmonk/homebridge-pima-force)
-and a shipped Control4 security driver, so large parts of the protocol were
-inference. **That is no longer the case**: it has since been checked against
-PIMA's own specification and against a second, physically-validated
-implementation.
-
 [SPEC-VALIDATION.md](SPEC-VALIDATION.md) is the authoritative record. In
 summary:
 
