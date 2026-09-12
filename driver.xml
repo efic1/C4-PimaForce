@@ -5,8 +5,8 @@
 	<model>FORCE Series</model>
 	<creator>Community</creator>
 	<created>09/04/2026 00:00</created>
-	<modified>09/07/2026 14:14</modified>
-	<version>29</version>
+	<modified>09/08/2026 15:50</modified>
+	<version>40</version>
 	<small>devices_sm/c4.gif</small>
 	<large>devices_lg/c4.gif</large>
 	<control>lua_gen</control>
@@ -46,7 +46,7 @@
 		</button_D>
 
 		<arm_states>Away (Full Arm),Stay (Home1),Night (Home2)</arm_states>
-		<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles</functions>
+		<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles,Disable Event Notifications,Enable Event Notifications</functions>
 	</capabilities>
 	<config>
 		<script file="driver.lua"></script>
@@ -187,7 +187,16 @@ Change log:
 				<type>STRING</type>
 				<default></default>
 				<readonly>false</readonly>
-				<description>EXPERIMENTAL, and a test you can run in one edit. If the Zones tab in the app shows a bare "UNKNOWN" heading above the zone list, set this to any text (for example "Home") and watch that heading. It sends the partition proxy a DISPLAY_TEXT notification - the one remaining Control4 partition notify whose purpose is putting text on a partition screen, with its call shape copied from Control4's own shipped proxy template. If the heading changes to your text, that was the cause and this property is now the control for it. If the heading still reads UNKNOWN, DISPLAY_TEXT is ruled out and nothing further on the driver side will change that label. Leave empty to send nothing.</description>
+				<description>Fixed text shown on the partition status line in the app - the line on the Status tab, below the lock indicator. Leave empty for none. The driver appends its own status to this line: "Notifications OFF" while event notifications are muted, and the names of any bypassed zones in that partition. So "Ground floor" here can read "Ground floor | Bypassed: Patio Door" in the app. (Originally added as an experiment against the Zones-tab "UNKNOWN" heading. It does not fill that heading - nothing on the driver side does - it renders on the Status tab instead, which turned out to be the more useful place.)</description>
+			</property>
+			<property>
+				<name>Event Mute Minutes</name>
+				<type>RANGED_INTEGER</type>
+				<minimum>0</minimum>
+				<maximum>1440</maximum>
+				<default>60</default>
+				<readonly>false</readonly>
+				<description>How long "Disable Event Notifications" (Functions menu in the app) stays in effect before the driver re-enables events by itself. A mute that is forgotten on a security system is its own hazard - after this many minutes, programming events and notifications resume automatically. 0 means stay muted until re-enabled by hand, which is not recommended. Muting only stops programming events; live status in the app - armed state, zone open/closed, the shield - is never affected, and while muted the partition status line on the app's Status tab reads "Notifications OFF" so the mute is visible rather than silent.</description>
 			</property>
 			<property>
 				<name>Link Timeout Seconds</name>
@@ -197,6 +206,13 @@ Change log:
 				<default>600</default>
 				<readonly>false</readonly>
 				<description>Treat the panel as disconnected if nothing at all arrives from it for this many seconds. The panel normally sends traffic (a heartbeat, at minimum) about every 4 minutes, so silence past that means the link is gone - but a socket left half-open (panel powered off, cable pulled, network dropped) never reports a TCP disconnect, and without this the driver would keep reporting Connected forever and no alarm would ever reach Control4. The default of 600 leaves a comfortable margin over the normal ~240s cadence; do not set this below about 300 or ordinary heartbeat gaps risk being flagged as a dropped link. 0 disables the check, which is not recommended.</description>
+			</property>
+			<property>
+				<name>Event Notifications</name>
+				<type>STRING</type>
+				<default>Enabled</default>
+				<readonly>true</readonly>
+				<description>Whether the driver is currently firing programming events. Controlled from the app Functions menu (Disable / Enable Event Notifications) and auto-re-enabled after Event Mute Minutes.</description>
 			</property>
 			<property>
 				<name>Connection Status</name>
@@ -452,6 +468,10 @@ Change log:
 				<description>Query current zone status bitfields (parameter 2149) and log a summary.</description>
 			</command>
 			<command>
+				<name>Report Variables</name>
+				<description>Logs every driver variable and its current value, so a notification that came through with empty text can be diagnosed: either the variables exist and hold values, or they do not.</description>
+			</command>
+			<command>
 				<name>Request Faults</name>
 				<description>Query current system faults (parameter 2250) and log a summary.</description>
 			</command>
@@ -570,6 +590,10 @@ Change log:
 				<command>Request Zone Status</command>
 			</action>
 			<action>
+				<name>Report Variables</name>
+				<command>Report Variables</command>
+			</action>
+			<action>
 				<name>Request Faults</name>
 				<command>Request Faults</command>
 			</action>
@@ -683,116 +707,136 @@ Change log:
 		</event>
 		<event>
 			<id>22</id>
+			<name>Any Alarm</name>
+			<description>ANY alarm condition: burglary, fire, medical, panic, duress or tamper, on any partition. Fires alongside the specific event. Use this for a single push-notification script instead of wiring one per alarm type - the ALERT_TYPE and ALERT_TEXT variables say which it was.</description>
+		</event>
+		<event>
+			<id>23</id>
+			<name>Any Trouble</name>
+			<description>ANY system trouble: mains power, battery, communications, or the panel connection being lost. Fires alongside the specific event. ALERT_TYPE and ALERT_TEXT describe it.</description>
+		</event>
+		<event>
+			<id>24</id>
+			<name>Panel Connection Lost</name>
+			<description>The driver can no longer reach the panel - either the socket closed or nothing arrived for Link Timeout Seconds. The system is not being monitored through Control4 until it returns. Worth a notification.</description>
+		</event>
+		<event>
+			<id>25</id>
+			<name>Panel Connection Restored</name>
+			<description>The panel is talking to the driver again.</description>
+		</event>
+		<event>
+			<id>26</id>
 			<name>Zone Opened</name>
 			<description>A zone opened. See Last Zone Number / Last Zone Name.</description>
 		</event>
 		<event>
-			<id>23</id>
+			<id>27</id>
 			<name>Zone Closed</name>
 			<description>A zone closed. See Last Zone Number / Last Zone Name.</description>
 		</event>
 		<event>
-			<id>24</id>
+			<id>28</id>
 			<name>Zone Bypassed</name>
 			<description>A zone was bypassed (from the keypad or this driver). See Last Zone Number / Last Zone Name.</description>
 		</event>
 		<event>
-			<id>25</id>
+			<id>29</id>
 			<name>Zone Bypass Cleared</name>
 			<description>A zone bypass was cleared. See Last Zone Number / Last Zone Name.</description>
 		</event>
 		<event>
-			<id>26</id>
+			<id>30</id>
 			<name>Fire Alarm</name>
 			<description>Fire alarm (zone or pull station).</description>
 		</event>
 		<event>
-			<id>27</id>
+			<id>31</id>
 			<name>Fire Alarm Restored</name>
 			<description>Fire alarm restored.</description>
 		</event>
 		<event>
-			<id>28</id>
+			<id>32</id>
 			<name>Medical Alarm</name>
 			<description>Medical alarm.</description>
 		</event>
 		<event>
-			<id>29</id>
+			<id>33</id>
 			<name>Medical Alarm Restored</name>
 			<description>Medical alarm restored.</description>
 		</event>
 		<event>
-			<id>30</id>
+			<id>34</id>
 			<name>Panic Alarm</name>
 			<description>Panic alarm (keypad or silent).</description>
 		</event>
 		<event>
-			<id>31</id>
+			<id>35</id>
 			<name>Panic Alarm Restored</name>
 			<description>Panic alarm restored.</description>
 		</event>
 		<event>
-			<id>32</id>
+			<id>36</id>
 			<name>Duress Alarm</name>
 			<description>Duress code used.</description>
 		</event>
 		<event>
-			<id>33</id>
+			<id>37</id>
 			<name>Duress Alarm Restored</name>
 			<description>Duress alarm restored.</description>
 		</event>
 		<event>
-			<id>34</id>
+			<id>38</id>
 			<name>Tamper Alarm</name>
 			<description>Panel or zone tamper.</description>
 		</event>
 		<event>
-			<id>35</id>
+			<id>39</id>
 			<name>Tamper Restored</name>
 			<description>Tamper restored.</description>
 		</event>
 		<event>
-			<id>36</id>
+			<id>40</id>
 			<name>AC Power Lost</name>
 			<description>Panel AC power lost.</description>
 		</event>
 		<event>
-			<id>37</id>
+			<id>41</id>
 			<name>AC Power Restored</name>
 			<description>Panel AC power restored.</description>
 		</event>
 		<event>
-			<id>38</id>
+			<id>42</id>
 			<name>Low Battery</name>
 			<description>Panel or zone low battery.</description>
 		</event>
 		<event>
-			<id>39</id>
+			<id>43</id>
 			<name>Low Battery Restored</name>
 			<description>Low battery restored.</description>
 		</event>
 		<event>
-			<id>40</id>
+			<id>44</id>
 			<name>Communication Trouble</name>
 			<description>CMS communication path trouble.</description>
 		</event>
 		<event>
-			<id>41</id>
+			<id>45</id>
 			<name>Communication Restored</name>
 			<description>CMS communication path restored.</description>
 		</event>
 		<event>
-			<id>42</id>
+			<id>46</id>
 			<name>Output Activated</name>
 			<description>A panel output (e.g. siren) activated. See Last Output Number.</description>
 		</event>
 		<event>
-			<id>43</id>
+			<id>47</id>
 			<name>Output Deactivated</name>
 			<description>A panel output deactivated.</description>
 		</event>
 		<event>
-			<id>44</id>
+			<id>48</id>
 			<name>Unmapped Panel Event</name>
 			<description>A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.</description>
 		</event>
