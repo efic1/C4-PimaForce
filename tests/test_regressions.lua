@@ -10,7 +10,11 @@ local calls, timers, timerSeq, now
 local function resetCalls()
   calls = { UpdateProperty = {}, FireEvent = {}, ServerSend = {}, CreateServer = {},
             AddTimer = {}, KillTimer = {}, SendToProxy = {}, DestroyServer = {},
-            SetPropertyAttribs = {} }
+            SetPropertyAttribs = {},
+            -- Blocking-call counters. AddVariable and SetPropertyAttribs are
+            -- Director round trips just like SendToProxy, and the v36 test
+            -- that keeps the driver-load callback fast has to count them.
+            AddVariableSeq = {}, SetPropertyAttribsSeq = {} }
 end
 
 local function mockC4()
@@ -24,6 +28,27 @@ local function mockC4()
     end,
     FireEvent = function(self, name) table.insert(calls.FireEvent, name) end,
     ServerSend = function(self, handle, data) table.insert(calls.ServerSend, { handle, data }) end,
+    -- Driver variables (C4:AddVariable / SetVariable / GetVariable). Kept in
+    -- a plain table so tests can assert on what programming would see.
+    -- Strict on purpose: Director rejects a non-string value with
+    -- "strValue should be a string", and a mock that accepts a Lua boolean
+    -- let v30 ship three variables that could never be written. The mock
+    -- must be at least as strict as the runtime.
+    AddVariable = function(self, name, value, vtype)
+      assert(type(value) == 'string',
+        'C4:AddVariable("' .. tostring(name) .. '") was given a ' ..
+        type(value) .. '; Director requires a string')
+      Variables[name] = value
+      VariableTypes[name] = vtype
+      table.insert(calls.AddVariableSeq, name)
+    end,
+    SetVariable = function(self, name, value)
+      assert(type(value) == 'string',
+        'C4:SetVariable("' .. tostring(name) .. '") was given a ' ..
+        type(value) .. '; Director requires a string')
+      Variables[name] = value
+    end,
+    GetVariable = function(self, name) return Variables[name] end,
     SendToProxy = function(self, id, cmd, params, mode)
       table.insert(calls.SendToProxy, { id, cmd, params, mode })
     end,
@@ -36,12 +61,16 @@ local function mockC4()
     KillTimer = function(self, id) timers[id] = nil; table.insert(calls.KillTimer, id) end,
     SetPropertyAttribs = function(self, name, attrib)
       calls.SetPropertyAttribs[name] = attrib
+      table.insert(calls.SetPropertyAttribsSeq, name)
     end,
     DebugLog = function(self, msg) end,
     GetDriverConfigInfo = function(self, key) return '1.0' end,
     GetTime = function(self) return now end,
   }
 end
+
+Variables = {}
+VariableTypes = {}
 
 local DEFAULT_PROPS = {
   ['Listen Port'] = '7780',
@@ -50,6 +79,7 @@ local DEFAULT_PROPS = {
   ['Zones Config'] = '1,Front Door,contact,1;7,Shed,contact,',
   ['Log Level'] = 'Info',
   ['Link Timeout Seconds'] = '90',
+  ['Event Mute Minutes'] = '60',
   ['Zone Bypass Auto-Clear Minutes'] = '30',
   ['Zone/User Name Encoding'] = 'Windows-1255',
   ['Reverse Zone/User Names'] = 'Off',
@@ -60,9 +90,20 @@ local DEFAULT_PROPS = {
   ['Recent Activity'] = '',
 }
 
+-- Drains the batched zone-publish timer the way Director would. Since v39
+-- NO zone batch runs inline -- the load callback arms the timer and returns
+-- -- so a harness that never fires timers would see an empty zone list.
+local function drainZonePublish()
+  local guard = 0
+  while ZonePublishTimerId and guard < 200 do
+    guard = guard + 1
+    OnTimerExpired(ZonePublishTimerId)
+  end
+end
+
 -- Fresh driver + mock for each test. Returns nothing; all state is global,
 -- matching how DriverWorks actually loads a driver.
-local function freshDriver(overrides)
+local function freshDriver(overrides, keepZoneQueue)
   resetCalls()
   Properties = {}
   for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
@@ -77,8 +118,17 @@ local function freshDriver(overrides)
   -- NOT 1: PIMA's Appendix C reserves 1 for "Partition Not Exist", so using
   -- it here would collide with a real, spec-defined meaning.
   SYSTEM_KEY_DISARMED[97] = true
+  Variables = {}
+  VariableTypes = {}
   OnDriverInit()
   OnDriverLateInit()
+  -- v36: OnDriverLateInit no longer does the Director-facing init work
+  -- inline -- it arms a short timer so Composer is not held for ~20 seconds
+  -- while dozens of blocking round trips run. Fire that timer here so every
+  -- test downstream sees a fully initialised driver, exactly as it did
+  -- before deferral. Tests that care about the deferral itself drive it
+  -- themselves instead of using this helper.
+  if not keepZoneQueue then drainZonePublish() end
 end
 
 -- Bring a verified panel session up on the given handle.
@@ -92,6 +142,7 @@ local function connectPanel(handle, keepSync)
   handle = handle or 1
   OnServerConnectionStatusChanged(handle, 7780, 'ONLINE')
   OnServerDataIn(handle, '{"frame_type":"null","account":"1234","counter":1}', '10.0.0.50', 5555)
+  drainZonePublish()
   if not keepSync then
     ClearInFlight()
     ResetQueueState()
@@ -2291,6 +2342,7 @@ test('a zone that is open or bypassed IS seeded with its status', function()
   -- A change to the inventory forces a republish; the open state must survive it.
   Properties['Zones Config'] = '1,Front Door Renamed,contact,1'
   OnPropertyChanged('Zones Config')
+  drainZonePublish()
   local states = proxyCalls(5002, 'ZONE_STATE')
   assert(#states == 1 and states[1][3].ZONE_OPEN == 'true',
     'a zone that is genuinely open must be stated on republish, got ' .. #states)
@@ -2302,6 +2354,7 @@ test('partition zone lists are cleared before being rebuilt', function()
   -- Zone moves from partition 1 to partition 2.
   Properties['Zones Config'] = '1,Front Door,contact,2'
   OnPropertyChanged('Zones Config')
+  drainZonePublish()
   local cleared = false
   for _, c in ipairs(proxyCalls(5002, 'CLEAR_ZONE_LIST')) do cleared = true end
   assert(cleared, 'the old partition list must be cleared or the zone shows under both')
@@ -2359,8 +2412,10 @@ test('applying the same zone list twice does no work the second time', function(
   for i = 1, 20 do names[i] = 'Zone ' .. i end
   runDiscovery(h, names)
   ExecuteCommand('Apply Discovered Zones', {})
+  drainZonePublish()
   calls.SendToProxy = {}
   ExecuteCommand('Apply Discovered Zones', {})    -- identical list
+  drainZonePublish()
   assert(#proxyCalls(5001, 'PANEL_ZONE_INFO') == 0,
     're-applying an identical list must be a no-op, not a full republish')
 end)
@@ -2370,6 +2425,7 @@ test('a real change still republishes', function()
   calls.SendToProxy = {}
   Properties['Zones Config'] = '1,Front Door,contact,1;2,Back Door,contact,1'
   OnPropertyChanged('Zones Config')
+  drainZonePublish()
   assert(#proxyCalls(5001, 'PANEL_ZONE_INFO') == 2,
     'adding a zone must publish the new list')
 end)
@@ -2378,6 +2434,7 @@ test('an explicit Director query is always answered, even if unchanged', functio
   freshDriver({ ['Zones Config'] = '1,Front Door,contact,1' })
   calls.SendToProxy = {}
   ReceivedFromProxy(5001, 'GET_ALL_ZONE_INFO', {})
+  drainZonePublish()
   assert(#proxyCalls(5001, 'ALL_ZONES_INFO') == 1,
     'a refresh request must be answered regardless of the dedup')
   assert(#proxyCalls(5001, 'PANEL_ZONE_INFO') == 1)
@@ -2387,6 +2444,7 @@ test('publishing a large inventory stays within a sane number of round trips', f
   freshDriver({ ['Zones Config'] = bigZoneConfig(40) })
   calls.SendToProxy = {}
   SendPanelInfo(true)
+  drainZonePublish()
   local n = #calls.SendToProxy
   -- 2 info documents + 1 initialised + 3 clears + 2 per zone.
   assert(n <= 40 * 2 + 10,
@@ -2499,6 +2557,7 @@ test('applying discovered zones fills Zones Config and republishes the list', fu
   runDiscovery(h, { 'Front Door', 'Back Door' })
   calls.SendToProxy = {}
   ExecuteCommand('Apply Discovered Zones', {})
+  drainZonePublish()
   assert(Properties['Zones Config'] == '1,Front Door,contact,1;2,Back Door,contact,1',
     'Zones Config should now hold the discovered list, got: ' .. tostring(Properties['Zones Config']))
   assert(Zones[1] and Zones[1].name == 'Front Door', 'the zones must be parsed into memory')
@@ -2568,6 +2627,7 @@ test('a complete (unshortened) property still applies after a reload', function(
   DiscoveredZonesFull = nil
   Properties['Discovered Zones'] = '1,Front Door,contact,1;2,Back Door,contact,1'
   ExecuteCommand('Apply Discovered Zones', {})
+  drainZonePublish()
   assert(Properties['Zones Config'] == '1,Front Door,contact,1;2,Back Door,contact,1',
     'a short list that was never shortened must still be usable after a reload')
 end)
@@ -2724,14 +2784,24 @@ test('a large zone list does not block the driver-load callback', function()
   -- blocking Director round trips, and they all ran inside OnDriverLateInit
   -- and the Zones Config change handler -- the very callbacks Composer waits
   -- on. The whole-inventory documents stay synchronous; the per-zone traffic
-  -- is drained on a timer.
+  -- is drained on a timer. v13 left the first batch inline as a compromise;
+  -- since v39 not one zone call touches the load callback.
   local zl = {}
   for i = 1, 45 do zl[#zl + 1] = i .. ',Zone ' .. i .. ',contact,1' end
-  freshDriver({ ['Zones Config'] = table.concat(zl, ';') })
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = table.concat(zl, ';')
+  mockC4()
+  dofile('driver.lua')
+  Variables = {}
+  VariableTypes = {}
+  OnDriverInit()
+  OnDriverLateInit()          -- deliberately NOT drained
 
   local zoneCalls = #proxyCalls(nil, 'PANEL_ZONE_INFO') + #proxyCalls(nil, 'HAS_ZONE')
-  assert(zoneCalls <= 2 * ZONE_PUBLISH_BATCH,
-    'the load callback must publish at most one batch inline, sent ' .. zoneCalls)
+  assert(zoneCalls == 0,
+    'no per-zone call may run on the load callback, sent ' .. zoneCalls)
   assert(#proxyCalls(5001, 'ALL_ZONES_INFO') > 0,
     'the zone document itself is two calls and must still go out immediately')
 
@@ -2747,10 +2817,92 @@ test('a large zone list does not block the driver-load callback', function()
     'and the panel proxy, got ' .. #proxyCalls(nil, 'PANEL_ZONE_INFO'))
 end)
 
+test('the driver-load callback stays within its blocking-call budget (v39)', function()
+  -- Init is synchronous on purpose: when OnDriverLateInit returns the driver
+  -- is fully loaded, with no window in which a panel frame interleaves with
+  -- a half-built driver. The cost of that choice is that every call here is
+  -- Composer frozen, so the guard is a BUDGET, not a deferral. v35 was at 55
+  -- on this config, which is the ~50 second freeze. Anything that pushes it
+  -- back up has to earn it.
+  local zl = {}
+  for i = 1, 40 do zl[#zl + 1] = i .. ',Zone ' .. i .. ',contact,1' end
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = table.concat(zl, ';')
+  Properties['Partitions Config'] = '1,Main,1111,ASN'   -- a one-partition house
+  mockC4()
+  dofile('driver.lua')
+  Variables = {}
+  VariableTypes = {}
+  OnDriverInit()
+
+  resetCalls()
+  OnDriverLateInit()
+  local blocking = #calls.SendToProxy + #calls.AddVariableSeq
+    + #calls.SetPropertyAttribsSeq + #calls.UpdateProperty
+  assert(blocking <= 40,
+    'the load callback made ' .. blocking .. ' blocking Director calls ' ..
+    '(budget 40; v35 was 55, v39 is 36). Every one is Composer frozen on every driver update. ' ..
+    'Cut calls -- do not move them onto a timer: v36 did that and v38 had ' ..
+    'to patch two races it created.')
+
+  -- And the driver must be genuinely complete when the callback returns.
+  assert(next(Variables) ~= nil, 'variables must exist synchronously')
+  assert(#proxyCalls(5002, 'PARTITION_ENABLED') > 0,
+    'partition proxies must be enabled synchronously')
+  assert(#proxyCalls(5002, 'PARTITION_STATE_INIT') > 0,
+    'partition state must be seeded synchronously')
+end)
+
+test('partition variables are declared only for configured partitions', function()
+  -- Declaring all MAX_DECLARED_PARTITIONS cost a one-partition house four
+  -- extra AddVariable round trips at every load, to create variables for
+  -- partitions that do not exist -- and offered them in Composer's
+  -- programming picker as though they did.
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  assert(Variables['PARTITION_1_STATE'] ~= nil, 'partition 1 is configured')
+  assert(Variables['PARTITION_2_STATE'] == nil,
+    'partition 2 is not configured and must not get variables')
+  assert(Variables['PARTITION_3_ARMED'] == nil)
+end)
+
+test('an init phase that throws does not strand the phases after it', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  mockC4()
+  dofile('driver.lua')
+  Variables = {}
+  VariableTypes = {}
+  OnDriverInit()
+
+  local realApply = ApplyPropertyVisibility
+  ApplyPropertyVisibility = function() error('deliberate') end
+  local ok = pcall(OnDriverLateInit)
+  ApplyPropertyVisibility = realApply
+  assert(ok, 'a throwing phase must not propagate out of the load callback')
+  assert(#proxyCalls(5002, 'PARTITION_ENABLED') > 0,
+    'a later phase must still run -- a driver whose partition proxies were ' ..
+    'never enabled is unusable, and it must not depend on a cosmetic phase')
+end)
+
+test('init timing is reported on every load', function()
+  -- The "0.4s per Director round trip" this project has optimised against
+  -- came from one v13 observation and was extrapolated across five
+  -- versions. This line replaces the estimate with a measurement.
+  local logged = withCapturedLogs(function()
+    freshDriver()
+  end)
+  assert(table.concat(logged, '\n'):find('init timing:', 1, true),
+    'every load must report where its time went')
+end)
+
+
 test('PANEL_INITIALIZED is sent only after the last zone', function()
   local zl = {}
   for i = 1, 45 do zl[#zl + 1] = i .. ',Zone ' .. i .. ',contact,1' end
-  freshDriver({ ['Zones Config'] = table.concat(zl, ';') })
+  freshDriver({ ['Zones Config'] = table.concat(zl, ';') }, true)
   assert(#proxyCalls(nil, 'PANEL_INITIALIZED') == 0,
     'announcing the panel ready with two thirds of its zones unpublished tells ' ..
     'Navigator to render a list that is still being built')
@@ -2767,7 +2919,7 @@ end)
 test('a second publish replaces the pending one instead of interleaving', function()
   local zl = {}
   for i = 1, 45 do zl[#zl + 1] = i .. ',Zone ' .. i .. ',contact,1' end
-  freshDriver({ ['Zones Config'] = table.concat(zl, ';') })
+  freshDriver({ ['Zones Config'] = table.concat(zl, ';') }, true)
   local firstTimer = ZonePublishTimerId
   assert(firstTimer, 'precondition: a drain must be pending')
 
@@ -3209,6 +3361,582 @@ test('a bypass whose read-back never answers is reported as unverified, not as s
     Properties['Last Command Result'])
 end)
 
+test('routine panel housekeeping fires no programming event (v34)', function()
+  -- A periodic test arriving on the panel's own schedule used to fire
+  -- Unmapped Panel Event, which looks exactly like an event with no fault
+  -- behind it to anyone with a notification wired to it.
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  for _, cid in ipairs({602, 601, 305, 625, 306, 412}) do
+    OnServerDataIn(h, string.format(
+      '{"frame_type":"event","counter":%d,"account":"1234","type":%d,"qualifier":1,"zone":0,"partition":1}',
+      900 + cid, cid), '10.0.0.50', 5555)
+  end
+  assert(#calls.FireEvent == 0,
+    'routine housekeeping must raise nothing, got ' .. #calls.FireEvent .. ' events')
+  assert(Properties['Last Event Summary']:find('CID'),
+    'but must still be visible: ' .. tostring(Properties['Last Event Summary']))
+end)
+
+test('a genuinely unrecognised event still fires Unmapped Panel Event', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":950,"account":"1234","type":999,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['Unmapped Panel Event'], 'something truly unknown must still surface')
+end)
+
+test('a replayed event after a reconnect does not re-fire the alarm (v33)', function()
+  -- The panel buffers events and reports them once a connection is up, so a
+  -- reconnect replays what it already sent. Through v32 the dedupe was one
+  -- slot cleared on every connect, which turned that replay into fresh alarm
+  -- notifications for things that had already happened.
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  local ev = '{"frame_type":"event","counter":80,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}'
+  OnServerDataIn(h, ev, '10.0.0.50', 5555)
+  local firstCount = #calls.FireEvent
+  assert(firstCount > 0, 'setup: the real alarm must fire')
+  -- Panel drops and comes back, then replays its buffer.
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  local h2 = connectPanel(2)
+  calls.FireEvent = {}
+  OnServerDataIn(h2, ev, '10.0.0.50', 5555)
+  assert(#calls.FireEvent == 0,
+    'a replayed event must not fire again, got ' .. #calls.FireEvent .. ' events')
+end)
+
+test('a retransmit that arrives after another event is still suppressed (v33)', function()
+  -- Single-slot dedupe only caught back-to-back repeats; anything in between
+  -- and the retransmit was dispatched again.
+  freshDriver({ ['Zones Config'] = '5,Smoke,smoke,1;6,Door,contact,1' })
+  local h = connectPanel()
+  local alarm = '{"frame_type":"event","counter":81,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}'
+  local other = '{"frame_type":"event","counter":82,"account":"1234","type":760,"qualifier":1,"zone":6,"partition":1}'
+  OnServerDataIn(h, alarm, '10.0.0.50', 5555)
+  OnServerDataIn(h, other, '10.0.0.50', 5555)
+  calls.FireEvent = {}
+  OnServerDataIn(h, alarm, '10.0.0.50', 5555)   -- panel retransmits the alarm
+  assert(#calls.FireEvent == 0,
+    'an interleaved retransmit must still be suppressed, got ' .. #calls.FireEvent)
+end)
+
+test('a genuinely new alarm is never swallowed by the dedupe (v33)', function()
+  -- The guard that makes the above safe: anything different is still new.
+  freshDriver({ ['Zones Config'] = '5,Smoke,smoke,1' })
+  local h = connectPanel()
+  OnServerDataIn(h, '{"frame_type":"event","counter":83,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  calls.FireEvent = {}
+  -- Same alarm, different counter: a second real occurrence.
+  OnServerDataIn(h, '{"frame_type":"event","counter":84,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['Fire Alarm'], 'a new occurrence must still fire')
+end)
+
+test('the dedupe window expires so an old key cannot suppress forever', function()
+  freshDriver({ ['Zones Config'] = '5,Smoke,smoke,1' })
+  local h = connectPanel()
+  local ev = '{"frame_type":"event","counter":85,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}'
+  OnServerDataIn(h, ev, '10.0.0.50', 5555)
+  advanceClock(EVENT_DEDUPE_WINDOW_MS + 1000)
+  calls.FireEvent = {}
+  OnServerDataIn(h, ev, '10.0.0.50', 5555)
+  assert(#calls.FireEvent > 0, 'past the window the same key must be treated as new')
+end)
+
+test('the dedupe set stays bounded', function()
+  freshDriver()
+  connectPanel()
+  for i = 1, EVENT_DEDUPE_MAX + 50 do AlreadySeenEvent('key' .. i) end
+  assert(#SeenEventOrder <= EVENT_DEDUPE_MAX,
+    'the set must stay bounded, got ' .. #SeenEventOrder)
+end)
+
+test('a trouble RESTORE does not fire Any Trouble (v32)', function()
+  -- v30 fired it on both edges, so every mains flicker was two
+  -- notifications. Alarms were already scoped to the new condition only.
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":70,"account":"1234","type":301,"qualifier":3,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['AC Power Restored'], 'the specific restore event must still fire')
+  assert(not fired['Any Trouble'], 'a restore must not raise the trouble hook')
+end)
+
+test('no driver variable collides with a name the proxy already declares (v35)', function()
+  -- v32 added TROUBLE_TYPE/TROUBLE_TEXT as driver variables, but the security
+  -- panel proxy already declares TROUBLE_TYPE -- Composer then showed two
+  -- entries with the same name and no way to tell them apart.
+  freshDriver()
+  local reserved = { TROUBLE_TYPE = true, TROUBLE_TEXT = true, ARM_STATE = true }
+  for _, name in ipairs(DriverVariableNames) do
+    assert(not reserved[name],
+      'driver variable "' .. name .. '" collides with a proxy-declared name')
+  end
+end)
+
+test('each trouble gets its own identifier so one cannot clear another (v35)', function()
+  -- All troubles were sent with IDENTIFIER = 0, so with mains power and low
+  -- battery both active, clearing either cleared the proxy's single id-0
+  -- trouble and the other silently vanished while still being real.
+  freshDriver()
+  connectPanel()
+  calls.SendToProxy = {}
+  NotifyProxyTrouble('AC power lost', true)
+  NotifyProxyTrouble('Low battery', true)
+  local ids = {}
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[2] == 'TROUBLE_START' then ids[#ids + 1] = c[3].IDENTIFIER end
+  end
+  assert(#ids == 2, 'both troubles must be sent')
+  assert(ids[1] ~= ids[2], 'they must not share an identifier, both were ' .. tostring(ids[1]))
+end)
+
+test('TROUBLE_CLEAR carries the identifier, matching the reference driver', function()
+  freshDriver()
+  connectPanel()
+  NotifyProxyTrouble('AC power lost', true)
+  calls.SendToProxy = {}
+  NotifyProxyTrouble('AC power lost', false)
+  local cleared
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[2] == 'TROUBLE_CLEAR' then cleared = c[3] end
+  end
+  assert(cleared, 'a clear must be sent')
+  assert(cleared.IDENTIFIER == TROUBLE_IDENTIFIERS['AC power lost'],
+    'the clear must name the same identifier as the start')
+end)
+
+test('an unlisted trouble gets its own slot rather than colliding on 0', function()
+  freshDriver()
+  local a = TroubleIdentifier('something new')
+  local b = TroubleIdentifier('something else new')
+  assert(a ~= b and a ~= 0 and b ~= 0, 'unlisted troubles must not share 0')
+  assert(TroubleIdentifier('something new') == a, 'and must be stable per text')
+end)
+
+test('a trouble sets LAST_TROUBLE_TYPE and LAST_TROUBLE_TEXT as well as ALERT_* (v35)', function()
+  -- These were the names being referenced in notification text and had never
+  -- been created, so they could only ever resolve empty.
+  freshDriver()
+  local h = connectPanel()
+  OnServerDataIn(h, '{"frame_type":"event","counter":71,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power', 'got ' .. tostring(Variables['LAST_TROUBLE_TYPE']))
+  assert(Variables['LAST_TROUBLE_TEXT'] == 'Mains power lost', 'got ' .. tostring(Variables['LAST_TROUBLE_TEXT']))
+  assert(Variables['ALERT_TYPE'] == 'AC Power', 'ALERT_* must still be set too')
+end)
+
+test('an alarm does not overwrite the last trouble, and vice versa', function()
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  OnServerDataIn(h, '{"frame_type":"event","counter":72,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  OnServerDataIn(h, '{"frame_type":"event","counter":73,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(Variables['ALERT_TYPE'] == 'Fire', 'ALERT_* tracks the most recent event')
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power',
+    'LAST_TROUBLE_* must survive a later alarm, got ' .. tostring(Variables['LAST_TROUBLE_TYPE']))
+end)
+
+test('an alert is never published with empty text (v32)', function()
+  -- A notification that says something happened but not what is worse than
+  -- none at all.
+  freshDriver()
+  connectPanel()
+  FireAlert(nil, nil)
+  assert(Variables['ALERT_TYPE'] ~= '' and Variables['ALERT_TYPE'] ~= nil,
+    'ALERT_TYPE must never be blank')
+  assert(Variables['ALERT_TEXT'] ~= '' and Variables['ALERT_TEXT'] ~= nil,
+    'ALERT_TEXT must never be blank')
+  FireTrouble('', '')
+  assert(Variables['ALERT_TEXT'] ~= '', 'nor for troubles')
+end)
+
+test('a variable that cannot be created is reported loudly, not swallowed (v32)', function()
+  -- The original symptom: notification text resolved empty and the log said
+  -- nothing, because the failure was pcall-ed and logged at Debug only.
+  local logged = withCapturedLogs(function()
+    local realAdd = C4.AddVariable
+    C4.AddVariable = function() error('simulated failure') end
+    DriverVariablesReady = false
+    DeclareDriverVariables()
+    C4.AddVariable = realAdd
+  end)
+  local text = table.concat(logged, '\n')
+  assert(text:find('Could not create'), 'the failure must be reported: ' .. text)
+  assert(text:find('EMPTY'), 'and must explain the symptom it causes')
+end)
+
+test('Report Variables reads every variable back', function()
+  freshDriver()
+  local logged = withCapturedLogs(function() ReportDriverVariables() end)
+  local text = table.concat(logged, '\n')
+  assert(text:find('ALERT_TEXT') and text:find('LAST_TROUBLE_TYPE'),
+    'the readback must name each variable: ' .. text)
+end)
+
+test('Disable Event Notifications stops programming events firing (v31)', function()
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":60,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(#calls.FireEvent == 0,
+    'no programming event may fire while muted, got ' .. #calls.FireEvent)
+end)
+
+test('muting does NOT stop live state reaching the app (v31)', function()
+  -- The whole point: silence the notification, never the alarm display.
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  calls.SendToProxy = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":61,"account":"1234","type":130,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  local sawAlarm = false
+  for _, c in ipairs(calls.SendToProxy) do
+    if type(c[3]) == 'table' and tostring(c[3].STATE or ''):find('ALARM') then sawAlarm = true end
+  end
+  assert(sawAlarm, 'the partition must still be published as in alarm while muted')
+end)
+
+test('Enable Event Notifications restores firing', function()
+  freshDriver()
+  local h = connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  ExecutePartitionFunction(1, 'Enable Event Notifications')
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":62,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(#calls.FireEvent > 0, 'events must fire again once re-enabled')
+end)
+
+test('muting shows on the partition status line, and clears (v37)', function()
+  -- v31 indicated the mute by raising a standing panel trouble. That put a
+  -- fault on a panel that has none, and since v35 gave troubles stable
+  -- identifiers it also took a slot in a list meant for real conditions.
+  -- The status line is the honest place for "the driver is deliberately
+  -- quiet", and it is where the user is already looking.
+  freshDriver()
+  connectPanel()
+  calls.SendToProxy = {}
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+
+  local muted = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#muted > 0 and tostring(muted[#muted][3]):find('Notifications OFF'),
+    'the mute must be stated on the status line, got: ' ..
+    tostring(#muted > 0 and muted[#muted][3] or '(nothing sent)'))
+  for _, c in ipairs(calls.SendToProxy) do
+    assert(c[2] ~= 'TROUBLE_START',
+      'muting must not fabricate a panel trouble; the panel has no fault')
+  end
+
+  calls.SendToProxy = {}
+  ExecutePartitionFunction(1, 'Enable Event Notifications')
+  local back = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#back > 0 and not tostring(back[#back][3]):find('Notifications OFF'),
+    'the line must clear on re-enable, got: ' ..
+    tostring(#back > 0 and back[#back][3] or '(nothing sent)'))
+end)
+
+test('re-enabling still clears a v31-v36 mute trouble left by an upgrade', function()
+  -- A driver updated from one of those versions while muted would otherwise
+  -- leave a phantom trouble in the app with nothing left to clear it.
+  freshDriver()
+  connectPanel()
+  calls.SendToProxy = {}
+  SetEventsEnabled(true, 'test')
+  local cleared = false
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[2] == 'TROUBLE_CLEAR' then cleared = true end
+  end
+  assert(cleared, 'the legacy trouble clear must still be sent')
+end)
+
+test('bypassed zones are named on the partition status line (v37)', function()
+  freshDriver({ ['Zones Config'] = '1,Front Door,contact,1;7,Patio,contact,1' })
+  connectPanel()
+  calls.SendToProxy = {}
+  NotifyProxyZoneState(7, nil, true, 1)
+  local sent = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#sent > 0 and tostring(sent[#sent][3]):find('Patio'),
+    'a bypassed zone must be named on the status line, got: ' ..
+    tostring(#sent > 0 and sent[#sent][3] or '(nothing sent)'))
+
+  calls.SendToProxy = {}
+  NotifyProxyZoneState(7, nil, false, 1)
+  local cleared = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#cleared > 0 and not tostring(cleared[#cleared][3]):find('Patio'),
+    'clearing the bypass must clear the line -- leaving it would be a false ' ..
+    'statement about a security system')
+end)
+
+test('a bypassed QUIET zone is still named on the status line', function()
+  -- Quiet Zones silences open/close chatter. A bypass is a disabled
+  -- detector, which is not chatter, and hiding it was never the intent.
+  freshDriver({
+    ['Zones Config'] = '4,Kitchen PIR,interior,1',
+    ['Quiet Zones'] = '4',
+  })
+  connectPanel()
+  calls.SendToProxy = {}
+  NotifyProxyZoneState(4, nil, true, 1)
+  assert(#proxyCalls(nil, 'ZONE_STATE') == 0, 'the zone itself stays quiet')
+  local sent = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#sent > 0 and tostring(sent[#sent][3]):find('Kitchen PIR'),
+    'but the bypass must still reach the status line')
+end)
+
+test('many bypassed zones collapse to a count rather than blowing the line', function()
+  local zl = {}
+  for i = 1, 8 do zl[#zl + 1] = i .. ',Zone Name ' .. i .. ',contact,1' end
+  freshDriver({ ['Zones Config'] = table.concat(zl, ';') })
+  connectPanel()
+  for i = 1, 8 do NotifyProxyZoneState(i, nil, true, 1) end
+  local text = PartitionStatusText(1)
+  assert(text:find('8 zones'),
+    'past a few zones the count is the safety-relevant part, got: ' .. text)
+  assert(#text <= DISPLAY_TEXT_MAX, 'the line must stay within its budget, got: ' .. text)
+end)
+
+test('the status line is truncated, never sent over budget', function()
+  freshDriver({ ['Partition Display Text'] = string.rep('X', 200) })
+  local text = PartitionStatusText(1)
+  assert(#text <= DISPLAY_TEXT_MAX + 3,
+    'an over-long line must be cut, got ' .. #text .. ' bytes')
+end)
+
+test('a bypass in another partition stays off this partition line', function()
+  freshDriver({ ['Zones Config'] = '1,Front Door,contact,1;7,Shed,contact,2' })
+  connectPanel()
+  NotifyProxyZoneState(7, nil, true, 2)
+  assert(not PartitionStatusText(1):find('Shed'),
+    'partition 1 must not report partition 2 bypasses')
+  assert(PartitionStatusText(2):find('Shed'),
+    'partition 2 must report its own')
+end)
+
+test('an unchanged status line is not re-sent', function()
+  -- Zone events arrive in bursts and every DISPLAY_TEXT is a blocking
+  -- Director round trip.
+  freshDriver({ ['Zones Config'] = '1,Front Door,contact,1' })
+  connectPanel()
+  NotifyProxyZoneState(1, nil, true, 1)
+  local after = #proxyCalls(5002, 'DISPLAY_TEXT')
+  for _ = 1, 5 do NotifyPartitionDisplayText(1) end
+  assert(#proxyCalls(5002, 'DISPLAY_TEXT') == after,
+    'republishing identical text on every call is the cost this guards against')
+end)
+
+test('the custom prefix and the driver status share the line', function()
+  freshDriver({
+    ['Zones Config'] = '1,Front Door,contact,1',
+    ['Partition Display Text'] = 'Ground Floor',
+  })
+  connectPanel()
+  NotifyProxyZoneState(1, nil, true, 1)
+  local text = PartitionStatusText(1)
+  assert(text:find('Ground Floor') and text:find('Front Door'),
+    'the installer label must not be overwritten by driver status, got: ' .. text)
+end)
+
+test('the mute auto-re-enables when its timer expires (v31)', function()
+  -- A forgotten mute on a security system is its own hazard.
+  freshDriver({ ['Event Mute Minutes'] = '60' })
+  connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  assert(EventsEnabled == false, 'setup: must be muted')
+  assert(EventMuteTimerId ~= nil, 'a mute must schedule its own expiry')
+  OnTimerExpired(EventMuteTimerId)
+  assert(EventsEnabled == true, 'the mute must lift itself')
+end)
+
+test('Event Mute Minutes = 0 mutes until re-enabled by hand', function()
+  freshDriver({ ['Event Mute Minutes'] = '0' })
+  connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  assert(EventsEnabled == false and EventMuteTimerId == nil,
+    'zero means no auto-enable timer')
+  assert(Properties['Event Notifications']:find('until re%-enabled'),
+    'and the property must say so: ' .. Properties['Event Notifications'])
+end)
+
+test('a driver reload never comes back muted (v31)', function()
+  -- A reload is when someone is fixing the panel; silently resuming muted is
+  -- the failure this guards against.
+  freshDriver()
+  connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  assert(EventsEnabled == false, 'setup: muted')
+  freshDriver()
+  assert(EventsEnabled == true, 'a reload must come back with events enabled')
+  assert(Properties['Event Notifications'] == 'Enabled',
+    'and say so, got ' .. tostring(Properties['Event Notifications']))
+end)
+
+test('the mute state is published as a variable for programming', function()
+  freshDriver()
+  connectPanel()
+  ExecutePartitionFunction(1, 'Disable Event Notifications')
+  -- 'false', not false: Director's variable API takes strings only, and
+  -- asserting the Lua boolean here is what let v30's broken writes pass the
+  -- suite for nine versions.
+  assert(Variables['EVENTS_ENABLED'] == 'false', 'got ' .. tostring(Variables['EVENTS_ENABLED']))
+  ExecutePartitionFunction(1, 'Enable Event Notifications')
+  assert(Variables['EVENTS_ENABLED'] == 'true')
+end)
+
+test('every function the driver calls by name actually exists (v30)', function()
+  -- luac -p accepts a call to an undefined global, so a helper that was
+  -- never inserted passes the syntax check and only fails at runtime. This
+  -- catches that class directly.
+  freshDriver()
+  local required = {
+    'NotePanelDisconnected', 'FireAlert', 'FireTrouble', 'DeclareDriverVariables',
+    'SetDriverVariable', 'IsZoneBypassable', 'IsQuietZone', 'VerifyZoneBypass',
+    'ExecutePartitionFunction', 'DecodeFault', 'DecodeFaults', 'FallbackPartition',
+    'FireDriverEvent', 'SetEventsEnabled', 'EventMuteMinutes', 'CancelEventMuteTimer',
+    'NonEmptyAlert', 'ReportDriverVariables', 'AlreadySeenEvent', 'ResetEventDedupe', 'TroubleIdentifier',
+    'ApplyZoneStatusResponse', 'ArmAllPartitions', 'DisarmAllPartitions',
+  }
+  for _, name in ipairs(required) do
+    assert(type(_G[name]) == 'function', name .. ' is called by the driver but is not defined')
+  end
+end)
+
+test('an alarm fires Any Alarm alongside its specific event, with ALERT_TEXT set (v30)', function()
+  -- One programming script instead of one per alarm type.
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":50,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['Fire Alarm'], 'the specific event must still fire')
+  assert(fired['Any Alarm'], 'and the consolidated one alongside it')
+  assert(Variables['ALERT_TYPE'] == 'Fire', 'got ' .. tostring(Variables['ALERT_TYPE']))
+  assert(tostring(Variables['ALERT_TEXT']):find('Kitchen Smoke'),
+    'ALERT_TEXT must name the zone: ' .. tostring(Variables['ALERT_TEXT']))
+end)
+
+test('an alarm RESTORE does not fire Any Alarm', function()
+  -- Otherwise the all-clear would trigger the same notification as the alarm.
+  freshDriver({ ['Zones Config'] = '5,Kitchen Smoke,smoke,1' })
+  local h = connectPanel()
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":51,"account":"1234","type":110,"qualifier":3,"zone":5,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['Fire Alarm Restored'], 'the restore event must fire')
+  assert(not fired['Any Alarm'], 'a restore must not raise the alarm hook')
+end)
+
+test('a trouble fires Any Trouble with a readable description (v30)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":52,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['AC Power Lost'] and fired['Any Trouble'], 'both events must fire')
+  assert(Variables['ALERT_TEXT'] == 'Mains power lost',
+    'got ' .. tostring(Variables['ALERT_TEXT']))
+end)
+
+test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
+  freshDriver()
+  local h = connectPanel()
+  assert(Variables['PANEL_CONNECTED'] == 'true', 'must start connected')
+  calls.FireEvent = {}
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == 'Panel Connection Lost' then n = n + 1 end end
+  assert(n == 1, 'expected exactly one Panel Connection Lost, got ' .. n)
+  assert(Variables['PANEL_CONNECTED'] == 'false', 'the variable must follow')
+  -- A second disconnect notice must not re-fire it.
+  calls.FireEvent = {}
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  for _, e in ipairs(calls.FireEvent) do
+    assert(e ~= 'Panel Connection Lost', 'the event must fire on the edge, not repeatedly')
+  end
+end)
+
+test('partition state is mirrored into variables for programming conditionals (v30)', function()
+  freshDriver()
+  local h = connectPanel(1, true)
+  answerSyncQueries(h, 3)                     -- armed away
+  assert(Variables['PARTITION_1_ARMED'] == 'true',
+    'armed must set the boolean, got ' .. tostring(Variables['PARTITION_1_ARMED']))
+  assert(tostring(Variables['PARTITION_1_STATE']):find('Armed'),
+    'and the state string: ' .. tostring(Variables['PARTITION_1_STATE']))
+  SetPartitionState(1, 'Disarmed')
+  assert(Variables['PARTITION_1_ARMED'] == 'false', 'disarm must clear it')
+end)
+
+test('no driver variable is ever written as a Lua boolean (v40)', function()
+  -- Director rejects a non-string with "strValue should be a string". v30
+  -- set PANEL_CONNECTED, EVENTS_ENABLED and PARTITION_n_ARMED with real
+  -- booleans, so all three failed every write from v30 to v39 -- the pcall
+  -- kept the driver up and, until v32, kept the log quiet too. The mock now
+  -- rejects a non-string exactly as Director does; this test drives the
+  -- paths that were broken.
+  freshDriver()
+  local h = connectPanel()
+  assert(Variables['PANEL_CONNECTED'] == 'true')
+  assert(Variables['EVENTS_ENABLED'] == 'true')
+
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+  assert(Variables['PARTITION_1_ARMED'] == 'true')
+  SetPartitionState(1, 'Disarmed')
+  assert(Variables['PARTITION_1_ARMED'] == 'false')
+
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  assert(Variables['PANEL_CONNECTED'] == 'false')
+
+  for _, v in pairs(Variables) do
+    assert(type(v) == 'string', 'every variable must hold a string, got ' .. type(v))
+  end
+end)
+
+test('VariableValueString renders booleans the way a BOOL variable reads', function()
+  freshDriver()
+  assert(VariableValueString(true) == 'true')
+  assert(VariableValueString(false) == 'false')
+  assert(VariableValueString('Armed Away') == 'Armed Away')
+  assert(VariableValueString(7) == '7')
+end)
+
+test('every event the driver fires is declared in driver.xml (v30)', function()
+  -- A FireEvent for an undeclared name is silently dropped by Director.
+  freshDriver()
+  local xml = readFile('driver.xml')
+  assert(xml, 'driver.xml not found -- run ./build.sh')
+  local declared = {}
+  for name in xml:gmatch('<event>.-<name>(.-)</name>') do declared[name] = true end
+  local lua = readFile('driver.lua')
+  local missing = {}
+  for name in lua:gmatch("C4:FireEvent%('([^']+)'%)") do
+    if not declared[name] then missing[#missing + 1] = name end
+  end
+  assert(#missing == 0,
+    'fired but not declared in driver.xml: ' .. table.concat(missing, ', '))
+end)
+
 test('Functions: Bypass Open Zones bypasses only the open, bypassable ones (v28)', function()
   freshDriver({
     ['Zones Config'] = '1,Front Door,contact,1;2,Window,window,1;13,Smoke,smoke,1',
@@ -3481,10 +4209,14 @@ test('Partition Display Text sends DISPLAY_TEXT in the reference call shape (v24
   assert(p1[#p1][4] == nil, 'the reference template passes no NOTIFY mode argument')
 end)
 
-test('Partition Display Text sends nothing when left empty', function()
+test('an empty status line is sent as empty, not skipped', function()
+  -- Skipping it would leave whatever was on the line before -- after a
+  -- reload, that is a stale "Bypassed: Front Door" describing a zone that
+  -- is no longer bypassed.
   freshDriver({ ['Partition Display Text'] = '' })
-  assert(#proxyCalls(nil, 'DISPLAY_TEXT') == 0,
-    'an experiment that was never opted into must stay off the wire')
+  local sent = proxyCalls(5002, 'DISPLAY_TEXT')
+  assert(#sent > 0 and sent[#sent][3] == '',
+    'expected an empty payload, got: ' .. tostring(#sent > 0 and sent[#sent][3] or '(nothing sent)'))
 end)
 
 test('editing Partition Display Text applies without a driver reload', function()
@@ -3554,6 +4286,7 @@ test('a quiet zone is published as closed so it cannot churn the list', function
   NotifyProxyZoneState(4, true, nil, 1)     -- really open right now
   calls.SendToProxy = {}
   PublishZoneInventory()
+  drainZonePublish()
   local info = proxyCalls(5001, 'PANEL_ZONE_INFO')
   assert(#info > 0, 'the zone must still be published')
   assert(info[#info][3].IS_OPEN == false,
