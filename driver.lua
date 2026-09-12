@@ -15,7 +15,7 @@
         cross-checked against a mature open-source implementation. High
         confidence.
       * Control4-side surface uses LUA_ACTIONS commands, properties and
-        C4:FireEvent() programming events -- all directly confirmed against
+        FireDriverEvent() programming events -- all directly confirmed against
         Control4/Snap One's own published sample drivers. This is what
         Composer Pro programming (arm/disarm buttons, "when armed away"
         triggers, zone-open triggers) is built on, and it WILL import and
@@ -96,7 +96,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 29
+local DRIVER_VERSION = 40
 
 -- How much of a discovered zone list to show in the read-only preview
 -- property. Only affects display: the full list is kept in memory and is what
@@ -940,6 +940,34 @@ function StopServer()
   end
 end
 
+-- Tracks the connected/disconnected edge so the events fire on transitions
+-- rather than on every status write.
+--
+-- Deliberately a plain assignment, NOT the `X = X or false` idiom used for
+-- genuinely persistent globals: this is per-session state, and preserving it
+-- across a driver reload would mean the first connect after a reload does not
+-- count as an edge, so Panel Connection Restored would never fire.
+PanelWasConnected = false
+
+-- A panel that has stopped talking to Control4 means the system is not being
+-- monitored, which is exactly the condition worth a push notification -- and
+-- until v30 the driver detected it (the link watchdog) but offered nothing to
+-- program against.
+function NotePanelDisconnected(reason)
+  if not PanelWasConnected then return end
+  PanelWasConnected = false
+  SetDriverVariable('PANEL_CONNECTED', false)
+  local text = 'Panel connection lost' .. (reason and (' (' .. tostring(reason) .. ')') or '')
+  SetDriverVariable('ALERT_TYPE', 'Panel Offline')
+  SetDriverVariable('ALERT_TEXT', text)
+  SetDriverVariable('LAST_TROUBLE_TYPE', 'Panel Offline')
+  SetDriverVariable('LAST_TROUBLE_TEXT', text)
+  LogError('Panel connection lost' .. (reason and (': ' .. tostring(reason)) or '') ..
+    ' -- the system is not being monitored through Control4 until it returns')
+  FireDriverEvent('Panel Connection Lost')
+  FireDriverEvent('Any Trouble')
+end
+
 function OnServerConnectionStatusChanged(nHandle, nPort, strStatus)
   Dbg('OnServerConnectionStatusChanged handle=' .. tostring(nHandle) .. ' port=' .. tostring(nPort) .. ' status=' .. tostring(strStatus))
   local isOnline = (strStatus == 'ONLINE' or strStatus == 'CONNECTED' or strStatus == 'true' or strStatus == true)
@@ -962,6 +990,9 @@ function OnServerConnectionStatusChanged(nHandle, nPort, strStatus)
     end
     ConnHandle = nHandle
     PanelVerified = false
+    -- NOT resetting the event dedupe here on purpose: the panel replays its
+    -- buffered events on reconnect, and forgetting what we already processed
+    -- is what turned that replay into fresh alarm notifications.
     LastEventKey = nil
     RecvBuffer = ''
     VerifyFailures = 0
@@ -986,6 +1017,7 @@ function OnServerConnectionStatusChanged(nHandle, nPort, strStatus)
       FailInFlight('panel disconnected')
       ResetQueueState()
       SetProp('Connection Status', 'Not Connected')
+      NotePanelDisconnected('link down')
       SetProp('Panel Verified Account', '')
       StopLinkWatchdog()
       LastInboundAt = nil
@@ -1142,7 +1174,7 @@ function HandleServerData(nHandle, strData)
     if ConnHandle ~= nil then
       PanelVerified = false
       RecvBuffer = ''
-      LastEventKey = nil
+      LastEventKey = nil          -- dedupe set deliberately preserved
     end
   end
   -- A handle we already gave up on (too many wrong-account frames) must stay
@@ -1368,6 +1400,7 @@ function HandleInboundFrame(handle, frame)
           ConnHandle = nil
           RecvBuffer = ''
           SetProp('Connection Status', 'Not Connected')
+          NotePanelDisconnected('too many unverified frames')
         end
       end
       return
@@ -1375,6 +1408,11 @@ function HandleInboundFrame(handle, frame)
     PanelVerified = true
     VerifyFailures = 0
     SetProp('Connection Status', 'Connected')
+    if not PanelWasConnected then
+      PanelWasConnected = true
+      SetDriverVariable('PANEL_CONNECTED', true)
+      FireDriverEvent('Panel Connection Restored')
+    end
     SetProp('Panel Verified Account', tostring(acct))
     LogInfo('Panel verified (account ' .. tostring(acct) .. ')')
     -- Ask the panel what state everything is actually in. Without this the
@@ -1465,7 +1503,7 @@ function HandleInboundFrame(handle, frame)
       tostring(frame.type), tostring(frame.qualifier),
       tostring(frame.zone), tostring(frame.partition),
     }, '|')
-    if counter ~= nil and key == LastEventKey then
+    if counter ~= nil and AlreadySeenEvent(key) then
       Dbg('Suppressing duplicate retransmit of event ' .. key)
       return
     end
@@ -1476,6 +1514,64 @@ function HandleInboundFrame(handle, frame)
   end
 
   Dbg('Unhandled/stray frame: ' .. JSON.encode(frame))
+end
+
+--[[=============================================================================
+    Retransmit / replay suppression (v33).
+
+    The panel resends an event it has not seen ACKed, and PIMA's own spec
+    says the AS buffers events and reports them once a connection is up
+    ("NULL ... sent also after all the events in the AS buffer have been
+    reported"). So the same event legitimately arrives more than once, and
+    after a reconnect a whole buffer of already-seen events can replay.
+
+    Through v32 this was guarded by remembering ONE key, cleared on every
+    connect. That failed in both the ways that matter:
+
+      * a retransmit that arrived after any other event no longer matched the
+        single remembered key, so it was dispatched again; and
+      * clearing on connect meant a reconnect replayed the buffer as if it
+        were live -- firing alarm and trouble events, and the notifications
+        wired to them, for things that had already happened.
+
+    Now: a bounded set with a time window, deliberately NOT cleared on
+    reconnect, since surviving the reconnect is the entire point. An event
+    still counts as new if anything about it differs (the key includes type,
+    qualifier, zone and partition as well as the counter), so a genuinely new
+    alarm is never swallowed -- only a byte-identical repeat of one already
+    processed inside the window.
+===============================================================================]]
+EVENT_DEDUPE_WINDOW_MS = 5 * 60 * 1000
+EVENT_DEDUPE_MAX = 128
+SeenEventAt = {}
+SeenEventOrder = {}
+
+function ResetEventDedupe()
+  SeenEventAt = {}
+  SeenEventOrder = {}
+end
+
+function AlreadySeenEvent(key)
+  local now = nowMs()
+  local seenAt = SeenEventAt[key]
+  if seenAt then
+    local age = now - seenAt
+    -- A clock step backwards must not make a stale entry look current
+    -- forever; treat a negative age as "just now" and keep suppressing.
+    if age < 0 or age <= EVENT_DEDUPE_WINDOW_MS then
+      SeenEventAt[key] = now
+      return true
+    end
+  end
+
+  SeenEventAt[key] = now
+  SeenEventOrder[#SeenEventOrder + 1] = key
+  -- Bounded so a long-running driver cannot grow this without limit.
+  while #SeenEventOrder > EVENT_DEDUPE_MAX do
+    local oldest = table.remove(SeenEventOrder, 1)
+    if oldest ~= key then SeenEventAt[oldest] = nil end
+  end
+  return false
 end
 
 --[[=============================================================================
@@ -1610,6 +1706,11 @@ function ProcessQueue()
 end
 
 function OnTimerExpired(idTimer)
+  if EventMuteTimerId and idTimer == EventMuteTimerId then
+    EventMuteTimerId = nil
+    SetEventsEnabled(true, 'mute period elapsed')
+    return
+  end
   -- Match on timer IDENTITY, never on "is a guard pending" -- otherwise an
   -- unrelated timer firing while a guard is pending is consumed by the guard
   -- branch (and that timer's real work, e.g. clearing a zone bypass, is
@@ -2391,6 +2492,16 @@ end
 function SetPartitionState(partitionId, state, isInit)
   PartitionStatusFor(partitionId).base = state
   PublishPartitionState(partitionId, isInit)
+  -- Mirror into driver variables so Composer programming can test partition
+  -- state directly, instead of the installer maintaining a Variables-agent
+  -- boolean by hand off the arm/disarm events (which drifts if one is ever
+  -- missed).
+  if partitionId >= 1 and partitionId <= MAX_DECLARED_PARTITIONS then
+    local effective = tostring(EffectivePartitionState(partitionId))
+    SetDriverVariable('PARTITION_' .. partitionId .. '_STATE', effective)
+    SetDriverVariable('PARTITION_' .. partitionId .. '_ARMED',
+      effective:find('Armed') ~= nil)
+  end
 end
 
 -- Raises or clears one alarm type on a partition. Multiple alarm types can
@@ -2416,12 +2527,12 @@ function ClearPartitionAlarm(partitionId, alarmType)
   end
 end
 
--- The partitions a panel event applies to. A partition of 0 means panel-wide
--- (the panel's own convention, and the one this driver uses when sending),
--- so it fans out to every configured partition instead of being dropped.
--- Iterates the configured partitions themselves, not just 1..8 -- ids 9-16
--- are valid on this panel family and would otherwise be skipped entirely.
 -- Partitions an event applies to.
+--
+-- NOTE: an earlier comment here described partition 0 as fanning out to every
+-- configured partition. It does NOT, and must not -- see below. That comment
+-- described behaviour that was removed as a safety fix and is deleted rather
+-- than left to invite someone to "restore" it.
 --
 -- A partition of 0, missing, or unparseable means UNKNOWN -- never
 -- "everything". This driver previously fanned those out to every configured
@@ -2565,11 +2676,55 @@ end
 
 -- Panel-level trouble conditions (AC loss, low battery, comm trouble,
 -- tamper) surface on the Security Panel proxy's own trouble list.
+--[[---------------------------------------------------------------------------
+    Every trouble used to be sent with IDENTIFIER = 0.
+
+    IDENTIFIER is how the proxy tells one standing trouble from another, so
+    sharing 0 across all of them meant they overwrote each other: with mains
+    power and low battery both active, clearing either cleared the proxy's
+    single id-0 trouble and the other silently vanished from the app while
+    still being a real condition.
+
+    Each trouble now has its own stable id. Anything unlisted gets a slot
+    derived from its text rather than colliding on 0.
+
+    Parameter names match the shipped reference driver exactly: TROUBLE_START
+    carries TROUBLE_TEXT and IDENTIFIER, TROUBLE_CLEAR carries IDENTIFIER
+    alone.
+-----------------------------------------------------------------------------]]
+TROUBLE_IDENTIFIERS = {
+  ['Tamper'] = 1,
+  ['AC power lost'] = 2,
+  ['Low battery'] = 3,
+  ['Communication trouble'] = 4,
+  ['Event notifications disabled'] = 5,
+}
+TROUBLE_ID_BASE = 100
+TroubleIdAssigned = {}
+TroubleIdNext = TROUBLE_ID_BASE
+
+function TroubleIdentifier(troubleText)
+  local known = TROUBLE_IDENTIFIERS[troubleText]
+  if known then return known end
+  if not TroubleIdAssigned[troubleText] then
+    TroubleIdAssigned[troubleText] = TroubleIdNext
+    TroubleIdNext = TroubleIdNext + 1
+  end
+  return TroubleIdAssigned[troubleText]
+end
+
 function NotifyProxyTrouble(troubleText, isNew)
-  C4:SendToProxy(PANEL_PROXY_BINDINGID, isNew and 'TROUBLE_START' or 'TROUBLE_CLEAR', {
-    TROUBLE_TEXT = troubleText,
-    IDENTIFIER = 0,
-  }, 'NOTIFY')
+  local id = TroubleIdentifier(troubleText)
+  if isNew then
+    C4:SendToProxy(PANEL_PROXY_BINDINGID, 'TROUBLE_START', {
+      TROUBLE_TEXT = troubleText,
+      IDENTIFIER = id,
+    }, 'NOTIFY')
+  else
+    C4:SendToProxy(PANEL_PROXY_BINDINGID, 'TROUBLE_CLEAR', {
+      IDENTIFIER = id,
+    }, 'NOTIFY')
+  end
 end
 
 function NotifyProxyArmFailed(partitionId)
@@ -2600,15 +2755,26 @@ function NotifyProxyPartitionsInit()
       C4:SendToProxy(bindingId, 'PARTITION_ENABLED', { ENABLED = configured and 'true' or 'false' }, 'NOTIFY')
       if configured then
         NotifyPartitionInfo(pid)
-        -- We have not heard from the panel yet, so we genuinely do not know
-        -- the state. Seed OFFLINE rather than an optimistic DISARMED_READY
-        -- that would show a green "disarmed" shield for an armed house.
-        C4:SendToProxy(bindingId, 'PARTITION_STATE_INIT', {
-          STATE = 'OFFLINE',
-          TYPE = '',
-          DELAY_TIME_TOTAL = 0,
-          DELAY_TIME_REMAINING = 0,
-        }, 'NOTIFY')
+        if PanelVerified then
+          -- The panel beat us here. Since v36 this runs on a timer rather
+          -- than inline in OnDriverLateInit, so a panel that reconnects
+          -- inside that window can report real state BEFORE this seed --
+          -- and an unconditional OFFLINE would then overwrite a live
+          -- "Armed Away" shield with "offline" until the next sync. Seed
+          -- what the panel actually told us instead.
+          PublishPartitionState(pid, true)
+        else
+          -- We have not heard from the panel yet, so we genuinely do not
+          -- know the state. Seed OFFLINE rather than an optimistic
+          -- DISARMED_READY that would show a green "disarmed" shield for an
+          -- armed house.
+          C4:SendToProxy(bindingId, 'PARTITION_STATE_INIT', {
+            STATE = 'OFFLINE',
+            TYPE = '',
+            DELAY_TIME_TOTAL = 0,
+            DELAY_TIME_REMAINING = 0,
+          }, 'NOTIFY')
+        end
       end
     end
   end
@@ -2780,12 +2946,22 @@ end
 
 function NotifyProxyZoneState(zone, isOpen, isBypassed, eventPartition)
   local st = ZoneStateFor(zone)
+  local bypassWas = st.bypassed
   if isOpen ~= nil then st.open = isOpen end
   if isBypassed ~= nil then st.bypassed = isBypassed end
   -- Remember the partition the panel attributed this zone to, so later
   -- notifications that carry no partition of their own (a bypass written by
   -- this driver, say) still land on the right partition proxy.
   if eventPartition and eventPartition > 0 then st.partition = eventPartition end
+
+  -- Refresh the status line before the suppression checks below, not after.
+  -- A quiet zone, or one whose reporting mode is off, is still a disabled
+  -- detector when bypassed -- those settings silence open/close chatter, and
+  -- were never meant to hide a bypass. Only on an actual change: zone
+  -- open/close events arrive in bursts and this is a Director round trip.
+  if st.bypassed ~= bypassWas then
+    NotifyPartitionDisplayText(ZonePartition(zone, eventPartition))
+  end
 
   -- State is always tracked above, whatever the reporting settings say: the
   -- bypass logic, the inventory's IS_OPEN, and the zone-status sync all read
@@ -2929,60 +3105,128 @@ function NotifyPartitionInfo(partitionId)
   C4:SendToProxy(bindingId, 'PARTITION_INFO', PartitionInfoXML(partitionId), 'NOTIFY')
 end
 
---[[---------------------------------------------------------------------------
-    DISPLAY_TEXT -- the remaining candidate for the Zones-tab "UNKNOWN"
-    header, wired as an experiment you can run rather than a hardcoded guess.
+--[[=============================================================================
+    DISPLAY_TEXT -- the partition status line.
 
-    What changed to make this worth trying. Setting Zone State Reporting to
-    "Panel only" on the installed system produced a decisive result: History
-    went quiet AND the zone list stopped showing open/closed. So ZONE_STATE,
-    sent to the PARTITION binding, is what renders that screen -- the
-    partition proxy is demonstrably alive and is what the Zones tab is drawn
-    from. The UNKNOWN header therefore sits on a working partition proxy that
-    simply has no text for that slot.
-
-    DISPLAY_TEXT is the one named partition-proxy notify this driver has
-    never sent whose literal purpose is putting text on a partition's screen
-    (it is the keypad-display line on panels that have one). Unlike v20's
-    PARTITION_INFO -- where the XML shape had to be invented -- its call
-    shape is copied exactly from the shipped Control4 proxy template found in
-    the reference driver:
+    Origin. This was added in v24 as an experiment against the Zones-tab
+    "UNKNOWN" header: DISPLAY_TEXT is the one partition-proxy notify whose
+    literal purpose is putting text on a partition's screen, and its call
+    shape is copied exactly from the shipped Control4 proxy template --
 
         C4:SendToProxy(BindingID, "DISPLAY_TEXT", DispText)
 
-    three arguments, a bare string payload, no NOTIFY mode argument.
+    three arguments, bare string payload, no NOTIFY mode argument.
 
-    This is still a hypothesis. So rather than hardcode a label, it is driven
-    by the "Partition Display Text" property: set it to anything (say "Home")
-    and reload. If the header changes to that text, this was it and the
-    property is now the control for it. If the header still reads UNKNOWN,
-    DISPLAY_TEXT is ruled out for good and no further driver-side attempt at
-    that label is worth making. Either outcome ends the question.
------------------------------------------------------------------------------]]
+    Result: it does NOT fill the Zones-tab header, which stays UNKNOWN. It
+    renders in the app's **Status tab, below the lock indicator**. So the
+    experiment answered its question in the negative and handed back
+    something more useful -- a line of driver-controlled text on the screen
+    the user is already looking at when they check the system.
+
+    What goes on it. Two pieces of state that the app otherwise shows badly
+    or not at all:
+
+      1. Event notifications muted. v31 indicated this by raising a standing
+         panel *trouble*, which was wrong on reflection: it puts a fault on a
+         panel that has no fault, and since v35 gave troubles stable
+         identifiers it also occupies a slot in a list meant for real
+         conditions. A status line is the honest place for "the driver is
+         deliberately quiet".
+      2. Bypassed zones. A bypass is a disabled detector. Control4 shows it
+         per zone on the Zones tab, which means noticing it requires going
+         looking; naming them here puts it in front of whoever is arming.
+
+    Both are suppression states -- the system doing less than it appears to.
+    That is exactly what belongs on a status line, and why they share one.
+
+    The **Partition Display Text** property still works: it is now the fixed
+    prefix, so an installer label ("Ground floor") and the driver's own
+    status coexist rather than one overwriting the other.
+===============================================================================]]
+DISPLAY_TEXT_SEPARATOR = ' | '
+-- Keypad display lines are narrow and this is a status line, not a report:
+-- past roughly this width the app truncates it and the interesting part is
+-- as likely to be the half that got cut.
+DISPLAY_TEXT_MAX = 64
+-- Above this many bypassed zones, naming them all is what blows the budget,
+-- so the count replaces the list. The count is the safety-relevant part.
+DISPLAY_TEXT_MAX_NAMED_ZONES = 3
+
+-- Last text sent per partition, so an unchanged line is not re-sent. Every
+-- DISPLAY_TEXT is a blocking Director round trip, and this is republished
+-- from zone events, which arrive in bursts.
+DisplayTextSent = {}
+
+function BypassedZonesForPartition(partitionId)
+  local names = {}
+  for _, z in ipairs(SortedZoneNumbers()) do
+    local st = ZoneState[z]
+    if st and st.bypassed and ZonePartition(z) == partitionId then
+      local zcfg = Zones[z]
+      local nm = zcfg and trim(tostring(zcfg.name or '')) or ''
+      names[#names + 1] = (nm ~= '') and nm or ('Zone ' .. z)
+    end
+  end
+  return names
+end
+
+-- Composes the status line for one partition. Pure: no Director calls, so
+-- it is cheap to call on every state change and directly testable.
+function PartitionStatusText(partitionId)
+  local parts = {}
+
+  local custom = trim(tostring(Properties['Partition Display Text'] or ''))
+  if custom ~= '' then parts[#parts + 1] = custom end
+
+  -- Deliberately first among the driver's own states. A muted driver is a
+  -- system that will not tell you about the next alarm, which outranks
+  -- knowing which door is bypassed.
+  if not EventsEnabled then
+    parts[#parts + 1] = 'Notifications OFF'
+  end
+
+  local bypassed = BypassedZonesForPartition(partitionId)
+  if #bypassed > 0 then
+    if #bypassed > DISPLAY_TEXT_MAX_NAMED_ZONES then
+      parts[#parts + 1] = 'Bypassed: ' .. #bypassed .. ' zones'
+    else
+      parts[#parts + 1] = 'Bypassed: ' .. table.concat(bypassed, ', ')
+    end
+  end
+
+  local text = table.concat(parts, DISPLAY_TEXT_SEPARATOR)
+  if #text > DISPLAY_TEXT_MAX then
+    -- Truncating mid-word would be worse than saying so.
+    text = text:sub(1, DISPLAY_TEXT_MAX - 3) .. '...'
+  end
+  return text
+end
+
 function NotifyPartitionDisplayText(partitionId)
-  local text = trim(tostring(Properties['Partition Display Text'] or ''))
-  if text == '' then return end
   local bindingId = PartitionProxyBindingID(partitionId)
   if not bindingId then return end
   if not Partitions[partitionId] then return end
+
+  local text = PartitionStatusText(partitionId)
+  -- An empty string is sent when the line clears, not skipped: skipping it
+  -- would leave "Bypassed: Front Door" on screen after the bypass was
+  -- cleared, which is a false statement about a security system. Only a
+  -- genuinely unchanged line is suppressed.
+  if DisplayTextSent[partitionId] == text then return end
+  DisplayTextSent[partitionId] = text
   C4:SendToProxy(bindingId, 'DISPLAY_TEXT', text)
+  Dbg('Partition ' .. partitionId .. ' status line: "' .. text .. '"')
 end
 
--- Pushes the display text to every configured partition. Called at init and
--- whenever the property changes, so the experiment needs only a reload.
+-- Republishes the status line on every configured partition. Called from
+-- init, from the mute controls, from bypass changes and when the property
+-- changes; the per-partition dedupe above makes calling it freely cheap.
 function PublishPartitionDisplayText()
-  local text = trim(tostring(Properties['Partition Display Text'] or ''))
-  if text == '' then return end
-  local sent = 0
   for pid = 1, MAX_DECLARED_PARTITIONS do
     if Partitions[pid] then
       NotifyPartitionDisplayText(pid)
-      sent = sent + 1
     end
   end
-  LogInfo('Partition Display Text "' .. text .. '" sent to ' .. sent ..
-    ' partition binding(s) via DISPLAY_TEXT. If the Zones-tab header still ' ..
-    'reads UNKNOWN after this, DISPLAY_TEXT is not what fills that label.')
 end
 
 -- <zones> document for the Security Panel proxy. type_id is the numeric
@@ -3177,12 +3421,23 @@ function PublishZoneInventory()
       '). Set the 4th field of each Zones Config entry to place zones explicitly.')
   end
 
-  DrainZonePublishQueue()
+  -- Arm the drain rather than running the first batch inline. v13 left one
+  -- batch synchronous as a compromise; with init synchronous again that
+  -- batch is ZONE_PUBLISH_BATCH * 2 blocking calls on the thread Composer is
+  -- waiting on, for no benefit. Deferring it is the one deferral with no
+  -- correctness question attached: a zone INVENTORY arriving 50ms later
+  -- cannot mis-state whether the house is armed -- unlike the partition
+  -- seeds, which is exactly the distinction v38 had to learn.
+  ZonePublishTimerId = C4:AddTimer(ZONE_PUBLISH_TICK_MS, 'MILLISECONDS')
+  if not ZonePublishTimerId then
+    -- No timer: publish inline rather than leave the app with no zone list.
+    DrainZonePublishQueue()
+  end
 end
 
 -- Publishes at most ZONE_PUBLISH_BATCH zones, then either re-arms the timer
--- or finishes with PANEL_INITIALIZED. Called synchronously for the first
--- batch so a small panel is fully published before this returns.
+-- or finishes with PANEL_INITIALIZED. Every batch runs on the timer since
+-- v39; nothing here touches the load callback.
 function DrainZonePublishQueue()
   ZonePublishTimerId = nil
   local queue = ZonePublishQueue
@@ -3497,7 +3752,8 @@ end
     and honestly named.
 -----------------------------------------------------------------------------]]
 PARTITION_FUNCTIONS = { 'Check Status', 'Arm All', 'Disarm All',
-                        'Bypass Open Zones', 'Clear All Bypasses', 'Refresh Troubles' }
+                        'Bypass Open Zones', 'Clear All Bypasses', 'Refresh Troubles',
+                        'Disable Event Notifications', 'Enable Event Notifications' }
 
 
 --[[---------------------------------------------------------------------------
@@ -3787,10 +4043,303 @@ function ExecutePartitionFunction(partitionId, name)
     return
   end
 
+  if fn == 'disable event notifications' then
+    SetEventsEnabled(false, 'Functions menu')
+    return
+  end
+
+  if fn == 'enable event notifications' then
+    SetEventsEnabled(true, 'Functions menu')
+    return
+  end
+
   LogWarn('Functions menu: "' .. tostring(name) .. '" is not a function this driver ' ..
     'implements. Implemented: ' .. table.concat(PARTITION_FUNCTIONS, ', ') ..
     '. If the app is offering something else, the <functions> capability in ' ..
     'driver.xml and this list have drifted apart.')
+end
+
+
+--[[=============================================================================
+    Alert routing: two events instead of forty-four (v30).
+
+    Wiring push notifications through Composer means one programming script
+    per event you care about. With 44 events that is absurd, and it is the
+    driver's fault for offering no coarser hook.
+
+    So every alarm-class condition also fires `Any Alarm`, and every
+    trouble-class condition also fires `Any Trouble`. The specific events
+    still fire exactly as before -- nothing existing breaks, and anyone who
+    wants per-condition scripts can still have them. But a complete
+    notification setup is now two scripts:
+
+        WHEN  Any Alarm    ->  Push Notification "Security alarm"
+        WHEN  Any Trouble  ->  Push Notification "Panel trouble"
+
+    Alongside each, the driver sets ALERT_TEXT / ALERT_TYPE variables
+    describing what actually happened. If the Push Notification agent can
+    interpolate a variable into its message text, one script gives fully
+    specific alerts; if it cannot, the detail is still one glance away in the
+    app and usable in programming conditions.
+===============================================================================]]
+
+-- Runtime variables. Added here rather than declared in driver.xml because
+-- AddVariable at runtime needs no static metadata change, which means no
+-- Director restart to pick them up.
+DriverVariablesReady = false
+
+DriverVariableNames = {}
+
+function DeclareDriverVariables()
+  if DriverVariablesReady then return end
+  DriverVariableNames = {}
+  local failed = {}
+  local function add(name, value, vtype)
+    DriverVariableNames[#DriverVariableNames + 1] = name
+    value = VariableValueString(value)
+    local ok, err = pcall(function() C4:AddVariable(name, value, vtype) end)
+    if not ok then
+      failed[#failed + 1] = name .. ' (' .. tostring(err) .. ')'
+    end
+  end
+  add('ALERT_TEXT', '', 'STRING')
+  add('ALERT_TYPE', '', 'STRING')
+  -- Deliberately NOT named TROUBLE_TYPE / TROUBLE_TEXT: the security panel
+  -- proxy already declares its own TROUBLE_TYPE, and v32 added driver
+  -- variables with the same names on top of it, so Composer showed two
+  -- entries called Force::TROUBLE_TYPE with no way to tell which was which.
+  -- These carry the same idea under names that cannot collide: ALERT_* is
+  -- "the last thing that happened", LAST_TROUBLE_* is "the last trouble",
+  -- which survives a later alarm.
+  add('LAST_TROUBLE_TEXT', '', 'STRING')
+  add('LAST_TROUBLE_TYPE', '', 'STRING')
+  add('PANEL_CONNECTED', false, 'BOOL')
+  add('EVENTS_ENABLED', true, 'BOOL')
+  -- Only for partitions that are actually configured. Declaring all
+  -- MAX_DECLARED_PARTITIONS meant a one-partition house paid four extra
+  -- AddVariable round trips at every load to create variables describing
+  -- partitions that do not exist -- and offered them in Composer's
+  -- programming picker as though they did.
+  for pid = 1, MAX_DECLARED_PARTITIONS do
+    if Partitions[pid] then
+      add('PARTITION_' .. pid .. '_STATE', 'Unknown', 'STRING')
+      add('PARTITION_' .. pid .. '_ARMED', false, 'BOOL')
+    end
+  end
+  -- Loudly, on purpose. v30 wrapped this in a pcall that logged only at
+  -- Debug level, so if variable creation failed the only symptom was
+  -- notification text resolving empty, with nothing in the log to explain
+  -- it. A driver that cannot publish its variables must say so.
+  if #failed > 0 then
+    LogError('Could not create ' .. #failed .. ' driver variable(s): ' ..
+      table.concat(failed, ', ') .. '. Notification text referencing them will ' ..
+      'resolve EMPTY. Run the "Report Variables" action for the current state.')
+  else
+    LogInfo('Driver variables published: ' .. table.concat(DriverVariableNames, ', '))
+  end
+  DriverVariablesReady = true
+end
+
+-- Reads every variable back from Director and logs it. The point is to make
+-- "the notification came through empty" answerable from one log line instead
+-- of guesswork: either the variables exist and hold values, or they do not.
+function ReportDriverVariables()
+  if #DriverVariableNames == 0 then
+    LogError('No driver variables have been declared at all -- DeclareDriverVariables ' ..
+      'never ran, or every AddVariable call failed.')
+    SetProp('Last Command Result', 'No driver variables declared')
+    return
+  end
+  local lines, missing = {}, 0
+  for _, name in ipairs(DriverVariableNames) do
+    local ok, value = pcall(function() return C4:GetVariable(name) end)
+    if not ok then
+      lines[#lines + 1] = name .. '=<READ FAILED>'
+      missing = missing + 1
+    elseif value == nil then
+      lines[#lines + 1] = name .. '=<nil: variable does not exist>'
+      missing = missing + 1
+    else
+      lines[#lines + 1] = name .. '=' .. tostring(value)
+    end
+  end
+  local summary = table.concat(lines, ', ')
+  if missing > 0 then
+    LogError('Driver variables: ' .. missing .. ' of ' .. #DriverVariableNames ..
+      ' unreadable. ' .. summary)
+  else
+    LogInfo('Driver variables: ' .. summary)
+  end
+  SetProp('Last Command Result', 'Variables: ' .. summary)
+end
+
+-- Failures are reported once per variable rather than on every write, so a
+-- broken variable is visible without flooding the log.
+VariableWriteFailed = {}
+
+--[[---------------------------------------------------------------------------
+    Director's variable API takes STRINGS, and only strings. Passing a Lua
+    boolean throws "strValue should be a string".
+
+    v30 introduced PANEL_CONNECTED, EVENTS_ENABLED and PARTITION_n_ARMED as
+    BOOL variables and set them with real Lua booleans. Every one of those
+    writes has been failing since -- so those three have never held a value,
+    and any notification text or programming condition referencing them has
+    been reading an empty variable for nine versions. The pcall around the
+    write meant it never took the driver down, and until v32 made variable
+    failures loud there was nothing in the log to say so either.
+
+    Booleans render as "true"/"false" to match how a BOOL variable reads in
+    Composer. The regression mock now rejects a non-string exactly as
+    Director does, so this class of bug cannot ship again from any call site.
+-----------------------------------------------------------------------------]]
+function VariableValueString(value)
+  if type(value) == 'boolean' then return value and 'true' or 'false' end
+  return tostring(value)
+end
+
+function SetDriverVariable(name, value)
+  value = VariableValueString(value)
+  local ok, err = pcall(function() C4:SetVariable(name, value) end)
+  if ok then
+    VariableWriteFailed[name] = nil
+    return
+  end
+  if not VariableWriteFailed[name] then
+    VariableWriteFailed[name] = true
+    LogError('Cannot set variable ' .. name .. ': ' .. tostring(err) ..
+      '. Anything in a notification referencing it will be EMPTY.')
+  end
+end
+
+-- Fired for anything a person would want to be told about immediately.
+-- `kind` is a short category ("Fire", "Burglary", ...), `text` a readable
+-- description including the zone or partition where one is known.
+function FireAlert(kind, text)
+  kind, text = NonEmptyAlert(kind, text, 'Alarm')
+  SetDriverVariable('ALERT_TYPE', kind)
+  SetDriverVariable('ALERT_TEXT', text)
+  FireDriverEvent('Any Alarm')
+end
+
+-- Fired for system health: power, battery, comms, tamper restore and so on.
+function FireTrouble(kind, text)
+  kind, text = NonEmptyAlert(kind, text, 'Trouble')
+  SetDriverVariable('ALERT_TYPE', kind)
+  SetDriverVariable('ALERT_TEXT', text)
+  SetDriverVariable('LAST_TROUBLE_TYPE', kind)
+  SetDriverVariable('LAST_TROUBLE_TEXT', text)
+  FireDriverEvent('Any Trouble')
+end
+
+-- A notification that says nothing is worse than no notification: it tells
+-- you something happened and denies you what. Never let these go out blank.
+function NonEmptyAlert(kind, text, fallback)
+  kind = trim(tostring(kind or ''))
+  text = trim(tostring(text or ''))
+  if kind == '' then kind = fallback end
+  if text == '' then text = kind end
+  return kind, text
+end
+
+
+--[[=============================================================================
+    Muting programming events (v31).
+
+    A panel that malfunctions can machine-gun events -- a flapping detector, a
+    trouble that will not clear -- and with notifications wired to Any Alarm /
+    Any Trouble that becomes a phone buzzing all night. "Disable Event
+    Notifications" in the app's Functions menu stops the driver firing
+    programming events until it is re-enabled.
+
+    Deliberate scope: this gates C4:FireEvent ONLY. Live state still flows --
+    the shield still shows ARMED or ALARM, zones still update, properties and
+    the app's own History are untouched. What stops is programming triggers,
+    which is what feeds notifications. Muting the display of a live alarm
+    would be a far worse idea than muting the notification about it.
+
+    Because a mute that is forgotten is its own hazard on a security system,
+    two things guard it:
+
+      * it auto-re-enables after Event Mute Minutes (default 60), the same
+        reasoning as the bypass auto-clear; and
+      * while muted the driver raises a panel TROUBLE, so the app shows a
+        standing trouble rather than the mute being invisible.
+===============================================================================]]
+EventsEnabled = true
+EventMuteTimerId = nil
+
+function EventMuteMinutes()
+  local m = tonumber(Properties['Event Mute Minutes'])
+  if m == nil then m = 60 end
+  return m
+end
+
+function CancelEventMuteTimer()
+  if EventMuteTimerId then
+    pcall(function() C4:KillTimer(EventMuteTimerId) end)
+    EventMuteTimerId = nil
+  end
+end
+
+-- Every programming event in this driver goes through here. Gating one
+-- function is why the mute cannot miss a path, and why a new event added
+-- later is muted automatically without anyone remembering to wire it up.
+function FireDriverEvent(name)
+  if not EventsEnabled then
+    Dbg('Event "' .. tostring(name) .. '" suppressed: event notifications are disabled')
+    return
+  end
+  C4:FireEvent(name)
+end
+
+function SetEventsEnabled(enabled, reason)
+  enabled = not not enabled
+  local changed = (enabled ~= EventsEnabled)
+  EventsEnabled = enabled
+  CancelEventMuteTimer()
+  SetDriverVariable('EVENTS_ENABLED', enabled)
+
+  -- The mute is shown on the partition status line (see DISPLAY_TEXT), not
+  -- as a panel trouble. Both states publish it, so the line can never
+  -- disagree with EventsEnabled.
+  PublishPartitionDisplayText()
+
+  if enabled then
+    SetProp('Event Notifications', 'Enabled')
+    -- v31-v36 indicated the mute by raising a standing trouble. That is gone,
+    -- but the clear is still sent: a driver updated from one of those
+    -- versions while muted would otherwise leave a phantom "Event
+    -- notifications disabled" trouble in the app with nothing left to clear
+    -- it. Harmless once no such trouble exists.
+    NotifyProxyTrouble('Event notifications disabled', false)
+    if changed then
+      LogInfo('Event notifications ENABLED' .. (reason and (' (' .. reason .. ')') or '') ..
+        ' -- programming events and notifications resume')
+    end
+    SetProp('Last Command Result', 'Event notifications enabled')
+    return
+  end
+
+  local minutes = EventMuteMinutes()
+  local until_text = 'until re-enabled'
+  if minutes > 0 then
+    EventMuteTimerId = C4:AddTimer(minutes, 'MINUTES')
+    if EventMuteTimerId then
+      until_text = 'for ' .. minutes .. ' minutes'
+    else
+      LogWarn('Could not schedule the event-mute auto-enable timer; notifications ' ..
+        'will stay disabled until re-enabled by hand')
+    end
+  end
+
+  SetProp('Event Notifications', 'DISABLED (' .. until_text .. ')')
+  -- Loud on purpose: this is the driver being told to stay quiet about a
+  -- security system, and it should be obvious in the log that it did.
+  LogWarn('Event notifications DISABLED ' .. until_text ..
+    ' -- alarms and troubles will NOT fire programming events or push ' ..
+    'notifications. Live status in the app is unaffected.')
+  SetProp('Last Command Result', 'Event notifications DISABLED ' .. until_text)
 end
 
 function ReceivedFromProxy(idBinding, sCommand, tParams)
@@ -3814,6 +4363,10 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     -- last published" is not a reason to stay silent. Leaving this deduped
     -- would answer a refresh with nothing at all.
     SendPanelInfo(true)
+    -- Same reasoning for the status line: a rebound proxy has no text, so
+    -- drop the "already sent" memory and restate it.
+    DisplayTextSent = {}
+    PublishPartitionDisplayText()
     return
   end
 
@@ -3969,18 +4522,29 @@ function FirePartitionEvent(partitionId, suffix)
     if not DECLARED_PARTITION_EVENTS[suffix] then
       SetProp('Last Event Summary', 'Partition ' .. partitionId .. ' ' .. suffix)
       if suffix:match('^Armed') then
-        C4:FireEvent('Partition ' .. partitionId .. ' Armed')
+        FireDriverEvent('Partition ' .. partitionId .. ' Armed')
       else
-        C4:FireEvent('Unmapped Panel Event')
+        FireDriverEvent('Unmapped Panel Event')
       end
       return
     end
-    C4:FireEvent('Partition ' .. partitionId .. ' ' .. suffix)
+    FireDriverEvent('Partition ' .. partitionId .. ' ' .. suffix)
   else
     SetProp('Last Event Summary', 'Partition ' .. partitionId .. ' ' .. suffix)
-    C4:FireEvent('Unmapped Panel Event')
+    FireDriverEvent('Unmapped Panel Event')
   end
 end
+
+-- CID types that are normal panel housekeeping rather than anything to act
+-- on. Names from Appendix A of PIMA's Force Interface JSON specification.
+ROUTINE_EVENT_NAMES = {
+  [305] = 'system power-up',
+  [306] = 'programming changed',
+  [412] = 'remote upload/download',
+  [601] = 'manual test',
+  [602] = 'periodic test',
+  [625] = 'time/date changed',
+}
 
 function DispatchEvent(frame)
   local etype = tonumber(frame.type) or 0
@@ -4001,7 +4565,7 @@ function DispatchEvent(frame)
     SetProp('Last Zone Number', tostring(zone))
     SetProp('Last Zone Name', zname)
     SetProp('Last Zone Partition', tostring(partition))
-    C4:FireEvent(isOpen and 'Zone Opened' or 'Zone Closed')
+    FireDriverEvent(isOpen and 'Zone Opened' or 'Zone Closed')
     -- Pass nil for bypassed so the zone's tracked bypass state is preserved:
     -- hardcoding false here used to silently clear the bypass flag on the
     -- widget the moment a bypassed zone next opened or closed.
@@ -4021,7 +4585,7 @@ function DispatchEvent(frame)
         tostring(frame.partition) .. ') -- not applied to any partition')
       SetProp('Last Event Summary',
         'Arm/disarm event with no partition (type=' .. etype .. ' qualifier=' .. qualifier .. ')')
-      C4:FireEvent('Unmapped Panel Event')
+      FireDriverEvent('Unmapped Panel Event')
       return
     end
     for _, pid in ipairs(targets) do
@@ -4051,19 +4615,20 @@ function DispatchEvent(frame)
         ' with no usable partition (raw: ' .. tostring(frame.partition) .. ')')
       SetProp('Last Event Summary',
         (isNew and 'Burglary alarm' or 'Burglary alarm restored') .. ' (no partition reported)')
-      C4:FireEvent('Unmapped Panel Event')
+      FireDriverEvent('Unmapped Panel Event')
       return
     end
-    local panelWide = false
     -- Alarms are the events you will most want to find in a log after the
-    -- fact, so they are logged unconditionally (not behind Debug Logging)
-    -- and land in Recent Activity.
+    -- fact, so they are logged unconditionally (not behind a debug flag)
+    -- and land in Recent Activity. PartitionTargets never returns a fan-out
+    -- for partition 0 (see its comment -- doing so once marked a whole house
+    -- disarmed off one event), so anything reaching here names a partition.
     LogInfo((isNew and 'BURGLARY ALARM' or 'Burglary alarm restored') ..
-      ' -- partition ' .. (panelWide and 'all (panel-wide)' or tostring(partition)) ..
+      ' -- partition ' .. tostring(partition) ..
       (zone > 0 and (', zone ' .. zone) or ''))
     for _, pid in ipairs(targets) do
       if isNew then
-        SetPartitionAlarm(pid, 'Burglary', true, panelWide and 'panel' or 'partition')
+        SetPartitionAlarm(pid, 'Burglary', true, 'partition')
       else
         ClearPartitionAlarm(pid, 'Burglary')
       end
@@ -4092,7 +4657,12 @@ function DispatchEvent(frame)
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo((isNew and (emergency:upper() .. ' ALARM') or (emergency .. ' alarm restored')) ..
       ' -- partition ' .. tostring(partition) .. (zone > 0 and (', zone ' .. zone) or ''))
-    C4:FireEvent(isNew and names[emergency][1] or names[emergency][2])
+    FireDriverEvent(isNew and names[emergency][1] or names[emergency][2])
+    if isNew then
+      local where = (zone > 0) and (Zones[zone] and Zones[zone].name or ('zone ' .. zone))
+        or ('partition ' .. tostring(partition))
+      FireAlert(emergency, emergency .. ' alarm -- ' .. where)
+    end
     NotifyProxyEmergency(partition, emergency, isNew)
     return
   end
@@ -4100,7 +4670,8 @@ function DispatchEvent(frame)
   if etype == EV_TAMPER then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'TAMPER alarm' or 'Tamper restored')
-    C4:FireEvent(isNew and 'Tamper Alarm' or 'Tamper Restored')
+    FireDriverEvent(isNew and 'Tamper Alarm' or 'Tamper Restored')
+    if isNew then FireAlert('Tamper', 'Tamper alarm') end
     NotifyProxyTrouble('Tamper', isNew)
     return
   end
@@ -4109,21 +4680,24 @@ function DispatchEvent(frame)
   if etype == EV_AC_LOSS then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'Panel AC power lost' or 'Panel AC power restored')
-    C4:FireEvent(isNew and 'AC Power Lost' or 'AC Power Restored')
+    FireDriverEvent(isNew and 'AC Power Lost' or 'AC Power Restored')
+    if isNew then FireTrouble('AC Power', 'Mains power lost') end
     NotifyProxyTrouble('AC power lost', isNew)
     return
   end
   if etype == EV_LOW_BATTERY then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'Panel low battery' or 'Panel battery restored')
-    C4:FireEvent(isNew and 'Low Battery' or 'Low Battery Restored')
+    FireDriverEvent(isNew and 'Low Battery' or 'Low Battery Restored')
+    if isNew then FireTrouble('Battery', 'Panel battery low') end
     NotifyProxyTrouble('Low battery', isNew)
     return
   end
   if etype == EV_COMM_TROUBLE then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'Panel communication trouble' or 'Panel communication restored')
-    C4:FireEvent(isNew and 'Communication Trouble' or 'Communication Restored')
+    FireDriverEvent(isNew and 'Communication Trouble' or 'Communication Restored')
+    if isNew then FireTrouble('Communication', 'Panel communication trouble') end
     NotifyProxyTrouble('Communication trouble', isNew)
     return
   end
@@ -4134,7 +4708,7 @@ function DispatchEvent(frame)
     local bypassed = (qualifier == QUALIFIER_NEW)
     SetProp('Last Zone Number', tostring(zone))
     SetProp('Last Zone Name', zcfg and zcfg.name or ('Zone ' .. zone))
-    C4:FireEvent(bypassed and 'Zone Bypassed' or 'Zone Bypass Cleared')
+    FireDriverEvent(bypassed and 'Zone Bypassed' or 'Zone Bypass Cleared')
     -- Keep the widget's bypass indicator truthful: without this a bypassed
     -- (i.e. disabled) detector looks like a live one in the UI, and someone
     -- arms believing they have coverage they do not have.
@@ -4145,13 +4719,33 @@ function DispatchEvent(frame)
   -- Output (siren etc.)
   if etype == EV_OUTPUT and zone > 0 then
     SetProp('Last Output Number', tostring(zone))
-    C4:FireEvent(qualifier == QUALIFIER_NEW and 'Output Activated' or 'Output Deactivated')
+    FireDriverEvent(qualifier == QUALIFIER_NEW and 'Output Activated' or 'Output Deactivated')
     return
   end
 
-  -- Anything else: still visible via the Last Event * properties above.
+  --[[-------------------------------------------------------------------------
+      Routine housekeeping the panel reports on its own schedule.
+
+      These are normal operation, not faults, and firing Unmapped Panel Event
+      for them meant the panel's periodic test alone produced a programming
+      event -- something that looks exactly like "an event with no actual
+      fault behind it" to anyone with a notification wired up. They are
+      identified from Appendix A of PIMA's spec, logged so they are still
+      visible, and deliberately raise nothing.
+  ---------------------------------------------------------------------------]]
+  local routine = ROUTINE_EVENT_NAMES[etype]
+  if routine then
+    LogInfo('Panel ' .. routine .. ' (CID ' .. etype .. ') -- routine, no action taken')
+    SetProp('Last Event Summary', routine .. ' (CID ' .. etype .. ')')
+    return
+  end
+
+  -- Anything else: genuinely unrecognised, and still visible via the
+  -- Last Event * properties above.
   SetProp('Last Event Summary', 'type=' .. etype .. ' qualifier=' .. qualifier .. ' zone=' .. zone .. ' partition=' .. partition)
-  C4:FireEvent('Unmapped Panel Event')
+  LogWarn('Unrecognised panel event: type=' .. etype .. ' qualifier=' .. qualifier ..
+    ' zone=' .. zone .. ' partition=' .. partition)
+  FireDriverEvent('Unmapped Panel Event')
 end
 
 --[[=============================================================================
@@ -4377,19 +4971,107 @@ function OnDriverLateInit()
   end
   SetProp('Driver Version', shown)
   LogInfo('PIMA FORCE driver ready, version ' .. shown)
-  -- Proxy bindings are only reliably connected by LateInit, so the initial
-  -- PARTITION_ENABLED / PARTITION_STATE_INIT notifications belong here --
-  -- sent from OnDriverInit they can be dropped, leaving the partition proxy
-  -- never explicitly enabled and its keypad inert.
-  ApplyPropertyVisibility()
-  NotifyProxyPartitionsInit()
-  PublishPartitionDisplayText()
-  SendPanelInfo()
+  RunDriverInit()
+end
+
+--[[=============================================================================
+    Driver init -- synchronous, and measured.
+
+    History. v13 batched the per-zone publishing onto a timer to fix a ~40s
+    Composer freeze. Everything added since went back onto the load callback
+    -- 12 AddVariable (v30-v35), 12 SetPropertyAttribs (v15), the partition
+    notifications -- and by v35 a 40-zone install froze Composer for ~50
+    seconds again. v36 moved the whole block onto a timer; v38 then had to
+    patch two races that created (an OFFLINE seed landing after live panel
+    state, and a lost timer stranding the driver half-loaded).
+
+    v39 reverses that. Deferring init trades a guaranteed annoyance for a
+    rare wrong answer about whether a house is armed, and on a security
+    driver that is the wrong side of the trade. Init is synchronous again:
+    when OnDriverLateInit returns, the driver is fully loaded, with no window
+    in which a panel frame can interleave with a half-built driver.
+
+    The freeze is then a volume problem, and volume is fixed by making fewer
+    calls -- not by moving them. Which calls to cut is a measurement, not a
+    guess: the "0.4s per Director round trip" this project has been reasoning
+    from is one figure divided out of one v13 observation, and it has been
+    extrapolated across five versions without being rechecked. So each phase
+    is timed and reported at Info on every load:
+
+        init timing: variables 000ms, visibility 000ms, proxies 000ms,
+                     zones 000ms, TOTAL 000ms (n calls)
+
+    One driver update now says exactly where the time goes, and the next cut
+    can be aimed rather than guessed.
+===============================================================================]]
+-- Wraps one init phase: runs it, times it, and never lets it take the rest
+-- of init down with it. Returns the elapsed milliseconds.
+function RunInitPhase(name, fn)
+  local started = nil
+  if C4 and C4.GetTime then
+    local ok, t = pcall(function() return C4:GetTime() end)
+    if ok then started = tonumber(t) end
+  end
+  local ok, err = pcall(fn)
+  if not ok then
+    -- A phase failing must not strand the ones after it: a driver with no
+    -- property visibility is usable, a driver that never enabled its
+    -- partition proxies is not.
+    LogError('Driver init phase "' .. name .. '" failed: ' .. tostring(err))
+  end
+  if not started then return 0 end
+  local finished = started
+  if C4 and C4.GetTime then
+    local ok2, t2 = pcall(function() return C4:GetTime() end)
+    if ok2 and tonumber(t2) then finished = tonumber(t2) end
+  end
+  return math.floor(math.max(0, finished - started))
+end
+
+function RunDriverInit()
+  local t = {}
+
+  t.variables = RunInitPhase('variables', function()
+    DeclareDriverVariables()
+    -- A mute must not survive a driver reload silently: a reload is exactly
+    -- when someone is fixing the panel, and coming back up muted with no one
+    -- aware is the failure this guards against.
+    SetEventsEnabled(true, 'driver load')
+  end)
+
+  t.visibility = RunInitPhase('visibility', function()
+    ApplyPropertyVisibility()
+  end)
+
+  t.proxies = RunInitPhase('proxies', function()
+    -- Proxy bindings are only reliably connected by LateInit, so the initial
+    -- PARTITION_ENABLED / PARTITION_STATE_INIT notifications belong here --
+    -- sent from OnDriverInit they can be dropped, leaving the partition proxy
+    -- never explicitly enabled and its keypad inert.
+    NotifyProxyPartitionsInit()
+    PublishPartitionDisplayText()
+  end)
+
+  -- Zone publishing stays batched onto a timer, as it has been since v13.
+  -- That deferral is not the one v38 found races in: a zone inventory
+  -- arriving 50ms later cannot mis-state whether the house is armed, and it
+  -- is by far the largest block of calls.
+  t.zones = RunInitPhase('zones', function()
+    SendPanelInfo()
+  end)
+
+  local total = t.variables + t.visibility + t.proxies + t.zones
+  LogInfo(string.format(
+    'init timing: variables %dms, visibility %dms, proxies %dms, zones %dms, ' ..
+    'TOTAL %dms. Composer is frozen for this long on every driver update; ' ..
+    'if it is slow, this line says which phase to cut.',
+    t.variables, t.visibility, t.proxies, t.zones, total))
 end
 
 function OnDriverDestroyed()
   StopLinkWatchdog()
   CancelZonePublish()
+  CancelEventMuteTimer()
   StopServer()
   ResetQueueState()
   ClearInFlight()
@@ -4426,6 +5108,7 @@ function OnPropertyChanged(strProperty)
       RecvBuffer = ''
       FailInFlight('listen port changed')
       SetProp('Connection Status', 'Not Connected')
+      NotePanelDisconnected('link down')
       SetProp('Panel Verified Account', '')
       ResetPartitionStatus()
       for pid, _ in pairs(Partitions) do
@@ -4556,6 +5239,8 @@ function ExecuteCommand(strCommand, tParams)
         else SetProp('Last Event Summary', 'Zone status: ' .. JSON.encode(frame.parameters or {})) end
       end)
     end
+  elseif strCommand == 'Report Variables' then
+    ReportDriverVariables()
   elseif strCommand == 'Request Faults' then
     local pw = firstPartitionCode()
     if pw then
