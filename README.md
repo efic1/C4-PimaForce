@@ -21,7 +21,7 @@ Interface JSON Format Specification v2.4* — see
 [docs/SPEC-VALIDATION.md](docs/SPEC-VALIDATION.md) for exactly what is
 confirmed by the spec, what the spec corrected, and what remains ambiguous.
 
-245 offline regression tests, one per defect found in review or in the field.
+291 offline regression tests, one per defect found in review or in the field.
 
 ## Features
 
@@ -35,11 +35,13 @@ confirmed by the spec, what the spec corrected, and what remains ambiguous.
 - **Zone bypass** — set and clear, verified against the panel rather than
   trusted from the ACK, with a safety auto-clear timer and a never-bypass
   list for life-safety detectors.
+  Bypassed zones are named on the partition status line in the app.
 - **Alarm and trouble reporting** — burglary, fire, medical, panic, duress,
   tamper, AC loss, low battery and more, as Control4 programming events.
   Panel faults decode to readable text from the spec's fault table.
 - **Functions menu in the app** — Check Status, Arm All, Disarm All, Bypass
-  Open Zones, Clear All Bypasses, Refresh Troubles.
+  Open Zones, Clear All Bypasses, Refresh Troubles, and Disable / Enable
+  Event Notifications for muting a misbehaving panel.
 - **Hebrew zone names** — Windows-1255 names from the panel are transcoded to
   UTF-8 automatically, with a visual-order flag for panels that need it.
 - **Diagnostics** — connection state, last event, recent activity, a link
@@ -103,7 +105,8 @@ Use an account ID not shared with a real monitoring-station path.
 | Non-Bypassable Zones | *(empty)* | Zone numbers and/or type words that must never be bypassed |
 | Quiet Zones | *(empty)* | Zone numbers and/or type words that stop reporting open/close to the app |
 | Zone State Reporting | `Partition + Panel` | Which proxies carry live zone state |
-| Partition Display Text | *(empty)* | Experimental; see architecture notes |
+| Partition Display Text | *(empty)* | Fixed prefix for the partition status line on the app's Status tab |
+| Event Mute Minutes | `60` | How long *Disable Event Notifications* lasts before events resume by themselves. `0` = until re-enabled by hand |
 | Link Timeout Seconds | `600` | Treat the link as dead after this much silence. `0` disables |
 
 Plus 20 read-only diagnostic properties, hidden unless **Log Level** is
@@ -126,6 +129,10 @@ filing a bug:
 - **Zone open/close fills the app's History.** The same notification drives
   the live zone list and the History row, so they cannot be separated. Use
   **Quiet Zones** to silence noisy detectors such as motion.
+- **The Status tab carries a driver status line.** Below the lock indicator,
+  the driver states what is currently suppressed: `Notifications OFF` while
+  events are muted, and the names of any bypassed zones. **Partition Display
+  Text** prefixes it with a label of your own.
 - **No Emergency menu.** PIMA's protocol has no command to raise a fire,
   medical or police emergency, so those capabilities are deliberately off
   rather than being buttons that do nothing.
@@ -136,7 +143,7 @@ filing a bug:
 
 ```bash
 ./build.sh                        # regenerate driver.xml and package PimaForce.c4z
-lua5.4 tests/test_regressions.lua # 245 regression tests
+lua5.4 tests/test_regressions.lua # 291 regression tests
 lua5.4 tests/test_driver.lua      # happy-path harness
 ```
 
@@ -156,6 +163,9 @@ alarm.
   most non-obvious decisions and the field bugs behind them.
 - [docs/SPEC-VALIDATION.md](docs/SPEC-VALIDATION.md) — line-by-line
   validation against PIMA's specification, plus suggested additions.
+- [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md) — how to get push
+  notifications for alarms and faults (Push Notification agent + 4Sight), and
+  what the driver can and cannot do about it.
 - [CHANGELOG.md](CHANGELOG.md) — version history.
 
 ## Credits
@@ -167,6 +177,8 @@ alarm.
   documentation confirmed the zone-status bit layout, the arm `order` value,
   the real heartbeat cadence and the ACK-without-apply bypass failure mode.
 - PIMA Electronic Systems — the *Force Interface JSON Format Specification*.
+- Konnected's Security System Mirror driver — the reference for Control4's
+  own security proxy behaviour.
 
 ## License
 
