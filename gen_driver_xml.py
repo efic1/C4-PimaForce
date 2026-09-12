@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 29
+DRIVER_VERSION = 40
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's
@@ -103,11 +103,15 @@ add_property('Quiet Zones', 'STRING', '',
 add_property('Zone State Reporting', 'LIST', 'Partition + Panel', items=['Partition + Panel', 'Partition only', 'Panel only', 'Off'],
     description='Which proxy notifications carry live zone open/close. CONFIRMED ON REAL HARDWARE: ZONE_STATE (sent to the partition) drives BOTH the app History rows and the live open/closed indication in the zone list, while PANEL_ZONE_STATE (sent to the panel) drives neither - setting this to "Panel only" produced a clean History and a zone list with no open indication at all. So History noise and live zone status cannot be separated with this setting: they are the same notification. Use "Quiet Zones" instead to silence individual noisy zones while the rest stay live. "Partition only" is the efficient choice (half the proxy traffic, no observed loss); "Panel only" and "Off" both cost you live zone status.')
 add_property('Partition Display Text', 'STRING', '',
-    description='EXPERIMENTAL, and a test you can run in one edit. If the Zones tab in the app shows a bare "UNKNOWN" heading above the zone list, set this to any text (for example "Home") and watch that heading. It sends the partition proxy a DISPLAY_TEXT notification - the one remaining Control4 partition notify whose purpose is putting text on a partition screen, with its call shape copied from Control4\'s own shipped proxy template. If the heading changes to your text, that was the cause and this property is now the control for it. If the heading still reads UNKNOWN, DISPLAY_TEXT is ruled out and nothing further on the driver side will change that label. Leave empty to send nothing.')
+    description='Fixed text shown on the partition status line in the app - the line on the Status tab, below the lock indicator. Leave empty for none. The driver appends its own status to this line: "Notifications OFF" while event notifications are muted, and the names of any bypassed zones in that partition. So "Ground floor" here can read "Ground floor | Bypassed: Patio Door" in the app. (Originally added as an experiment against the Zones-tab "UNKNOWN" heading. It does not fill that heading - nothing on the driver side does - it renders on the Status tab instead, which turned out to be the more useful place.)')
+add_property('Event Mute Minutes', 'RANGED_INTEGER', 60, minimum=0, maximum=1440,
+    description='How long "Disable Event Notifications" (Functions menu in the app) stays in effect before the driver re-enables events by itself. A mute that is forgotten on a security system is its own hazard - after this many minutes, programming events and notifications resume automatically. 0 means stay muted until re-enabled by hand, which is not recommended. Muting only stops programming events; live status in the app - armed state, zone open/closed, the shield - is never affected, and while muted the partition status line on the app\'s Status tab reads "Notifications OFF" so the mute is visible rather than silent.')
 add_property('Link Timeout Seconds', 'RANGED_INTEGER', 600, minimum=0, maximum=3600,
     description='Treat the panel as disconnected if nothing at all arrives from it for this many seconds. The panel normally sends traffic (a heartbeat, at minimum) about every 4 minutes, so silence past that means the link is gone - but a socket left half-open (panel powered off, cable pulled, network dropped) never reports a TCP disconnect, and without this the driver would keep reporting Connected forever and no alarm would ever reach Control4. The default of 600 leaves a comfortable margin over the normal ~240s cadence; do not set this below about 300 or ordinary heartbeat gaps risk being flagged as a dropped link. 0 disables the check, which is not recommended.')
 
 # --- Diagnostics (read-only) ---
+add_property('Event Notifications', 'STRING', 'Enabled', readonly=True,
+    description='Whether the driver is currently firing programming events. Controlled from the app Functions menu (Disable / Enable Event Notifications) and auto-re-enabled after Event Mute Minutes.')
 add_property('Connection Status', 'STRING', 'Not Connected', readonly=True,
     description='Not Connected / Client Connected (awaiting verification) / Connected.')
 add_property('Panel Verified Account', 'STRING', '', readonly=True,
@@ -160,6 +164,7 @@ command_defs = [
     ('Discover Zone Names', 'Query the panel for all configured zone names and populate the Discovered Zones property.', []),
     ('Apply Discovered Zones', 'Copy the contents of the Discovered Zones property into Zones Config, and push the updated zone list to the Control4 app. Run "Discover Zone Names" first. Zones are assigned to partition 1 by default - edit Zones Config afterwards if a zone belongs elsewhere.', []),
     ('Request Zone Status', 'Query current zone status bitfields (parameter 2149) and log a summary.', []),
+    ('Report Variables', 'Logs every driver variable and its current value, so a notification that came through with empty text can be diagnosed: either the variables exist and hold values, or they do not.', []),
     ('Request Faults', 'Query current system faults (parameter 2250) and log a summary.', []),
 ]
 
@@ -208,6 +213,13 @@ for i in range(1, MAX_PARTITIONS + 1):
     add_event(f'Partition {i} Alarm Restored', f'Partition {i} burglary alarm restored.')
 
 generic_events = [
+    # Consolidated hooks so a complete notification setup is two programming
+    # scripts rather than one per condition. The specific events below still
+    # fire as well; these are in addition, never instead.
+    ('Any Alarm', 'ANY alarm condition: burglary, fire, medical, panic, duress or tamper, on any partition. Fires alongside the specific event. Use this for a single push-notification script instead of wiring one per alarm type - the ALERT_TYPE and ALERT_TEXT variables say which it was.'),
+    ('Any Trouble', 'ANY system trouble: mains power, battery, communications, or the panel connection being lost. Fires alongside the specific event. ALERT_TYPE and ALERT_TEXT describe it.'),
+    ('Panel Connection Lost', 'The driver can no longer reach the panel - either the socket closed or nothing arrived for Link Timeout Seconds. The system is not being monitored through Control4 until it returns. Worth a notification.'),
+    ('Panel Connection Restored', 'The panel is talking to the driver again.'),
     ('Zone Opened', 'A zone opened. See Last Zone Number / Last Zone Name.'),
     ('Zone Closed', 'A zone closed. See Last Zone Number / Last Zone Name.'),
     ('Zone Bypassed', 'A zone was bypassed (from the keypad or this driver). See Last Zone Number / Last Zone Name.'),
@@ -330,7 +342,7 @@ capabilities = f"""\t<capabilities>
 \t\t</button_D>
 
 \t\t<arm_states>{ARM_LABEL_AWAY},{ARM_LABEL_STAY},{ARM_LABEL_NIGHT}</arm_states>
-\t\t<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles</functions>
+\t\t<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles,Disable Event Notifications,Enable Event Notifications</functions>
 \t</capabilities>"""
 
 documentation = """
