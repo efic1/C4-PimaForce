@@ -23,7 +23,7 @@ specification, see [SPEC-VALIDATION.md](SPEC-VALIDATION.md).
 - `driver.xml` — generated device metadata: properties, commands, actions,
   programming events, proxies and capabilities. Committed so the tests and
   the packaged `.c4z` have it, and checked for staleness in CI.
-- `tests/test_regressions.lua` — 245 regression tests, one per defect found
+- `tests/test_regressions.lua` — 291 regression tests, one per defect found
   in review or in the field, each named for the failure it locks down. Run
   this before shipping any change; it is the file that will tell you if a
   "small fix" has reintroduced a fail-open disarm or a stuck alarm.
@@ -66,6 +66,13 @@ in Composer Pro is already whatever text you typed (Composer's property
 fields are UTF-8), so no decoding is applied there.
 
 ## What is verified, and what is not
+
+Originally this driver was written against
+[homebridge-pima-force](https://github.com/electricmonk/homebridge-pima-force)
+and a shipped Control4 security driver, so large parts of the protocol were
+inference. **That is no longer the case**: it has since been checked against
+PIMA's own specification and against a second, physically-validated
+implementation.
 
 [SPEC-VALIDATION.md](SPEC-VALIDATION.md) is the authoritative record. In
 summary:
@@ -125,7 +132,7 @@ it refuses to guess: an unknown value is reported as unknown rather than
 assumed, and anything the panel merely acknowledged is verified before it is
 believed.
 
-245 offline regression tests cover these, one per defect, each named for the
+291 offline regression tests cover these, one per defect, each named for the
 failure it locks down. They mock the Control4 runtime, so they cannot prove
 timing or byte-stream behaviour against a real panel — that part is covered by
 the installation it runs on.
@@ -345,6 +352,52 @@ candidates are `CODE_REQUIRED` (confirmed-real, unsent by this driver, but
 its documented purpose is prompting for a code, not labeling) or accepting
 this may be a Navigator/OS-version quirk unrelated to any notify.
 
+**v24's `DISPLAY_TEXT` experiment is settled, in the negative.** It does not
+fill the Zones-tab header. It renders on the app's **Status tab, below the
+lock indicator** — a different screen and a different slot. So the UNKNOWN
+header stays unexplained from the driver side and no further attempt at it is
+worth making; but the experiment handed back a usable line of
+driver-controlled text on the screen a user is already looking at, which
+v37 puts to work (see *The partition status line* below).
+
+### The partition status line
+
+`DISPLAY_TEXT` carries one line per partition, composed by
+`PartitionStatusText()` — pure, no Director calls, so it is cheap to
+recompute and directly testable. It joins, in order:
+
+1. **Partition Display Text** — the installer's own label, if set.
+2. `Notifications OFF`, while event notifications are muted.
+3. `Bypassed: <names>`, or `Bypassed: N zones` past three.
+
+The two driver-supplied pieces are both *suppression* states: the system
+doing less than it appears to. That is what a status line is for, and why
+they share one.
+
+**Why the mute moved here.** v31 indicated it by raising a standing panel
+trouble. That was wrong on reflection — it asserts a fault on a panel that
+has none, and once v35 gave troubles stable identifiers it also occupied a
+slot in a list meant for real conditions. The trouble is gone; the *clear*
+is still sent on every enable, so a driver upgraded from v31–v36 while muted
+does not strand a phantom trouble with nothing left to clear it.
+
+**Why bypasses are here too.** A bypass is a disabled detector. Control4
+shows it per zone on the Zones tab, so noticing it means going to look. On
+the status line it is in front of whoever is about to arm.
+
+Three details that are load-bearing:
+
+- The line is republished **before** the Quiet Zones and Zone State Reporting
+  checks in `NotifyProxyZoneState`. Those settings silence open/close
+  chatter; a bypass is not chatter, and hiding it was never their intent.
+- An empty line is **sent as empty**, not skipped. Skipping would leave a
+  stale `Bypassed: Front Door` on screen after the bypass cleared — a false
+  statement about a security system.
+- Identical text is not re-sent (`DisplayTextSent` per partition). Zone
+  events arrive in bursts and every `DISPLAY_TEXT` is a blocking round trip.
+  A forced refresh (`SYNC_PANEL_INFO` and friends) clears that memory, since
+  a rebound proxy has no text.
+
 **Zone list** -- three separate notifications are needed for a zone to appear
 with a live status, and missing any one leaves the list empty or dead:
 
@@ -363,6 +416,56 @@ Composer waits on: that was the ~40-second Composer freeze on every driver
 update after a zone list was imported. `PANEL_INITIALIZED` is sent after the
 last zone, and a publish started while another is draining replaces it rather
 than interleaving.
+
+**The rest of init followed, in v36 -- and was reversed in v39.** Batching
+the zone traffic fixed the symptom without fixing the cause: `OnDriverLateInit`
+was still where init work went, and it kept accumulating -- 12 `AddVariable`
+across v30-v35, 12 `SetPropertyAttribs` from v15, the partition
+notifications. On a 40-zone config that was 55 blocking calls before the
+callback returned and a ~50 second Composer freeze on every update.
+
+v36 moved the whole block onto a timer. v38 then had to patch two races that
+created: an `OFFLINE` partition seed landing *after* a reconnecting panel had
+reported real state, and a lost timer leaving the driver permanently
+half-loaded with no symptom. Both were fixable, and both were signs the
+approach was wrong for this driver: deferring init trades a guaranteed
+annoyance for a rare wrong answer about whether a house is armed.
+
+**So init is synchronous, and the freeze is a volume problem.** When
+`OnDriverLateInit` returns the driver is fully loaded; no panel frame can
+interleave with a half-built driver. The way to make it fast is to make
+fewer calls, not to move them:
+
+- **No zone batch runs inline.** v13 left the first batch synchronous as a
+  compromise; that is now on the timer with the rest. Zone publishing is the
+  one deferral with no correctness question attached -- a zone *inventory*
+  arriving 50 ms later cannot mis-state armed status, unlike the partition
+  seeds. That distinction is the whole lesson of v36-v39.
+- **Partition variables are declared only for configured partitions**, saving
+  four round trips on a one-partition house and removing variables Composer
+  was offering for partitions that do not exist.
+
+That is 55 -> 36 on the reference config.
+
+**Init is measured, not estimated.** Each phase is timed and reported at
+Info on every load:
+
+```
+init timing: variables 000ms, visibility 000ms, proxies 000ms, zones 000ms, TOTAL 000ms
+```
+
+The "~0.4s per Director round trip" this project has optimised against came
+from one v13 observation divided out once, and has been extrapolated across
+five versions without recheck. The largest remaining block is 12
+`SetPropertyAttribs`; whether that is five seconds or fifty milliseconds is
+currently **unknown**, and that line is what will say. Aim the next cut at
+whichever phase it implicates.
+
+**Anything added to driver init lands on the load callback.** A regression
+test budgets it at 40 blocking calls and fails above that. The budget, not
+any one fix, is what makes this stay fixed -- v13 was correct and still
+regressed, because nothing stopped the next feature from adding one more
+call to that path.
 
 All three are sent at init, whenever **Zones Config** changes, and again once
 the panel actually connects (on a cold start the driver initialises before
