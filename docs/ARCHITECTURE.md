@@ -23,7 +23,7 @@ specification, see [SPEC-VALIDATION.md](SPEC-VALIDATION.md).
 - `driver.xml` — generated device metadata: properties, commands, actions,
   programming events, proxies and capabilities. Committed so the tests and
   the packaged `.c4z` have it, and checked for staleness in CI.
-- `tests/test_regressions.lua` — 291 regression tests, one per defect found
+- `tests/test_regressions.lua` — 296 regression tests, one per defect found
   in review or in the field, each named for the failure it locks down. Run
   this before shipping any change; it is the file that will tell you if a
   "small fix" has reintroduced a fail-open disarm or a stuck alarm.
@@ -132,7 +132,7 @@ it refuses to guess: an unknown value is reported as unknown rather than
 assumed, and anything the panel merely acknowledged is verified before it is
 believed.
 
-291 offline regression tests cover these, one per defect, each named for the
+296 offline regression tests cover these, one per defect, each named for the
 failure it locks down. They mock the Control4 runtime, so they cannot prove
 timing or byte-stream behaviour against a real panel — that part is covered by
 the installation it runs on.
