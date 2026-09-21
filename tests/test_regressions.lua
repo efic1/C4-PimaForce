@@ -2092,6 +2092,114 @@ local function answerSyncQueries(handle, systemKeyValue)
   end
 end
 
+test('a disarm ACK triggers a system-key read instead of waiting (v41)', function()
+  -- An ACK means "received", not "disarmed", so the driver never moved the
+  -- shield on an ACK -- it waited for the panel's own CID 400/401 event,
+  -- which the panel sends on its own schedule. In the field that left the
+  -- app on "Armed" for seconds after the user tapped disarm. The driver now
+  -- ASKS the panel (parameter 2310) rather than guessing or waiting.
+  freshDriver()
+  local h = connectPanel()
+  DisarmPartition(1)
+  local op = operations()[1]
+  assert(op and op.optype == 17, 'precondition: a disarm went out')
+
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+
+  local asked = false
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310 then asked = true end
+  end
+  assert(asked, 'the ACK must be followed by a system-key read, not silence')
+end)
+
+test('the disarm read-back moves the shield as soon as the panel confirms (v41)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+  calls.SendToProxy = {}
+
+  DisarmPartition(1)
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  answerSyncQueries(h, 97)      -- 97 = confirmed-disarmed in this fixture
+
+  assert(tostring(EffectivePartitionState(1)) == 'Disarmed',
+    'the partition must read Disarmed once the panel confirms it, got ' ..
+    tostring(EffectivePartitionState(1)))
+  local states = proxyCalls(5002, 'PARTITION_STATE')
+  assert(#states > 0, 'and the shield must have been told, without a panel event')
+end)
+
+test('the disarm read-back does not fire a duplicate programming event (v41)', function()
+  -- The panel's own disarm event still arrives and is what fires the
+  -- programming event. A read-back that also fired one would double every
+  -- notification wired to a disarm.
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+  DisarmPartition(1)
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  calls.FireEvent = {}
+  answerSyncQueries(h, 97)
+  for _, e in ipairs(calls.FireEvent) do
+    assert(not tostring(e):find('Disarmed'),
+      'the read-back must set state silently; the panel event fires the event')
+  end
+end)
+
+test('an ARM ACK does NOT read the panel back (v41)', function()
+  -- An arm has an exit delay, during which the panel legitimately still
+  -- reads disarmed. Reading back there would paint "Disarmed" over a system
+  -- that is arming correctly -- the wrong-direction error this driver
+  -- refuses to make.
+  freshDriver()
+  local h = connectPanel()
+  ArmPartition(1, 'away')
+  local op = operations()[1]
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    assert(not (f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310),
+      'an arm must not be verified by an immediate state read')
+  end
+end)
+
+test('a disarm ACKed but not applied is reported, not silently accepted (v41)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+  DisarmPartition(1)
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  local logs = withCapturedLogs(function()
+    answerSyncQueries(h, 3)     -- still armed
+  end)
+  local joined = table.concat(logs, '\n')
+  assert(joined:find('ACKed but the panel still reports', 1, true),
+    'a disarm the panel did not apply must say so, got: ' .. joined)
+  -- Deliberately NOT escalated to DISARM_FAILED: the panel's own event may
+  -- still be in flight and a false failure on the widget is worse.
+  for _, c in ipairs(calls.SendToProxy) do
+    assert(c[2] ~= 'DISARM_FAILED',
+      'the read-back must not raise DISARM_FAILED on its own')
+  end
+end)
+
 test('verifying the panel triggers a state query for each configured partition', function()
   freshDriver()
   connectPanel(1, true)   -- keep the sync traffic
@@ -2755,8 +2863,8 @@ test('a partition state change refreshes the ALL_PARTITIONS_INFO document', func
   -- ignores live state, so the only copy the app ever saw was the OFFLINE one
   -- from load time -- the header stayed "Unknown" forever even after the panel
   -- reported Armed Away.
-  local h = freshDriver()
-  connectPanel(h, true)
+  freshDriver()
+  local h = connectPanel(nil, true)
   answerSyncQueries(h, 3)                      -- system key 3 = Armed Away
   assert(Properties['Partition 1 State']:match('^Armed Away'),
     'precondition: the sync must have produced Armed Away')
@@ -2768,8 +2876,8 @@ test('a partition state change refreshes the ALL_PARTITIONS_INFO document', func
 end)
 
 test('an unchanged partition state does not re-send the partitions document', function()
-  local h = freshDriver()
-  connectPanel(h, true)
+  freshDriver()
+  local h = connectPanel(nil, true)
   answerSyncQueries(h, 3)
   local before = #proxyCalls(5001, 'ALL_PARTITIONS_INFO')
   SetPartitionState(1, 'Armed Away (Full Arm)')
@@ -3026,8 +3134,8 @@ test('a cold sync sends a live PARTITION_STATE, not only the seed', function()
   -- The app kept showing UNKNOWN -- the partition proxy's default -- after a
   -- successful state sync, because the sync only ever sent
   -- PARTITION_STATE_INIT, which Navigator does not appear to re-render on.
-  local h = freshDriver()
-  connectPanel(h, true)
+  freshDriver()
+  local h = connectPanel(nil, true)
   calls.SendToProxy = {}
   answerSyncQueries(h, 3)                      -- system key 3 = Armed Away
   local live = proxyCalls(5002, 'PARTITION_STATE')
@@ -3177,8 +3285,8 @@ test('a burst of zone open/close never displaces arm/disarm/alarm from Recent Ac
   -- cycling open/closed all evening must not push a real alarm out of a
   -- 25-entry ring buffer, because zone open/close never occupies a slot in
   -- it at all.
-  local h = freshDriver()
-  connectPanel(h)
+  freshDriver()
+  local h = connectPanel()
 
   -- A burglary alarm goes in...
   OnServerDataIn(h, '{"frame_type":"event","counter":300,"account":"1234","type":130,"qualifier":1,"zone":0,"partition":1}',
@@ -3205,8 +3313,8 @@ test('a burst of zone open/close never displaces arm/disarm/alarm from Recent Ac
 end)
 
 test('arm and disarm are recorded in Recent Activity', function()
-  local h = freshDriver()
-  local handle = connectPanel(h, true)
+  freshDriver()
+  local handle = connectPanel(nil, true)
   answerSyncQueries(handle, 1)                 -- starts disarmed
   ClearInFlight(); ResetQueueState(); calls.ServerSend = {}
   -- Local disarm event (CID 401-family), then an arm.
