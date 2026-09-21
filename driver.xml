@@ -5,8 +5,8 @@
 	<model>FORCE Series</model>
 	<creator>Community</creator>
 	<created>09/04/2026 00:00</created>
-	<modified>09/08/2026 15:50</modified>
-	<version>40</version>
+	<modified>09/20/2026 14:29</modified>
+	<version>41</version>
 	<small>devices_sm/c4.gif</small>
 	<large>devices_lg/c4.gif</large>
 	<control>lua_gen</control>

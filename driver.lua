@@ -96,7 +96,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 40
+local DRIVER_VERSION = 41
 
 -- How much of a discovered zone list to show in the read-only preview
 -- property. Only affects display: the full list is kept in memory and is what
@@ -1913,6 +1913,47 @@ function ArmPartition(partitionId, mode)
   end)
 end
 
+--[[---------------------------------------------------------------------------
+    Why a disarm reads the panel back (v41).
+
+    An ACK means "command received", not "system disarmed", so the driver has
+    never changed the shield on an ACK -- it waited for the panel to report
+    the disarm as a CID 400/401 event. That is correct and it is also slow:
+    the panel sends that event on its own schedule, and in the field the app
+    sat on "Armed" for a few seconds after the user tapped disarm. Long
+    enough for someone to tap it again.
+
+    So on an ACK the driver now ASKS: one system-key read (parameter 2310),
+    which is the same authoritative query the cold sync uses. Not a guess --
+    the shield moves when the panel says it moved, just without waiting for
+    the panel to volunteer it. This is the v26 bypass pattern (verify, do not
+    trust the ACK) applied to arming.
+
+    The queue's own 500ms post-OPERATION pacing gives the panel a settling
+    window before the read goes out, so this needs no delay of its own.
+
+    Deliberately NOT done for arming: an arm has an exit delay, during which
+    the panel legitimately still reads disarmed. Reading back there would
+    paint "Disarmed" over a system that is arming correctly -- the exact
+    wrong-direction error this driver refuses to make.
+-----------------------------------------------------------------------------]]
+function VerifyDisarm(partitionId)
+  QueryPartitionArmState(partitionId, {
+    fireEvents = false,
+    onApplied = function(state)
+      if tostring(state):find('Armed') then
+        -- Not escalated to DISARM_FAILED: the panel's own disarm event may
+        -- still be in flight, and a false "disarm failed" on the widget is
+        -- worse than a slow one. Say it in the log and let the event settle
+        -- it.
+        LogWarn('Disarm of partition ' .. partitionId .. ' was ACKed but the ' ..
+          'panel still reports ' .. tostring(state) .. '. If the app stays armed, ' ..
+          'the code used may not have rights to disarm this partition.')
+      end
+    end,
+  })
+end
+
 function DisarmPartition(partitionId)
   SendOperation(partitionId, OPTYPE_DISARM, 0, nil, function(frame, err)
     if err then
@@ -1922,6 +1963,7 @@ function DisarmPartition(partitionId)
     else
       Dbg('Disarm partition ' .. partitionId .. ' ACKed')
       SetProp('Last Command Result', 'Disarm partition ' .. partitionId .. ' accepted by panel')
+      VerifyDisarm(partitionId)
     end
   end)
 end
@@ -1950,6 +1992,7 @@ function DisarmAllPartitions()
       for pid in pairs(Partitions) do NotifyProxyDisarmFailed(pid) end
     else
       Dbg('Disarm All ACKed')
+      for pid in pairs(Partitions) do VerifyDisarm(pid) end
     end
   end)
 end
@@ -2285,6 +2328,7 @@ function QueryPartitionArmState(partitionId, opts)
       (note and (' (' .. note .. ')') or ''))
     SetPartitionState(partitionId, state, opts.isInit)
     if fireEvents then FirePartitionEvent(partitionId, state) end
+    if opts.onApplied then pcall(opts.onApplied, state) end
   end
 
   if not pw then

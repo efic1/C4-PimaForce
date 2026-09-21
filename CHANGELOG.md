@@ -10,6 +10,37 @@ changes hot-reload.
 
 ---
 
+## v41 — the app catches up with a disarm immediately
+
+- **Fixed: the shield stayed on "Armed" for a few seconds after disarming.**
+  An ACK means "command received", not "system disarmed", so the driver has
+  never moved the shield on an ACK — it waited for the panel to report the
+  disarm as its own CID 400/401 event, which the panel sends on its own
+  schedule. Correct, and slow enough that someone would tap disarm twice.
+  On an ACK the driver now **asks** the panel: one system-key read
+  (parameter 2310), the same authoritative query the cold sync uses. Still
+  not a guess — the shield moves when the panel says it moved, without
+  waiting for the panel to volunteer it. This is v26's bypass rule (verify;
+  never trust an ACK) applied to arming.
+- The read is spaced by the queue's existing 500 ms post-`OPERATION` pacing,
+  so it needs no delay of its own, and it is sent with events suppressed —
+  the panel's own event still fires the programming event, so nothing
+  doubles.
+- **Deliberately not done for arming.** An arm has an exit delay, during
+  which the panel legitimately still reads disarmed. Reading back there would
+  paint "Disarmed" over a system that is arming correctly — the
+  wrong-direction error this driver exists to avoid. A test asserts the arm
+  path stays silent.
+- A disarm the panel ACKs but does not apply is now reported in the log,
+  naming the likely cause (a code without rights to that partition). It is
+  deliberately **not** escalated to `DISARM_FAILED` on the widget: the
+  panel's own event may still be in flight, and a false "disarm failed" is
+  worse than a slow one.
+- Tests: fixed a set of existing tests that fed frames on a nil handle —
+  `freshDriver()` returns nothing, so they were exercising the driver's
+  unverified path rather than the one they named. Found while verifying a
+  new test was passing for the right reason; it was not.
+
 ## v40 — the BOOL variables never worked
 
 - **Fixed: `PANEL_CONNECTED`, `EVENTS_ENABLED` and `PARTITION_n_ARMED` have
