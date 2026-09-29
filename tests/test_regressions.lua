@@ -19,6 +19,7 @@ end
 
 local function mockC4()
   timers, timerSeq, now = {}, 0, 1000000
+  if not KeepPersisted then Persisted = {}; PersistPending = {} else commitPersist() end
   C4 = {
     CreateServer = function(self, port) table.insert(calls.CreateServer, port) end,
     DestroyServer = function(self, port) table.insert(calls.DestroyServer, port) end,
@@ -64,6 +65,35 @@ local function mockC4()
       table.insert(calls.SetPropertyAttribsSeq, name)
     end,
     DebugLog = function(self, msg) end,
+    -- DriverWorks persistence (OS 2.10+). Fresh and empty per mockC4(), which
+    -- models a new install; tests that model an upgrade seed it first.
+    --
+    -- Models the REAL controller, observed in the field on v43: a stored
+    -- string that is valid JSON comes back DECODED -- an object as a table,
+    -- "1" as a number. v43's mock returned strings verbatim, which is exactly
+    -- how a byte-for-byte read-back that fails on hardware passed here.
+    -- Set PersistVerbatim = true to model a controller that does not decode.
+    PersistGetValue = function(self, key)
+      local v = Persisted[key]
+      -- Other transformations a controller might apply, for tests that
+      -- need them: a length cap and backslash-escape processing.
+      if type(v) == 'string' and PersistMaxLen and #v > PersistMaxLen then v = v:sub(1, PersistMaxLen) end
+      if type(v) == 'string' and PersistUnescapes then v = v:gsub('\\(.)', '%1') end
+      if PersistVerbatim or type(v) ~= 'string' or not JSON then return v end
+      local ok, decoded = pcall(function() return JSON.decode(v) end)
+      if ok and decoded ~= nil and type(decoded) ~= 'string' then return decoded end
+      return v
+    end,
+    -- Writes are DEFERRED, as on the field controller (v45 log: a new key read
+    -- straight back "came back as a nil"). They land when commitPersist()
+    -- runs -- the harness calls it where time would pass on a real system.
+    -- PersistImmediate = true models a controller that applies them at once.
+    PersistSetValue = function(self, key, value)
+      if PersistImmediate then Persisted[key] = value else PersistPending[key] = { v = value } end
+    end,
+    PersistDeleteValue = function(self, key)
+      if PersistImmediate then Persisted[key] = nil else PersistPending[key] = { v = nil } end
+    end,
     GetDriverConfigInfo = function(self, key) return '1.0' end,
     GetTime = function(self) return now end,
   }
@@ -71,6 +101,25 @@ end
 
 Variables = {}
 VariableTypes = {}
+Persisted = {}
+PersistPending = {}
+
+function commitPersist()
+  for k, e in pairs(PersistPending or {}) do Persisted[k] = e.v end
+  PersistPending = {}
+end
+
+-- Lets deferred writes land and runs the driver's delayed storage check(s),
+-- as a few seconds passing on a real controller would.
+function settlePersist()
+  commitPersist()
+  local guard = 0
+  while PersistVerifyTimerId and guard < 10 do
+    guard = guard + 1
+    OnTimerExpired(PersistVerifyTimerId)
+    commitPersist()
+  end
+end
 
 local DEFAULT_PROPS = {
   ['Listen Port'] = '7780',
@@ -129,6 +178,7 @@ local function freshDriver(overrides, keepZoneQueue)
   -- before deferral. Tests that care about the deferral itself drive it
   -- themselves instead of using this helper.
   if not keepZoneQueue then drainZonePublish() end
+  settlePersist()
 end
 
 -- Bring a verified panel session up on the given handle.
@@ -215,6 +265,7 @@ function runDiscovery(handle, names, pageCap, reportedCount)
       '{"frame_type":"DATA","account":1234,"counter":%d,"id":%d,"start_order":%s,"parameters":[%s]}',
       req.counter, id, tostring(req.start_order), body), '10.0.0.50', 5555)
   end
+  settlePersist()
   return sawCountQuery, pages
 end
 
@@ -532,12 +583,13 @@ test('a null inside a zone-name array does not shift every later zone', function
   local names = { n = 3 }
   names[1] = 'Front Door'
   names[3] = 'Garage Door'
+  -- A fresh install with no zones yet: discovery fills the store.
+  Zones = {}; ZoneStore = {}
   runDiscovery(h, names)
-  local discovered = Properties['Discovered Zones']
-  assert(discovered:find('1,Front Door'), 'zone 1 should be Front Door, got: ' .. tostring(discovered))
-  assert(discovered:find('3,Garage Door'),
-    'Garage Door is zone 3 and must not slide up to zone 2, got: ' .. tostring(discovered))
-  assert(not discovered:find('2,Garage Door'), 'the null must hold zone 2 open')
+  assert(PanelZoneNames[1] == 'Front Door', 'zone 1 should be Front Door, got: ' .. tostring(PanelZoneNames[1]))
+  assert(PanelZoneNames[3] == 'Garage Door',
+    'Garage Door is zone 3 and must not slide up to zone 2, got: ' .. tostring(PanelZoneNames[3]))
+  assert(PanelZoneNames[2] == nil, 'the null must hold zone 2 open')
 end)
 
 test('a non-array "parameters" from the panel does not throw or strand the partition', function()
@@ -2600,7 +2652,7 @@ test('publishing a large inventory stays within a sane number of round trips', f
 end)
 
 --=============================================================================
-section('Apply Discovered Zones action')
+section('Zone discovery')
 --=============================================================================
 
 
@@ -2614,8 +2666,7 @@ test('discovery pages through ALL zones, not just the first', function()
   assert(DiscoveredZonesCount == 40,
     'all 40 zones must be discovered, got ' .. tostring(DiscoveredZonesCount))
   assert(pages > 2, 'a 40-zone panel must take several pages, took ' .. pages)
-  assert(DiscoveredZonesFull:find('40,Zone 40,contact,1', 1, true),
-    'the last zone must be present')
+  assert(PanelZoneNames[40] == 'Zone 40', 'the last zone must be present')
 end)
 
 test('every zone-name request carries an explicit range', function()
@@ -2695,99 +2746,614 @@ test('unnamed zones returned as nulls do not end discovery early', function()
   runDiscovery(h, names)
   assert(DiscoveredZonesCount == 3, 'named zones spread across pages must all be found, got ' ..
     tostring(DiscoveredZonesCount))
-  assert(DiscoveredZonesFull:find('20,Garage,contact,1', 1, true),
+  assert(PanelZoneNames[20] == 'Garage',
     'a named zone after a long unnamed run must still be discovered')
 end)
 
-test('applying discovered zones fills Zones Config and republishes the list', function()
-  freshDriver({ ['Zones Config'] = '' })
-  local h = connectPanel()
-  runDiscovery(h, { 'Front Door', 'Back Door' })
-  calls.SendToProxy = {}
-  ExecuteCommand('Apply Discovered Zones', {})
-  drainZonePublish()
-  assert(Properties['Zones Config'] == '1,Front Door,contact,1;2,Back Door,contact,1',
-    'Zones Config should now hold the discovered list, got: ' .. tostring(Properties['Zones Config']))
-  assert(Zones[1] and Zones[1].name == 'Front Door', 'the zones must be parsed into memory')
-  assert(Zones[2] and Zones[2].name == 'Back Door')
-  assert(#proxyCalls(5001, 'PANEL_ZONE_INFO') == 2, 'the app must get the new zone list immediately')
-  assert((Properties['Last Command Result'] or ''):find('Applied 2 zones', 1, true),
-    'the outcome must be reported, got: ' .. tostring(Properties['Last Command Result']))
+--=============================================================================
+section('Zone store and Zones Config overrides (v43)')
+--=============================================================================
+
+local LEGACY = '1,דלת כניסה,contact,1;2,Kitchen PIR,motion,1;3,Garage,contact,2;4,Hall,contact,'
+
+-- Loads the driver as an upgrade from v42: a full Zones Config, empty store.
+local function upgradeFrom(configText, props)
+  local p = { ['Zones Config'] = configText }
+  for k, v in pairs(props or {}) do p[k] = v end
+  freshDriver(p)
+end
+
+test('the store survives a controller that decodes JSON on read (v44)', function()
+  -- Field report, v43: "Persistent key pima.zones.v1 held a table" followed
+  -- by "Zone store did not read back as written". This mock decodes JSON on
+  -- read the way that controller did.
+  upgradeFrom(LEGACY)
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'the migration must complete')
+  assert(Properties['Zones Config'] == '2,,motion;3,,,2', 'and shorten Zones Config, got: ' ..
+    tostring(Properties['Zones Config']))
+  assert(Persisted[ZONE_STORE_KEY]:sub(1, #PERSIST_BLOB_PREFIX) == PERSIST_BLOB_PREFIX,
+    'the store is written as an opaque blob, not JSON a controller would decode')
 end)
 
-test('applying with nothing discovered says so instead of wiping Zones Config', function()
-  freshDriver({ ['Zones Config'] = '1,Existing,contact,1' })
-  Properties['Discovered Zones'] = ''
-  ExecuteCommand('Apply Discovered Zones', {})
-  assert(Properties['Zones Config'] == '1,Existing,contact,1',
-    'an empty discovery must never clobber a working configuration')
-  assert((Properties['Last Command Result'] or ''):find('Discover Zone Names', 1, true),
-    'it must tell you what to do first')
-end)
-
-test('a long zone list is applied IN FULL, not cut to the preview', function()
-  freshDriver({ ['Zones Config'] = '' })
-  local h = connectPanel()
-  -- Enough zones that the preview property cannot hold them all.
-  local names = {}
-  for i = 1, 120 do names[i] = 'Zone Name Number ' .. i .. ' Long Enough To Overflow' end
-  runDiscovery(h, names)
-  assert(DiscoveredZonesCount == 120, 'all zones must be discovered, got ' .. tostring(DiscoveredZonesCount))
-  assert(#(Properties['Discovered Zones'] or '') < #DiscoveredZonesFull,
-    'the preview property should indeed be shorter than the full list')
-  assert((Properties['Discovered Zones'] or ''):find('preview shows', 1, true),
-    'the preview must say it is a preview and point at the action')
-  ExecuteCommand('Apply Discovered Zones', {})
-  local applied = 0
-  for _ in pairs(Zones) do applied = applied + 1 end
-  assert(applied == 120, 'every discovered zone must be applied, got ' .. applied)
-  assert(Zones[120] and Zones[120].name:find('Number 120', 1, true),
-    'the last zone must survive -- this is the case the old code silently dropped')
-end)
-
-test('the preview is cut at an entry boundary, never mid-name', function()
-  freshDriver()
-  local h = connectPanel()
-  local names = {}
-  for i = 1, 120 do names[i] = 'Zone ' .. i .. ' with a reasonably long descriptive name' end
-  runDiscovery(h, names)
-  local preview = Properties['Discovered Zones'] or ''
-  local body = preview:match('^(.-) %.%.%. %(preview shows') or preview
-  for entry in body:gmatch('[^;]+') do
-    assert(entry:match('^%d+,'), 'every previewed entry must be whole, got: ' .. entry)
-    local fields = select(2, entry:gsub(',', ',')) + 1
-    assert(fields == 4, 'entry should have 4 fields, got ' .. fields .. ' in: ' .. entry)
+test('a v43 store that comes back as a table is still readable (v44)', function()
+  local store = { [1] = { name = 'Front', from = 'panel' }, [2] = { name = 'Back', from = 'config' } }
+  local v43text = EncodeZoneStore(store)                -- v43: plain JSON
+  local v44text = ZONE_STORE_PREFIX .. v43text          -- v44: prefixed JSON
+  local asTable = JSON.decode(v43text)                  -- v43 as this controller returned it
+  for _, form in ipairs({ v43text, v44text:sub(#ZONE_STORE_PREFIX + 1), asTable }) do
+    local back = DecodeZoneStore(form)
+    assert(ZoneStoresEqual(back, store), 'form ' .. type(form) .. ' must decode to the same zones')
   end
 end)
 
-test('a preview-only property is not applied after a reload lost the full list', function()
-  freshDriver({ ['Zones Config'] = '1,Existing,contact,1' })
-  -- Simulates: discovery ran, driver reloaded, only the shortened preview survives.
-  DiscoveredZonesFull = nil
-  Properties['Discovered Zones'] = '1,A,contact,1 ... (preview shows 1 of 90 zones -- use the "Apply Discovered Zones" action, which applies all 90)'
-  ExecuteCommand('Apply Discovered Zones', {})
-  assert(Properties['Zones Config'] == '1,Existing,contact,1',
-    'applying a shortened preview would silently lose zones')
+test('store names with quotes, backslashes and padding round-trip exactly', function()
+  -- v44 on the field controller: "did not read back as written (Director
+  -- returned a string)". The driver's own encoding is proven exact here, so
+  -- the change happened in storage.
+  local store = {
+    [1] = { name = 'נפח הורים   ', from = 'panel' },
+    [2] = { name = 'ממ"ד', from = 'panel' },
+    [3] = { name = 'a\\b', from = 'config' },
+  }
+  assert(ZoneStoresEqual(DecodeZoneStore(EncodeZoneStore(store)), store))
 end)
 
-test('a complete (unshortened) property still applies after a reload', function()
-  freshDriver({ ['Zones Config'] = '' })
-  DiscoveredZonesFull = nil
-  Properties['Discovered Zones'] = '1,Front Door,contact,1;2,Back Door,contact,1'
-  ExecuteCommand('Apply Discovered Zones', {})
-  drainZonePublish()
-  assert(Properties['Zones Config'] == '1,Front Door,contact,1;2,Back Door,contact,1',
-    'a short list that was never shortened must still be usable after a reload')
-end)
-
-test('a discovery does not survive a driver reload', function()
+test('base64 round-trips every byte value (v45)', function()
   freshDriver()
+  local all = {}
+  for b = 0, 255 do all[#all + 1] = string.char(b) end
+  local bytes = table.concat(all)
+  for _, sample in ipairs({ '', 'a', 'ab', 'abc', 'abcd', bytes, 'ממ"ד \\ נפח' }) do
+    local enc = Base64Encode(sample)
+    assert(enc:match('^[A-Za-z0-9+/=]*$'), 'base64 must be plain ASCII')
+    assert(Base64Decode(enc) == sample, 'round trip failed for a ' .. #sample .. '-byte sample')
+  end
+  assert(Base64Decode('abc') == nil and Base64Decode('ab!=') == nil, 'malformed input is refused')
+end)
+
+-- 40 long Hebrew names, one with gershayim: the shapes that could break a
+-- length limit, escape processing or a JSON-decoding store.
+local function hostileConfig()
+  local zl = {}
+  for i = 1, 40 do zl[#zl + 1] = i .. ',חיישן נפח בחדר מספר ' .. i .. ',motion,1' end
+  zl[5] = '5,ממ"ד,contact,1'
+  return table.concat(zl, ';')
+end
+
+test('the store survives a storage length limit (v45)', function()
+  PersistMaxLen = 1000
+  upgradeFrom(hostileConfig())
+  PersistMaxLen = nil
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'migration must complete under a 1000-char cap')
+  assert(Zones[5].name == 'ממ"ד' and Zones[40].type == 'motion')
+end)
+
+test('the store survives storage that processes backslash escapes (v45)', function()
+  PersistUnescapes = true
+  upgradeFrom(hostileConfig())
+  PersistUnescapes = false
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'migration must complete')
+  local store = DecodeZoneStore((PersistReadBlob(ZONE_STORE_KEY)))
+  assert(store and store[5].name == 'ממ"ד', 'a name with a quote mark must survive')
+end)
+
+test('all three at once, and it survives a reload (v45)', function()
+  PersistMaxLen, PersistUnescapes = 1000, true
+  upgradeFrom(hostileConfig())
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = Properties['Zones Config'] })
+  KeepPersisted = false
+  PersistMaxLen, PersistUnescapes = nil, false
+  assert(Zones[5] and Zones[5].name == 'ממ"ד' and Zones[40] and Zones[40].type == 'motion',
+    'the reloaded driver must get every zone back')
+end)
+
+test('if storage still alters the data, the log says exactly how (v45)', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = hostileConfig()
+  mockC4()
+  local realSet = C4.PersistSetValue
+  C4.PersistSetValue = function(self, k, v) return realSet(self, k, (tostring(v):gsub('Q', 'q'))) end
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  local logs = table.concat(withCapturedLogs(function() OnDriverInit(); OnDriverLateInit(); settlePersist() end), '\n')
+  assert(logs:find('first difference at', 1, true), 'the log must pinpoint the change: ' .. logs:sub(1, 400))
+  assert(Properties['Zones Config'] == hostileConfig(), 'and nothing is changed')
+end)
+
+test('a damaged store after a completed migration is rebuilt from the backup (v45)', function()
+  -- Zones Config is overrides-only by then; falling back to it alone would
+  -- show every zone as "Zone N".
+  upgradeFrom(LEGACY)
+  KeepPersisted = true
+  Persisted[ZONE_STORE_KEY] = 'garbage that is not a zone store'
+  freshDriver({ ['Zones Config'] = Properties['Zones Config'] })
+  KeepPersisted = false
+  assert(Zones[1] and Zones[1].name == 'דלת כניסה', 'names must come back from the backup, got ' ..
+    tostring(Zones[1] and Zones[1].name))
+  assert(Zones[2].type == 'motion', 'overrides still apply')
+  assert(DecodeZoneStore((PersistReadBlob(ZONE_STORE_KEY))), 'and the store is saved again')
+end)
+
+test('v44-format keys are still read (v45)', function()
+  -- A controller where v44 did complete the migration holds PIMATEXT1: and
+  -- PIMAZONES1: values.
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '2,,motion'
+  mockC4()
+  Persisted[ZONE_MIGRATION_KEY] = 'PIMATEXT1:done'
+  Persisted[ZONE_STORE_KEY] = 'PIMAZONES1:' .. '{"v":1,"zones":{"1":{"f":"config","n":"Front"},"2":{"f":"config","n":"Kitchen"}}}'
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  OnDriverInit(); OnDriverLateInit()
+  assert(Zones[1].name == 'Front' and Zones[2].type == 'motion', 'v44 data must load')
+  assert(Properties['Zones Config'] == '2,,motion', 'and not be migrated again')
+end)
+
+-- Loads an upgrade WITHOUT letting storage settle, so a test can look at the
+-- moment between writing and confirmation.
+local function upgradeUnsettled(configText)
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = configText
+  mockC4()
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  SYSTEM_KEY_DISARMED[97] = true
+  OnDriverInit(); OnDriverLateInit()
+  drainZonePublish()
+end
+
+test('writes are not read back in the same moment they are made (v46)', function()
+  -- v45 field log: "pima.zones.v1.part1: came back as a nil". Reading a
+  -- value straight after writing it is not meaningful on that controller.
+  local logs = withCapturedLogs(function() upgradeUnsettled(LEGACY) end)
+  local out = table.concat(logs, '\n')
+  assert(not out:find('came back as', 1, true) and not out:find('did not read back', 1, true),
+    'nothing may be judged before storage has had time: ' .. out:sub(1, 300))
+  assert(PersistVerifyTimerId, 'the check is scheduled for later')
+end)
+
+test('Zones Config is not shortened until storage confirms the save (v46)', function()
+  upgradeUnsettled(LEGACY)
+  assert(Properties['Zones Config'] == LEGACY, 'the full list must stay until the save is confirmed')
+  assert(Zones[2].type == 'motion' and Zones[1].name == 'דלת כניסה', 'and the app is unaffected meanwhile')
+  settlePersist()
+  assert(Properties['Zones Config'] == '2,,motion;3,,,2', 'then it is shortened, got ' ..
+    tostring(Properties['Zones Config']))
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done')
+end)
+
+test('a controller slower than the first check is waited for (v46)', function()
+  upgradeUnsettled(LEGACY)
+  -- First check fires before anything has landed.
+  OnTimerExpired(PersistVerifyTimerId)
+  assert(Properties['Zones Config'] == LEGACY, 'not confirmed yet, nothing changes')
+  assert(PersistVerifyTimerId, 'and it checks again later')
+  settlePersist()
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'the later check completes it')
+end)
+
+test('storage that never confirms changes nothing, and the next load retries (v46)', function()
+  upgradeUnsettled(LEGACY)
+  local logs = withCapturedLogs(function()
+    local g = 0
+    while PersistVerifyTimerId and g < 10 do g = g + 1; OnTimerExpired(PersistVerifyTimerId) end
+  end)
+  assert(table.concat(logs, '\n'):find('migration not completed', 1, true), 'the failure is logged')
+  assert(Properties['Zones Config'] == LEGACY, 'and nothing was changed')
+  -- Writes land eventually (e.g. at shutdown); the next load finishes the job.
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = LEGACY })
+  KeepPersisted = false
+  assert(Properties['Zones Config'] == '2,,motion;3,,,2' and PersistGet(ZONE_MIGRATION_KEY) == 'done')
+end)
+
+test('a refresh that finishes before confirmation still hides left-out zones (v46)', function()
+  upgradeUnsettled('1,Front,contact,1;3,Garage,motion,1')
   local h = connectPanel()
-  runDiscovery(h, { 'Front Door' })
-  assert(DiscoveredZonesFull ~= nil)
-  freshDriver()   -- reload
-  assert(DiscoveredZonesFull == nil,
-    'a stale discovery must not be applied over a config edited since')
+  -- runDiscovery settles storage at the end; answer the panel first.
+  runDiscovery(h, { 'Front', 'Unused Zone', 'Garage' })
+  assert(Zones[2] == nil, 'zone 2 was not in the old list and must stay hidden')
+  assert(tostring(Properties['Zones Config']):find('2,,hidden', 1, true),
+    'and the hidden entry must survive the Zones Config rewrite, got ' .. tostring(Properties['Zones Config']))
+  assert(Zones[3].type == 'motion')
+end)
+
+test('a controller that applies writes at once also works (v46)', function()
+  PersistImmediate = true
+  upgradeFrom(LEGACY)
+  PersistImmediate = false
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done' and Properties['Zones Config'] == '2,,motion;3,,,2')
+end)
+
+test('an edit in Composer is not overwritten by a stale remembered value (v46)', function()
+  freshDriver()
+  SetProp('Zones Config', 'A')
+  Properties['Zones Config'] = 'B'          -- the installer edits it
+  OnPropertyChanged('Zones Config')
+  calls.UpdateProperty = {}
+  SetProp('Zones Config', 'A')              -- the driver writes A again
+  assert(#calls.UpdateProperty == 1, 'the write must go out: the property holds B now, not A')
+end)
+
+test('the read-back also passes on a controller that returns text verbatim', function()
+  PersistVerbatim = true
+  upgradeFrom(LEGACY)
+  PersistVerbatim = false
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done')
+  assert(Properties['Zones Config'] == '2,,motion;3,,,2')
+end)
+
+test('recovers the exact field state v43 left behind (v44)', function()
+  -- What the field log shows v43 did on that controller: migration refused
+  -- (read-back failed), so Zones Config is still the full list and no
+  -- migration flag was written; then the first connection stored every
+  -- panel zone, including zone 5, which the installer had deliberately left
+  -- out of Zones Config.
+  local oldConfig = '1,דלת כניסה,contact,1;2,Kitchen PIR,motion,1;3,Garage,contact,1'
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = oldConfig
+  mockC4()
+  Persisted[ZONE_BACKUP_KEY] = oldConfig
+  local panelStore = {}
+  for z, n in pairs({ 'P1', 'P2', 'P3', 'P4', 'Deliberately Excluded' }) do
+    panelStore[z] = { name = n, from = 'panel' }
+  end
+  Persisted[ZONE_STORE_KEY] = EncodeZoneStore(panelStore)  -- v43 form: plain JSON
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  SYSTEM_KEY_DISARMED[97] = true
+  OnDriverInit(); OnDriverLateInit()
+  drainZonePublish()
+  settlePersist()
+
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'the unfinished migration must complete now')
+  assert(Properties['Zones Config'] == '2,,motion', 'got: ' .. tostring(Properties['Zones Config']))
+  assert(Zones[1].name == 'דלת כניסה', 'your names win over the panel names v43 stored')
+  assert(Zones[5] == nil, 'a zone you had left out must not be in the app')
+
+  local h = connectPanel()
+  runDiscovery(h, { 'P1', 'P2', 'P3', 'P4', 'Deliberately Excluded' })
+  assert(Zones[4] == nil and Zones[5] == nil, 'zones outside the old list stay out after the refresh')
+  assert(tostring(Properties['Zones Config']):find('5,,hidden', 1, true), 'and are listed as hidden')
+  assert(Zones[2].type == 'motion')
+end)
+
+test('a completed migration is never re-run over overrides-only Zones Config', function()
+  -- The migration flag decides, so a later load with a short Zones Config
+  -- must not treat it as a legacy list and wipe the panel names.
+  freshDriver({ ['Zones Config'] = '' })
+  local h = connectPanel()
+  runDiscovery(h, { 'A', 'B', 'C' })
+  Properties['Zones Config'] = '2,,motion'
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = '2,,motion' })
+  KeepPersisted = false
+  assert(Zones[1] and Zones[1].name == 'A' and Zones[3] and Zones[3].name == 'C',
+    'the store must be loaded, not rebuilt from the overrides')
+  assert(Zones[2].type == 'motion')
+end)
+
+test('a zone already shown is not announced as new when it enters the store', function()
+  -- v43 logged "added 35 new zone(s)" for an existing install's own zones.
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '1,Front,contact,1;2,Back,contact,1'
+  mockC4()
+  C4.PersistGetValue = nil; C4.PersistSetValue = nil   -- no store: config is the list
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  OnDriverInit(); OnDriverLateInit()
+  local h = connectPanel()
+  local logs = withCapturedLogs(function() runDiscovery(h, { 'Front', 'Back' }) end)
+  assert(not table.concat(logs, '\n'):find('new zone', 1, true),
+    'zones already in the app must not be reported as new')
+end)
+
+test('upgrading imports every zone name, including Hebrew', function()
+  upgradeFrom(LEGACY)
+  assert(ZoneStore[1] and ZoneStore[1].name == 'דלת כניסה', 'Hebrew name must survive the import')
+  for z = 1, 4 do assert(Zones[z], 'zone ' .. z .. ' must still exist') end
+  assert(ZoneStore[2].from == 'config', 'imported names are marked as yours, not the panel\'s')
+end)
+
+test('upgrading keeps every manual type and partition', function()
+  upgradeFrom(LEGACY)
+  assert(Zones[2].type == 'motion', 'the motion type you set must survive, got ' .. tostring(Zones[2].type))
+  assert(Zones[3].partition == 2, 'a zone in partition 2 must stay there')
+  assert(Zones[1].type == 'contact')
+end)
+
+test('upgrading shrinks Zones Config to only what differs from defaults', function()
+  upgradeFrom(LEGACY)
+  local cfg = Properties['Zones Config']
+  assert(cfg == '2,,motion;3,,,2', 'expected just the two real changes, got: ' .. tostring(cfg))
+end)
+
+test('the effective zone list is identical before and after the upgrade', function()
+  -- The point of the migration: nothing the app sees may change.
+  freshDriver({ ['Zones Config'] = LEGACY })
+  local after = {}
+  for z, zc in pairs(Zones) do after[z] = zc.name .. '|' .. zc.type .. '|' .. tostring(zc.partition or FallbackPartition()) end
+  -- What v42 would have built from the same text:
+  local expect = {
+    [1] = 'דלת כניסה|contact|1', [2] = 'Kitchen PIR|motion|1',
+    [3] = 'Garage|contact|2', [4] = 'Hall|contact|1',
+  }
+  for z, e in pairs(expect) do assert(after[z] == e, 'zone ' .. z .. ': expected ' .. e .. ', got ' .. tostring(after[z])) end
+end)
+
+test('the original Zones Config is backed up verbatim before anything changes', function()
+  upgradeFrom(LEGACY)
+  assert(PersistGet(ZONE_BACKUP_KEY) == LEGACY, 'the backup must be the exact original text')
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done')
+end)
+
+test('the migration runs once: a reload does not re-import or rewrite', function()
+  upgradeFrom(LEGACY)
+  local cfg = Properties['Zones Config']
+  KeepPersisted = true
+  calls.UpdateProperty = {}
+  freshDriver({ ['Zones Config'] = cfg })
+  KeepPersisted = false
+  for _, u in ipairs(calls.UpdateProperty) do
+    assert(u[1] ~= 'Zones Config', 'a second load must not touch Zones Config')
+  end
+  assert(Zones[1].name == 'דלת כניסה' and Zones[2].type == 'motion', 'and the zones must load from the store')
+end)
+
+test('Restore Zones Config puts the original back and stops re-migration', function()
+  upgradeFrom(LEGACY)
+  ExecuteCommand('Restore Zones Config', {})
+  settlePersist()
+  assert(Properties['Zones Config'] == LEGACY, 'the exact original must come back')
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'off')
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = LEGACY })
+  KeepPersisted = false
+  assert(Properties['Zones Config'] == LEGACY, 'a reload after restoring must not import it again')
+  assert(Zones[2].type == 'motion' and Zones[3].partition == 2, 'and it works exactly as v42 did')
+end)
+
+test('no persistence on the controller: nothing is rewritten, v42 behaviour', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = LEGACY
+  mockC4()
+  C4.PersistGetValue = nil; C4.PersistSetValue = nil; C4.PersistDeleteValue = nil
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  OnDriverInit(); OnDriverLateInit()
+  assert(Properties['Zones Config'] == LEGACY, 'Zones Config must be left alone')
+  assert(Zones[2].type == 'motion' and Zones[1].name == 'דלת כניסה', 'and used as the full list')
+end)
+
+test('a store that does not read back is not trusted: nothing is rewritten', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = LEGACY
+  mockC4()
+  local realSet = C4.PersistSetValue
+  C4.PersistSetValue = function(self, k, v)
+    if k == ZONE_STORE_KEY then return realSet(self, k, v:sub(1, 10)) end   -- truncates
+    return realSet(self, k, v)
+  end
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  local logs = withCapturedLogs(function() OnDriverInit(); OnDriverLateInit(); settlePersist() end)
+  assert(Properties['Zones Config'] == LEGACY, 'a failed save must not shorten Zones Config')
+  assert(Zones[2].type == 'motion', 'the driver must keep working from Zones Config')
+  assert(table.concat(logs, '\n'):find('migration not completed', 1, true), 'and say why')
+end)
+
+test('a fresh install with no Zones Config starts with an empty store', function()
+  freshDriver({ ['Zones Config'] = '' })
+  assert(next(Zones) == nil)
+  assert(Persisted[ZONE_STORE_KEY] ~= nil, 'the store is created')
+  assert(PersistGet(ZONE_BACKUP_KEY) == nil, 'there is nothing to back up')
+end)
+
+test('the store round-trips Hebrew, commas-free names and every zone', function()
+  local store = { [1] = { name = 'דלת כניסה', from = 'config' }, [144] = { name = 'Zone 144', from = 'panel' } }
+  local back = DecodeZoneStore(EncodeZoneStore(store))
+  assert(back[1].name == 'דלת כניסה' and back[1].from == 'config')
+  assert(back[144].name == 'Zone 144')
+end)
+
+test('a corrupt store is reported and Zones Config still works', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '5,,motion'
+  mockC4()
+  Persisted[ZONE_STORE_KEY] = 'not json at all {'
+  Persisted[ZONE_MIGRATION_KEY] = 'PIMATEXT1:done'   -- corrupted after a good migration
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  local logs = withCapturedLogs(function() OnDriverInit(); OnDriverLateInit() end)
+  assert(table.concat(logs, '\n'):find('could not be read', 1, true), 'a corrupt store must be reported')
+  assert(Zones[5] and Zones[5].type == 'motion')
+end)
+
+test('overrides change only the fields they give', function()
+  freshDriver({ ['Zones Config'] = '' })
+  ZoneStore = { [5] = { name = 'Lounge', from = 'panel' }, [6] = { name = 'Porch', from = 'panel' } }
+  BuildZones('5,,motion;6,,,2')
+  assert(Zones[5].name == 'Lounge' and Zones[5].type == 'motion', 'type only')
+  assert(Zones[6].name == 'Porch' and Zones[6].type == 'contact' and Zones[6].partition == 2, 'partition only')
+  BuildZones('5,Living Room')
+  assert(Zones[5].name == 'Living Room' and Zones[5].type == 'contact', 'name only')
+end)
+
+test('"hidden" removes a zone from the app', function()
+  freshDriver({ ['Zones Config'] = '' })
+  ZoneStore = { [5] = { name = 'Lounge', from = 'panel' }, [9] = { name = 'Unused', from = 'panel' } }
+  BuildZones('9,,hidden')
+  assert(Zones[5] and Zones[9] == nil, 'zone 9 must be gone')
+end)
+
+test('a refresh adds new panel zones and never renames known ones', function()
+  upgradeFrom('1,My Fixed Name,contact,1')
+  Persisted[ZONE_HIDE_NEW_KEY] = nil        -- past the first post-upgrade refresh
+  HideNewZonesOnce = false
+  local h = connectPanel()
+  runDiscovery(h, { 'PANEL NAME 1', 'Back Door' })
+  assert(Zones[1].name == 'My Fixed Name', 'a name you set must never be overwritten by the panel')
+  assert(Zones[2] and Zones[2].name == 'Back Door' and ZoneStore[2].from == 'panel', 'a new zone must be added')
+  assert(DecodeZoneStore((PersistReadBlob(ZONE_STORE_KEY)))[2], 'and saved')
+end)
+
+test('after upgrading, zones the old list left out stay out of the app', function()
+  -- Up to v42 Zones Config was an explicit list; a zone deleted from it was
+  -- deliberately not in the app. The first refresh must not bring it back.
+  upgradeFrom('1,Front,contact,1;3,Garage,motion,1')
+  local h = connectPanel()
+  runDiscovery(h, { 'Front', 'Unused Zone', 'Garage' })
+  assert(Zones[2] == nil, 'zone 2 was not in the old list and must stay out of the app')
+  assert(ZoneStore[2] and ZoneStore[2].name == 'Unused Zone', 'but its name is known')
+  assert(tostring(Properties['Zones Config']):find('2,,hidden', 1, true),
+    'and Zones Config says so, so it can be shown by removing one entry: ' .. tostring(Properties['Zones Config']))
+  assert(Zones[3].type == 'motion', 'existing overrides are untouched')
+  assert(Persisted[ZONE_HIDE_NEW_KEY] == nil, 'this happens once, on the first complete refresh')
+end)
+
+test('after that first refresh, new panel zones are added normally', function()
+  upgradeFrom('1,Front,contact,1')
+  local h = connectPanel()
+  runDiscovery(h, { 'Front' })
+  runDiscovery(h, { 'Front', 'New Zone' })
+  assert(Zones[2] and Zones[2].name == 'New Zone', 'a zone added at the panel later must appear')
+end)
+
+test('a fresh install shows every panel zone', function()
+  freshDriver({ ['Zones Config'] = '' })
+  local h = connectPanel()
+  runDiscovery(h, { 'A', 'B', 'C' })
+  assert(Zones[1] and Zones[2] and Zones[3], 'nothing to preserve, so nothing is hidden')
+end)
+
+test('a refresh never removes a zone the panel stopped naming', function()
+  upgradeFrom('1,Front,contact,1;2,Old Zone,contact,1')
+  local h = connectPanel()
+  local logs = withCapturedLogs(function() runDiscovery(h, { 'Front' }) end)
+  assert(Zones[2], 'a zone vanishing silently from the app is worse than a stale one')
+  assert(table.concat(logs, '\n'):find('no longer names them', 1, true), 'but it is reported')
+end)
+
+test('the first connection after a load refreshes zones once', function()
+  freshDriver({ ['Zones Config'] = '' })
+  local h = connectPanel(nil, true)
+  local asked = 0
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and tonumber(f.id) == 2148 then asked = asked + 1 end
+  end
+  -- The count request is queued behind the state sync; walk the queue.
+  local guard = 0
+  while InFlight and guard < 20 do
+    guard = guard + 1
+    local req = InFlight.frame or {}
+    if tonumber(req.id) == 2148 then asked = asked + 1; break end
+    FailInFlight('skip')
+  end
+  assert(asked >= 1 or ZonesAutoRefreshed, 'a zone refresh must be started on the first connection')
+  assert(ZonesAutoRefreshed == true)
+  -- A reconnect in the same load does not repeat it.
+  ZonesAutoRefreshedBefore = ZonesAutoRefreshed
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  ClearInFlight(); ResetQueueState(); calls.ServerSend = {}
+  OnServerConnectionStatusChanged(h, 7780, 'ONLINE')
+  OnServerDataIn(h, '{"frame_type":"null","account":"1234","counter":2}', '10.0.0.50', 5555)
+  local again = false
+  local g2 = 0
+  while InFlight and g2 < 20 do
+    g2 = g2 + 1
+    if tonumber((InFlight.frame or {}).id) == 2148 then again = true end
+    FailInFlight('skip')
+  end
+  for _, q in ipairs(OutQueue or {}) do if tonumber((q.frame or {}).id) == 2148 then again = true end end
+  assert(not again, 'a reconnect must not refresh zones again in the same load')
+end)
+
+test('after Restore, connections do not rebuild the store', function()
+  upgradeFrom(LEGACY)
+  ExecuteCommand('Restore Zones Config', {})
+  ZonesAutoRefreshed = false
+  connectPanel()
+  assert(ZonesAutoRefreshed == false, 'restoring means Zones Config alone, as in v42')
+end)
+
+test('List Zones prints every zone without churning Recent Activity', function()
+  upgradeFrom(LEGACY)
+  calls.UpdateProperty = {}
+  local logs = withCapturedLogs(function() ExecuteCommand('List Zones', {}) end)
+  local out = table.concat(logs, '\n')
+  assert(out:find('Kitchen PIR', 1, true) and out:find('motion', 1, true), 'zones must be listed')
+  assert(out:find('type: Zones Config', 1, true), 'and where each value came from')
+  for _, u in ipairs(calls.UpdateProperty) do
+    assert(u[1] ~= 'Recent Activity', 'a report must not rewrite Recent Activity once per line')
+  end
+end)
+
+test('Zones Summary is short and names the counts', function()
+  upgradeFrom(LEGACY)
+  local sum = Properties['Zones Summary'] or ''
+  assert(sum:find('4 zone', 1, true) and sum:find('1 motion', 1, true), 'got: ' .. sum)
+  assert(#sum < 200)
+end)
+
+test('Recent Activity shows only the newest few; the full buffer is kept', function()
+  freshDriver()
+  for i = 1, 20 do RecordActivity('event ' .. i) end
+  local shown = select(2, (Properties['Recent Activity'] or ''):gsub('\n', '\n')) + 1
+  assert(shown == RECENT_ACTIVITY_SHOWN, 'expected ' .. RECENT_ACTIVITY_SHOWN .. ' lines, got ' .. shown)
+  assert(Properties['Recent Activity']:find('event 20', 1, true), 'newest first')
+  assert(#RecentActivity >= 20, 'the buffer itself is not shortened')
+  local logs = withCapturedLogs(function() ExecuteCommand('List Recent Activity', {}) end)
+  assert(table.concat(logs, '\n'):find('event 1', 1, true), 'the full buffer is printable')
+end)
+
+test('the old "Discover Zone Names" command still works', function()
+  freshDriver()
+  connectPanel()
+  ClearInFlight(); ResetQueueState(); calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  ExecuteCommand('Discover Zone Names', {})
+  local f = JSON.decode((calls.ServerSend[1] or {})[2] or '{}')
+  assert(tonumber(f.id) == 2148, 'the alias must start a refresh')
+end)
+
+test('the migration adds at most a few calls to the load', function()
+  -- Composer waits on OnDriverInit. Measured against the same load with the
+  -- store already in place, so this counts only what migrating adds.
+  local function initCalls(keep)
+    resetCalls()
+    Properties = {}
+    for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+    Properties['Zones Config'] = bigZoneConfig(40)
+    KeepPersisted = keep
+    mockC4()
+    dofile('driver.lua')
+    Variables = {}; VariableTypes = {}
+    OnDriverInit()
+    KeepPersisted = false
+    return #calls.SendToProxy + #calls.UpdateProperty + #calls.SetPropertyAttribsSeq + #calls.AddVariableSeq
+  end
+  local migrating = initCalls(false)
+  local settled = initCalls(true)          -- same store, already migrated
+  assert(migrating - settled <= 3,
+    'migration added ' .. (migrating - settled) .. ' blocking calls to the load')
 end)
 
 --=============================================================================
@@ -3072,8 +3638,12 @@ test('a second publish replaces the pending one instead of interleaving', functi
   assert(firstTimer, 'precondition: a drain must be pending')
 
   -- The installer edits the zone list while the first publish is mid-flight.
+  -- Since v43 the zones live in the store, so shrinking the list means hiding
+  -- the rest.
   calls.SendToProxy = {}
-  Properties['Zones Config'] = '1,Only Zone,contact,1'
+  local cfg = { '1,Only Zone' }
+  for i = 2, 45 do cfg[#cfg + 1] = i .. ',,hidden' end
+  Properties['Zones Config'] = table.concat(cfg, ';')
   OnPropertyChanged('Zones Config')
   local guard = 0
   while ZonePublishTimerId and guard < 100 do
@@ -3180,7 +3750,7 @@ end)
 
 test('the properties panel is never handed multi-kilobyte values', function()
   -- Long STRING property values are what make Composer's property grid slow.
-  freshDriver()
+  freshDriver({ ['Zones Config'] = '' })   -- a new install: zones come from the panel
   local h = connectPanel()
   for i = 1, 40 do
     RecordActivity(string.rep('x', 400) .. ' event ' .. i)
@@ -3191,10 +3761,12 @@ test('the properties panel is never handed multi-kilobyte values', function()
   local names = {}
   for i = 1, 60 do names[i] = 'A rather long zone name number ' .. i end
   runDiscovery(h, names)
-  assert(#Properties['Discovered Zones'] < 1000,
-    'Discovered Zones is a preview only; it is ' .. #Properties['Discovered Zones'] .. ' bytes')
-  -- ...and shortening the preview must not shorten what Apply writes.
-  ExecuteCommand('Apply Discovered Zones', {})
+  -- Since v43 the zone list lives in the store: no property holds it.
+  for name, v in pairs(Properties) do
+    assert(#tostring(v) < 3500, name .. ' is ' .. #tostring(v) .. ' bytes')
+  end
+  assert(#(Properties['Zones Config'] or '') < 200,
+    'Zones Config holds overrides only; it is ' .. #(Properties['Zones Config'] or '') .. ' bytes')
   local applied = 0
   for _ in pairs(Zones) do applied = applied + 1 end
   assert(applied == 60, 'all 60 zones must still be applied, got ' .. applied)
@@ -3289,26 +3861,47 @@ test('SET_ZONE_INFO is handled instead of warned about', function()
     'Navigator sends this on every security-agent refresh; it must not log a warning')
 end)
 
-test('a zone renamed in the app is written back to Zones Config', function()
+test('a zone renamed in the app is kept in the zone store (v43)', function()
   freshDriver()
   ReceivedFromProxy(5001, 'SET_ZONE_INFO', { ZONE_ID = '1', NAME = 'Porch Door' })
+  settlePersist()
   assert(Zones[1].name == 'Porch Door', 'the rename must be taken')
-  assert(Properties['Zones Config']:find('1,Porch Door'),
-    'and persisted, or it is lost on the next reload: ' .. tostring(Properties['Zones Config']))
-  assert(Properties['Zones Config']:find('7,Shed'), 'without dropping the other zones')
+  assert(ZoneStore[1] and ZoneStore[1].name == 'Porch Door' and ZoneStore[1].from == 'app',
+    'and stored, or it is lost on the next reload')
+  assert(DecodeZoneStore((PersistReadBlob(ZONE_STORE_KEY)))[1].name == 'Porch Door',
+    'the persisted copy must carry it too')
+  assert(Zones[7], 'without dropping the other zones')
 end)
 
-test('a rename containing a separator cannot corrupt Zones Config', function()
+test('an app rename survives a driver reload (v43)', function()
+  freshDriver()
+  ReceivedFromProxy(5001, 'SET_ZONE_INFO', { ZONE_ID = '1', NAME = 'Porch Door' })
+  KeepPersisted = true
+  local props = {}
+  for k, v in pairs(Properties) do props[k] = v end
+  freshDriver(props)
+  KeepPersisted = false
+  assert(Zones[1].name == 'Porch Door', 'got ' .. tostring(Zones[1] and Zones[1].name))
+end)
+
+test('an app rename is not silently beaten by a name override (v43)', function()
+  freshDriver({ ['Zones Config'] = '1,Front Door,contact,1' })
+  Properties['Zones Config'] = '1,Typed Name'
+  OnPropertyChanged('Zones Config')
+  ReceivedFromProxy(5001, 'SET_ZONE_INFO', { ZONE_ID = '1', NAME = 'From App' })
+  assert(Zones[1].name == 'From App',
+    'a name override would win and make the rename look like it did nothing, got ' .. tostring(Zones[1].name))
+  assert(not tostring(Properties['Zones Config']):find('Typed Name', 1, true),
+    'the stale name override must be dropped from Zones Config')
+end)
+
+test('a rename containing a separator cannot corrupt the zone list', function()
   freshDriver()
   ReceivedFromProxy(5001, 'SET_ZONE_INFO', { ZONE_ID = '1', NAME = 'Kitchen, Side; Door' })
-  local cfg = Properties['Zones Config']
-  local separators = select(2, cfg:gsub(';', ';'))
-  assert(separators == 1, 'still exactly two zones, got: ' .. cfg)
-  Properties['Zones Config'] = cfg
-  OnPropertyChanged('Zones Config')
-  local reparsed = 0
-  for _ in pairs(Zones) do reparsed = reparsed + 1 end
-  assert(reparsed == 2, 'and it must survive a round trip through the parser, got ' .. reparsed)
+  local n = 0
+  for _ in pairs(Zones) do n = n + 1 end
+  assert(n == 2, 'still exactly two zones, got ' .. n)
+  assert(not Zones[1].name:find('[,;]'), 'separators must be removed, got ' .. Zones[1].name)
 end)
 
 test('a half-open connection is eventually reported as disconnected', function()
@@ -4987,6 +5580,26 @@ test('every function the exit-delay path calls exists', function()
       'BeginExitDelay', 'TickExitDelay', 'EndExitDelay' }) do
     assert(type(_G[name]) == 'function', name .. ' must be defined')
   end
+end)
+
+--=============================================================================
+section('Documentation tab (v43)')
+--=============================================================================
+
+test('driver.xml points the Documentation tab at a file that exists', function()
+  -- Inline text in <documentation> is shown as unformatted plain text, which
+  -- is what the tab looked like before v43.
+  local xml = io.open('driver.xml'):read('*a')
+  local file = xml:match('<documentation file="([^"]+)"')
+  assert(file, 'the documentation must be a file reference, not inline text')
+  local f = io.open(file)
+  assert(f, file .. ' must exist')
+  local html = f:read('*a'); f:close()
+  assert(html:find('<table>', 1, true), 'and be real HTML with the reference tables')
+  assert(html:find('Driver version ' .. xml:match('<version>(%d+)</version>'), 1, true),
+    'and state the same version as driver.xml')
+  assert(not html:find('src="http', 1, true) and not html:find('href="http[^"]*%.css') and
+    not html:find('<script', 1, true), 'and be self-contained: no remote stylesheet or script')
 end)
 
 --=============================================================================
