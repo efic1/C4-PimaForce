@@ -97,17 +97,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 42
-
--- How much of a discovered zone list to show in the read-only preview
--- property. Only affects display: the full list is kept in memory and is what
--- "Apply Discovered Zones" writes into Zones Config.
--- Preview only: the full discovered list lives in DiscoveredZonesFull and
--- that is what "Apply Discovered Zones" writes, so this exists purely to
--- show the installer that discovery worked. Keeping kilobytes of text in a
--- Composer STRING property makes the whole properties panel sluggish for no
--- benefit, so show the first few entries and the count.
-local DISCOVERED_PREVIEW_BYTES = 600
+local DRIVER_VERSION = 46
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -604,6 +594,11 @@ end
 -- troubles, not routine traffic.
 local MAX_RECENT_ENTRIES = 25
 local MAX_RECENT_LINE = 100
+-- How many of those the Recent Activity PROPERTY shows. Every Info-level log
+-- line rewrites that property, and Composer redraws its grid on each write,
+-- so it carries the newest few (~0.5 KB) rather than all 25 (~2.5 KB). The
+-- full buffer is printed by the "List Recent Activity" action.
+RECENT_ACTIVITY_SHOWN = 5
 RecentActivity = RecentActivity or {}
 
 local function logTimestamp()
@@ -674,7 +669,9 @@ function RecordActivity(msg)
   -- was ever missing, activity was silently not recorded -- the one failure
   -- mode a diagnostic buffer must not have.
   if C4 and C4.UpdateProperty then
-    pcall(function() SetProp('Recent Activity', table.concat(RecentActivity, '\n')) end)
+    local shown = {}
+    for i = 1, math.min(RECENT_ACTIVITY_SHOWN, #RecentActivity) do shown[i] = RecentActivity[i] end
+    pcall(function() SetProp('Recent Activity', table.concat(shown, '\n')) end)
   end
 end
 
@@ -733,6 +730,18 @@ function LogAt(level, msg)
   -- fact needs to see, so they are recorded even though they are rarer.
   if level <= LOG_INFO then
     RecordActivity((LOG_PREFIX[level] or '') .. tostring(msg))
+  end
+end
+
+-- Prints several lines at Info WITHOUT recording each one in Recent Activity.
+-- A 40-line report through LogInfo would rewrite that property 40 times --
+-- the exact Composer churn v43 exists to remove.
+function LogBlock(lines)
+  if (LogLevel or LOG_INFO) < LOG_INFO then return end
+  for _, l in ipairs(lines) do
+    local line = '[PimaForce] ' .. Redact(tostring(l))
+    print(line)
+    if C4 and C4.DebugLog then pcall(function() C4:DebugLog(line) end) end
   end
 end
 
@@ -810,11 +819,19 @@ local function parseZones(str)
         zone = nil
       end
       if zone then
+        -- Since v43 an entry is an OVERRIDE of what the zone store holds, so
+        -- it matters which fields were actually written: "5,,motion" changes
+        -- the type and must leave the stored name alone.
+        local name = trim(f[2] or '')
+        local ztype = trim(f[3] or '')
         result[zone] = {
           zone = zone,
-          name = trim(f[2] or ('Zone ' .. zone)),
-          type = trim(f[3] or 'contact'),
+          name = (name ~= '') and name or ('Zone ' .. zone),
+          type = (ztype ~= '') and ztype or 'contact',
           partition = tonumber(trim(f[4] or '')),
+          nameGiven = (name ~= ''),
+          typeGiven = (ztype ~= ''),
+          hidden = (ztype:lower() == 'hidden'),
         }
       end
     end
@@ -822,22 +839,726 @@ local function parseZones(str)
   return result
 end
 
--- The inverse of parseZones. Used when the app renames a zone: the change has
--- to be written back into the Zones Config property or it is lost on the next
--- reload. Commas and semicolons are the field and record separators, so a name
--- containing either would corrupt every entry after it -- they are replaced
--- rather than escaped, because parseZones has no escape syntax to read back.
-function SerializeZones()
+-- Writes an overrides table back in Zones Config form, emitting only the
+-- fields that were actually given and dropping trailing empty ones, so a type
+-- change reads "5,,motion" rather than a padded full record. Commas and
+-- semicolons are the separators and parseZones has no escape syntax, so they
+-- are replaced in names rather than escaped.
+function SerializeZoneOverrides(overrides)
+  local nums = {}
+  for z in pairs(overrides or {}) do nums[#nums + 1] = z end
+  table.sort(nums)
   local out = {}
-  for _, z in ipairs(SortedZoneNumbers()) do
-    local c = Zones[z]
-    local name = tostring(c.name or ('Zone ' .. z)):gsub('[,;]', ' ')
-    out[#out + 1] = table.concat({
-      tostring(z), name, tostring(c.type or 'contact'),
-      c.partition and tostring(c.partition) or '',
-    }, ',')
+  for _, z in ipairs(nums) do
+    local o = overrides[z]
+    local f = {
+      tostring(z),
+      o.nameGiven and (tostring(o.name):gsub('[,;]', ' ')) or '',
+      o.hidden and 'hidden' or (o.typeGiven and tostring(o.type) or ''),
+      o.partition and tostring(o.partition) or '',
+    }
+    while #f > 1 and f[#f] == '' do table.remove(f) end
+    if #f > 1 then out[#out + 1] = table.concat(f, ',') end
   end
   return table.concat(out, ';')
+end
+
+--[[=============================================================================
+    Zone store (v43).
+
+    Until v42 the whole zone list lived in the Zones Config property -- about
+    1.7 KB for 40 Hebrew-named zones, plus the same again in Discovered Zones.
+    Composer redraws a property every time the driver writes it and edits it
+    in a one-line box, so the list was slow to show and miserable to change,
+    and every rename from the app rewrote the whole string.
+
+    Now:
+      * Zone numbers and names live in DriverWorks' persistence store
+        (C4:PersistSetValue / PersistGetValue, OS 2.10+). It survives driver
+        updates and Director restarts and is never drawn in Composer.
+      * Zones Config holds only OVERRIDES -- what the panel cannot know:
+        "zone,name,type,partition" with any field left empty to keep what the
+        store has. "5,,motion" changes zone 5's icon; "7,,,2" moves zone 7 to
+        partition 2; "9,,hidden" removes zone 9 from the app.
+      * The store is filled from the panel: once per driver load, on the first
+        connection, the driver reads the zone names and ADDS zones it does not
+        know. It never renames or removes a known zone.
+
+    Stored as one JSON string under a versioned key rather than as a Lua
+    table, and parsed here. A public driver template lost short plain strings
+    across reloads through a helper that re-decoded everything it read
+    (finitelabs/control4-driver-template#75); one document this driver encodes
+    and decodes itself avoids depending on how Director round-trips types.
+
+    Migration from v42 and earlier runs once, on the first load: the old full
+    Zones Config is imported into the store, saved verbatim as a backup,
+    verified by reading it back, and only then is Zones Config rewritten to
+    the short overrides form. If persistence is unavailable or the read-back
+    does not match, nothing is rewritten and the driver runs exactly as
+    before. "Restore Zones Config" puts the original back and stops the
+    driver from migrating it again.
+===============================================================================]]
+ZONE_STORE_KEY = 'pima.zones.v1'
+ZONE_BACKUP_KEY = 'pima.zonesConfig.backup'
+ZONE_MIGRATION_KEY = 'pima.zones.migration'   -- 'done' | 'off'
+-- Set by the migration, cleared by the first COMPLETE refresh after it. Up to
+-- v42 Zones Config was an explicit list: a zone the installer deleted from it
+-- was deliberately not in the app. The first refresh after upgrading would
+-- otherwise bring every such zone back, so it hides them instead.
+ZONE_HIDE_NEW_KEY = 'pima.zones.hideNewOnce'
+
+-- The store is written with this prefix so it is NOT valid JSON. Field
+-- report, v43: this controller handed a stored JSON string back from
+-- PersistGetValue as a decoded Lua TABLE, so the byte-for-byte read-back
+-- failed and the migration (correctly) refused to proceed. With the prefix
+-- the value is opaque text and comes back as written. Reads still accept a
+-- table, an unprefixed string, or a prefixed one, so a store v43 wrote is
+-- readable too.
+ZONE_STORE_PREFIX = 'PIMAZONES1:'
+-- Same idea for plain-text keys (the Zones Config backup, the flags). A
+-- lenient JSON reader turns "1,Front Door,contact,1" into the number 1; the
+-- prefix makes the value unparseable as JSON by any reader.
+PERSIST_TEXT_PREFIX = 'PIMATEXT1:'
+
+ZoneStore = {}          -- [zone] = { name = ..., from = 'config'|'panel'|'app' }
+ZoneOverrides = {}      -- parsed Zones Config
+ZonePersistence = false -- store is readable and writable
+ZoneMigrationMode = nil -- nil | 'done' | 'off'
+PanelZoneNames = {}     -- names the panel reported in the last refresh
+
+--[[---------------------------------------------------------------------------
+    Persisted blobs (v45).
+
+    Two field reports, two different ways the controller changed what was
+    stored:
+      v43  a JSON string came back as a decoded Lua table;
+      v44  a prefixed string came back as a string -- but not the one written.
+    The driver's own encode/decode round-trips the zone list exactly (a test
+    proves it with quote marks, backslashes, Hebrew and padding), so the
+    change happens inside Director: escape sequences, character encoding or a
+    length limit are the candidates, and the log did not say which.
+
+    So stored values are made immune to all three at once:
+      * base64 -- nothing but A-Z a-z 0-9 + / =, so there are no quotes,
+        backslashes, non-ASCII bytes or whitespace for anything to reinterpret;
+      * parts of at most PERSIST_PART_CHARS characters, so a per-value length
+        limit cannot cut one off;
+      * a header "PIMABLOB1:<parts>:<length>:<checksum>" written LAST, so a
+        reader never trusts a half-written value, and a checksum over the
+        decoded text.
+    Every part is read back and compared after writing. If one differs, the
+    log names the part, both lengths and the first differing position -- so a
+    further failure is a diagnosis, not another guess.
+-----------------------------------------------------------------------------]]
+PERSIST_PART_CHARS = 600
+PERSIST_BLOB_PREFIX = 'PIMABLOB1:'
+PERSIST_PART_PREFIX = 'PIMAB64:'
+
+local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local B64_INDEX = {}
+for i = 1, 64 do B64_INDEX[B64:sub(i, i)] = i - 1 end
+
+-- Pure Lua, no bit operators (Lua 5.1 has none), no C4:Base64*: a public
+-- template found C4:Base64Decode returns "" for short inputs.
+function Base64Encode(s)
+  local out = {}
+  for i = 1, #s, 3 do
+    local a, b, c = s:byte(i, i + 2)
+    local n = a * 65536 + (b or 0) * 256 + (c or 0)
+    local c1 = math.floor(n / 262144) % 64
+    local c2 = math.floor(n / 4096) % 64
+    local c3 = math.floor(n / 64) % 64
+    local c4 = n % 64
+    out[#out + 1] = B64:sub(c1 + 1, c1 + 1) .. B64:sub(c2 + 1, c2 + 1) ..
+      (b and B64:sub(c3 + 1, c3 + 1) or '=') .. (c and B64:sub(c4 + 1, c4 + 1) or '=')
+  end
+  return table.concat(out)
+end
+
+-- Returns nil for anything that is not well-formed base64.
+function Base64Decode(s)
+  if type(s) ~= 'string' or #s % 4 ~= 0 then return nil end
+  local out = {}
+  for i = 1, #s, 4 do
+    local q = { s:byte(i, i + 3) }
+    local v, pad = {}, 0
+    for k = 1, 4 do
+      local ch = string.char(q[k])
+      if ch == '=' then
+        if k < 3 or i + 3 ~= #s then return nil end
+        pad = pad + 1
+        v[k] = 0
+      else
+        if pad > 0 then return nil end
+        v[k] = B64_INDEX[ch]
+        if not v[k] then return nil end
+      end
+    end
+    local n = v[1] * 262144 + v[2] * 4096 + v[3] * 64 + v[4]
+    local a = math.floor(n / 65536) % 256
+    local b = math.floor(n / 256) % 256
+    local c = n % 256
+    out[#out + 1] = string.char(a)
+    if pad < 2 then out[#out + 1] = string.char(b) end
+    if pad < 1 then out[#out + 1] = string.char(c) end
+  end
+  return table.concat(out)
+end
+
+function PersistChecksum(s)
+  local sum = 0
+  for i = 1, #s do sum = (sum * 31 + s:byte(i)) % 16777213 end
+  return sum
+end
+
+local function blobPartKey(key, i) return key .. '.part' .. i end
+
+-- Describes how `got` differs from `want`, for the log.
+function DescribeDifference(want, got)
+  if type(got) ~= 'string' then return 'came back as a ' .. type(got) end
+  if got == want then return 'identical' end
+  local n = math.min(#want, #got)
+  local at = n + 1
+  for i = 1, n do
+    if want:byte(i) ~= got:byte(i) then at = i break end
+  end
+  return 'wrote ' .. #want .. ' chars, read ' .. #got .. ', first difference at ' .. at ..
+    ' (wrote "' .. want:sub(at, at + 11) .. '", read "' .. got:sub(at, at + 11) .. '")'
+end
+
+--[[---------------------------------------------------------------------------
+    Verification is DEFERRED (v46).
+
+    Field report, v45: a brand-new key, written and read straight back,
+    "came back as a nil". On this controller a persisted value becomes
+    readable only some time AFTER PersistSetValue returns. That one fact
+    explains all three field failures:
+      v43  the read returned the PREVIOUS value, decoded into a table;
+      v44  the read returned the PREVIOUS value as text -- "changed";
+      v45  the key was new, so the previous value was nothing.
+    Storage was working; the driver was checking too early.
+
+    So writes are not read back in the same callback. Each write is recorded
+    and checked on a timer, a few seconds later and again later if needed;
+    the result is logged either way, with the exact difference on failure.
+    Anything that must not happen until data is known to be saved -- the
+    Zones Config rewrite in particular -- waits for that check.
+-----------------------------------------------------------------------------]]
+PERSIST_VERIFY_DELAYS_S = { 5, 30, 120 }
+PersistExpect = {}          -- key -> { text = ..., raw = { [rawKey] = value } }
+PersistVerifyTimerId = nil
+PersistVerifyAttempt = 0
+PersistVerifyWaiters = {}   -- callbacks: function(ok, detail)
+
+function SchedulePersistVerify()
+  if PersistVerifyTimerId then return end
+  local delay = PERSIST_VERIFY_DELAYS_S[PersistVerifyAttempt + 1]
+  if not delay then return end
+  PersistVerifyTimerId = C4:AddTimer(delay, 'SECONDS')
+end
+
+function OnPersistVerifyWhenDone(fn)
+  PersistVerifyWaiters[#PersistVerifyWaiters + 1] = fn
+  if next(PersistExpect) == nil then
+    -- Nothing outstanding: answer on the next tick rather than re-entering.
+    SchedulePersistVerify()
+  end
+end
+
+-- Writes `text` as a blob. Returns true if the writes were accepted; whether
+-- they were KEPT is checked later (see above).
+function PersistWriteBlob(key, text)
+  if not (C4 and C4.PersistSetValue) then return false end
+  text = tostring(text)
+  local b64 = Base64Encode(text)
+  local parts = math.max(1, math.ceil(#b64 / PERSIST_PART_CHARS))
+
+  local previousParts = 0
+  local prev = PersistGetRaw(key)
+  if type(prev) == 'string' and prev:sub(1, #PERSIST_BLOB_PREFIX) == PERSIST_BLOB_PREFIX then
+    previousParts = tonumber(prev:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):')) or 0
+  end
+
+  local raw = {}
+  for i = 1, parts do
+    local value = PERSIST_PART_PREFIX .. b64:sub((i - 1) * PERSIST_PART_CHARS + 1, i * PERSIST_PART_CHARS)
+    if not PersistSetRaw(blobPartKey(key, i), value) then return false end
+    raw[blobPartKey(key, i)] = value
+  end
+  local header = PERSIST_BLOB_PREFIX .. parts .. ':' .. #text .. ':' .. PersistChecksum(text)
+  if not PersistSetRaw(key, header) then return false end
+  raw[key] = header
+  for i = parts + 1, previousParts do
+    if C4.PersistDeleteValue then pcall(function() C4:PersistDeleteValue(blobPartKey(key, i)) end) end
+  end
+
+  PersistExpect[key] = { text = text, raw = raw }
+  PersistVerifyAttempt = 0
+  SchedulePersistVerify()
+  return true
+end
+
+-- Checks every outstanding write. Returns true when all are verified.
+function RunPersistVerify()
+  PersistVerifyTimerId = nil
+  PersistVerifyAttempt = PersistVerifyAttempt + 1
+  local failures = {}
+  for key, want in pairs(PersistExpect) do
+    local got = PersistReadBlob(key)
+    if got == want.text then
+      PersistExpect[key] = nil
+    else
+      -- Name the first raw value that differs, exactly.
+      local detail = nil
+      local rawKeys = {}
+      for rk in pairs(want.raw) do rawKeys[#rawKeys + 1] = rk end
+      table.sort(rawKeys)
+      for _, rk in ipairs(rawKeys) do
+        local back = PersistGetRaw(rk)
+        if back ~= want.raw[rk] then
+          detail = rk .. ': ' .. DescribeDifference(want.raw[rk], back)
+          break
+        end
+      end
+      failures[#failures + 1] = detail or (key .. ': decoded value differs')
+    end
+  end
+
+  if #failures == 0 then
+    local waiters = PersistVerifyWaiters
+    PersistVerifyWaiters = {}
+    for _, fn in ipairs(waiters) do pcall(fn, true) end
+    return true
+  end
+
+  if PERSIST_VERIFY_DELAYS_S[PersistVerifyAttempt + 1] then
+    Dbg('Persistent storage not settled yet (' .. failures[1] .. '); checking again later')
+    SchedulePersistVerify()
+    return false
+  end
+
+  -- Out of retries for this load.
+  LogError('Persistent storage did not keep what was written, ' ..
+    (PersistVerifyAttempt > 0 and ('checked ' .. PersistVerifyAttempt .. ' times over several minutes') or '') ..
+    '. ' .. failures[1] .. '. Please send this line.')
+  local waiters = PersistVerifyWaiters
+  PersistVerifyWaiters = {}
+  for _, fn in ipairs(waiters) do pcall(fn, false, failures[1]) end
+  return false
+end
+
+-- Returns text, or nil plus a reason. Also reads the formats v43 and v44
+-- wrote: a prefixed string (prefix stripped), a plain string, or a table
+-- (returned as is, for the caller to interpret).
+function PersistReadBlob(key)
+  local raw = PersistGetRaw(key)
+  if raw == nil then return nil, 'not set' end
+  if type(raw) == 'table' then return raw end
+  if type(raw) ~= 'string' then return nil, 'held a ' .. type(raw) end
+  if raw:sub(1, #PERSIST_BLOB_PREFIX) ~= PERSIST_BLOB_PREFIX then
+    for _, legacy in ipairs({ 'PIMATEXT1:', 'PIMAZONES1:' }) do
+      if raw:sub(1, #legacy) == legacy then return raw:sub(#legacy + 1) end
+    end
+    return raw
+  end
+  local parts, len, sum = raw:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):(%d+):(%d+)$')
+  parts, len, sum = tonumber(parts), tonumber(len), tonumber(sum)
+  if not parts then return nil, 'unreadable header' end
+  local b64 = {}
+  for i = 1, parts do
+    local v = PersistGetRaw(blobPartKey(key, i))
+    if type(v) ~= 'string' or v:sub(1, #PERSIST_PART_PREFIX) ~= PERSIST_PART_PREFIX then
+      return nil, 'part ' .. i .. ' of ' .. parts .. ' missing or altered'
+    end
+    b64[i] = v:sub(#PERSIST_PART_PREFIX + 1)
+  end
+  local text = Base64Decode(table.concat(b64))
+  if not text then return nil, 'parts do not form valid base64' end
+  if #text ~= len then return nil, 'length ' .. #text .. ', expected ' .. len end
+  if PersistChecksum(text) ~= sum then return nil, 'checksum mismatch' end
+  return text
+end
+
+function PersistDeleteBlob(key)
+  local raw = PersistGetRaw(key)
+  local parts = 0
+  if type(raw) == 'string' then
+    parts = tonumber(raw:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):')) or 0
+  end
+  if C4 and C4.PersistDeleteValue then
+    pcall(function() C4:PersistDeleteValue(key) end)
+    for i = 1, parts do pcall(function() C4:PersistDeleteValue(blobPartKey(key, i)) end) end
+  end
+end
+
+-- Returns whatever Director hands back, unmodified: a string, but on some
+-- controllers a number or a table for text that looks like JSON.
+function PersistGetRaw(key)
+  if not (C4 and C4.PersistGetValue) then return nil end
+  local ok, v = pcall(function() return C4:PersistGetValue(key) end)
+  if not ok then
+    LogWarn('Could not read persistent key ' .. key .. ': ' .. tostring(v))
+    return nil
+  end
+  return v
+end
+
+-- Text keys (backup, flags). Anything that is not text -- e.g. a number a
+-- controller produced by decoding v43's unprefixed value, which may be all
+-- that survived of a whole line -- is treated as absent.
+function PersistGet(key)
+  local v, why = PersistReadBlob(key)
+  if v == nil then
+    if why and why ~= 'not set' then LogWarn('Persistent key ' .. key .. ': ' .. why .. '; ignoring it') end
+    return nil
+  end
+  if type(v) ~= 'string' then
+    LogWarn('Persistent key ' .. key .. ' held a ' .. type(v) .. ', not text; ignoring it')
+    return nil
+  end
+  return v
+end
+
+-- Writes raw. Use PersistSet for text.
+function PersistSetRaw(key, value)
+  if not (C4 and C4.PersistSetValue) then return false end
+  local ok, err = pcall(function() C4:PersistSetValue(key, value) end)
+  if not ok then LogError('Could not save persistent key ' .. key .. ': ' .. tostring(err)) end
+  return ok
+end
+
+function PersistSet(key, text)
+  return PersistWriteBlob(key, text)
+end
+
+function PersistDelete(key)
+  PersistDeleteBlob(key)
+end
+
+function EncodeZoneStore(store)
+  local zones = {}
+  for z, r in pairs(store) do
+    zones[tostring(z)] = { n = tostring(r.name or ''), f = tostring(r.from or 'panel') }
+  end
+  return JSON.encode({ v = 1, zones = zones })
+end
+
+-- Accepts the JSON text a blob holds, v44's "PIMAZONES1:" + JSON, v43's plain
+-- JSON, or that JSON already decoded into a table by Director. Returns a store
+-- table, or nil if it is not a v1 store.
+function DecodeZoneStore(value)
+  local doc = value
+  if type(value) == 'string' then
+    local text = value
+    if text:sub(1, #ZONE_STORE_PREFIX) == ZONE_STORE_PREFIX then
+      text = text:sub(#ZONE_STORE_PREFIX + 1)
+    end
+    local ok, d = pcall(function() return JSON.decode(text) end)
+    if not ok then return nil end
+    doc = d
+  end
+  if type(doc) ~= 'table' or tonumber(JSON.scalar(doc.v)) ~= 1 or type(doc.zones) ~= 'table' then
+    return nil
+  end
+  local store = {}
+  for k, r in pairs(doc.zones) do
+    local z = tonumber(k)
+    if z and z >= 1 and z == math.floor(z) and type(r) == 'table' then
+      store[z] = { name = tostring(JSON.scalar(r.n) or ('Zone ' .. z)), from = tostring(JSON.scalar(r.f) or 'panel') }
+    end
+  end
+  return store
+end
+
+function ZoneStoresEqual(a, b)
+  if type(a) ~= 'table' or type(b) ~= 'table' then return false end
+  for z, r in pairs(a) do
+    local o = b[z]
+    if not o or o.name ~= r.name or o.from ~= r.from then return false end
+  end
+  for z in pairs(b) do if not a[z] then return false end end
+  return true
+end
+
+-- Writes the store and reads it back. Returns true only if what Director
+-- hands back DECODES to the same zones. Compared by content rather than by
+-- bytes: v43 compared bytes, and a controller that returns the value in
+-- another form (it did) failed a save that had in fact worked.
+ZoneStoreSavedOnce = false
+
+-- Writes the store. Whether it was kept is checked a few seconds later and
+-- logged (see "Verification is DEFERRED").
+function SaveZoneStore()
+  if not ZonePersistence then return false end
+  if not PersistWriteBlob(ZONE_STORE_KEY, EncodeZoneStore(ZoneStore)) then
+    LogError('Zone store could not be saved; zone changes will not survive a reload')
+    return false
+  end
+  if not ZoneStoreSavedOnce then
+    ZoneStoreSavedOnce = true
+    local n = 0
+    for _ in pairs(ZoneStore) do n = n + 1 end
+    OnPersistVerifyWhenDone(function(ok)
+      if ok then LogInfo('Zone store saved and verified: ' .. n .. ' zone(s)') end
+    end)
+  end
+  return true
+end
+
+-- Merges the store with the Zones Config overrides into the `Zones` table the
+-- rest of the driver uses. `configText` is passed explicitly because a value
+-- this driver just wrote with UpdateProperty is not guaranteed to be in
+-- Properties yet.
+function BuildZones(configText)
+  ZoneOverrides = parseZones(configText or '')
+  local result = {}
+  for z, r in pairs(ZoneStore) do
+    result[z] = { zone = z, name = r.name, type = 'contact', nameFrom = r.from }
+  end
+  for z, o in pairs(ZoneOverrides) do
+    if o.hidden then
+      result[z] = nil
+    else
+      local r = result[z] or { zone = z, name = 'Zone ' .. z, type = 'contact', nameFrom = 'default' }
+      if o.nameGiven then r.name = o.name; r.nameFrom = 'override' end
+      if o.typeGiven then r.type = o.type; r.typeFrom = 'override' end
+      if o.partition then r.partition = o.partition; r.partitionFrom = 'override' end
+      result[z] = r
+    end
+  end
+  Zones = result
+  UpdateZonesSummary()
+end
+
+function UpdateZonesSummary()
+  local total, byType, overrides = 0, {}, 0
+  for _, zc in pairs(Zones) do
+    total = total + 1
+    local t = tostring(zc.type or 'contact'):lower()
+    byType[t] = (byType[t] or 0) + 1
+  end
+  for _ in pairs(ZoneOverrides) do overrides = overrides + 1 end
+  local types = {}
+  for t, n in pairs(byType) do types[#types + 1] = n .. ' ' .. t end
+  table.sort(types)
+  local text = total .. ' zone(s)' .. (#types > 0 and (': ' .. table.concat(types, ', ')) or '') ..
+    '. ' .. overrides .. ' override(s) in Zones Config. Run "List Zones" for the full table.'
+  if not ZonePersistence then
+    text = text .. ' (zone store unavailable -- Zones Config is the full list)'
+  end
+  SetProp('Zones Summary', text)
+end
+
+-- Which override entries a legacy full Zones Config actually needs once the
+-- names are in the store: a non-default type, or a partition other than the
+-- one an unassigned zone falls back to anyway.
+function MinimalOverrides(parsed, store)
+  local fallback = FallbackPartition()
+  local out = {}
+  for z, e in pairs(parsed) do
+    local t = e.typeGiven and tostring(e.type):lower() or 'contact'
+    local keepType = e.hidden or (t ~= 'contact')
+    local keepPart = e.partition and e.partition ~= fallback
+    -- A name the store does not already hold (edited while the migration
+    -- was waiting on storage) stays an override rather than being lost.
+    local keepName = e.nameGiven and store and not (store[z] and store[z].name == e.name)
+    if keepType or keepPart or keepName then
+      out[z] = {
+        zone = z, nameGiven = keepName and true or false, name = e.name,
+        typeGiven = keepType and not e.hidden, type = e.type, hidden = e.hidden,
+        partition = keepPart and e.partition or nil,
+      }
+    end
+  end
+  return out
+end
+
+function InitZoneStore()
+  ZoneStore = {}
+  ZonePersistence = (C4 and C4.PersistGetValue and C4.PersistSetValue) and true or false
+  local configText = Properties['Zones Config'] or ''
+  if not ZonePersistence then
+    LogWarn('Persistent storage is not available on this controller; Zones Config ' ..
+      'is used as the complete zone list, as in v42 and earlier.')
+    BuildZones(configText)
+    return
+  end
+
+  ZoneMigrationMode = PersistGet(ZONE_MIGRATION_KEY)
+  local stored, storedWhy = PersistReadBlob(ZONE_STORE_KEY)
+
+  -- The migration flag, not the store's existence, decides. 'done' is only
+  -- written after a verified migration; v43 on a controller that returned
+  -- the store as a table left a store behind WITHOUT the flag, holding only
+  -- panel names. With a non-empty Zones Config and no flag, the migration
+  -- has never completed, so it runs now and replaces that store.
+  if ZoneMigrationMode ~= 'done' and ZoneMigrationMode ~= 'off' and trim(configText) ~= '' then
+    -- 'pending' (a previous load wrote everything but could not confirm it
+    -- before unloading) goes through the same path: the data is written
+    -- again and confirmed on a timer, so the result does not depend on how
+    -- long this controller takes to make a write readable.
+    MigrateZonesConfig(configText)
+    return
+  end
+
+  local store = (stored ~= nil) and DecodeZoneStore(stored) or nil
+  if store then
+    ZoneStore = store
+  elseif stored ~= nil or (storedWhy and storedWhy ~= 'not set') then
+    -- Present but unreadable. After a migration Zones Config holds only
+    -- overrides, so falling back to it alone would drop every zone name.
+    -- Rebuild the names from the verified backup of the original list.
+    local backup = PersistGet(ZONE_BACKUP_KEY)
+    if backup and trim(backup) ~= '' then
+      for z, e in pairs(parseZones(backup)) do
+        if e.nameGiven and not e.hidden then ZoneStore[z] = { name = e.name, from = 'config' } end
+      end
+      LogWarn('The saved zone store could not be read (' .. tostring(storedWhy or 'not a zone store') ..
+        '); rebuilt it from the backup of your original Zones Config.')
+      SaveZoneStore()
+    else
+      LogError('The saved zone store could not be read (' .. tostring(storedWhy or 'not a zone store') ..
+        ') and there is no backup; using Zones Config alone. Run "Refresh Zones From Panel" to rebuild it.')
+    end
+  else
+    SaveZoneStore()
+  end
+  if ZoneMigrationMode == nil then
+    -- A fresh install: nothing to migrate, and nothing to migrate later.
+    PersistSet(ZONE_MIGRATION_KEY, 'done')
+    ZoneMigrationMode = 'done'
+  end
+  BuildZones(configText)
+end
+
+-- Phase 1: write the backup and the store, keep running on the full Zones
+-- Config (the zones are identical either way), and wait for storage to
+-- confirm. Phase 2, FinishZoneMigration, only then shortens Zones Config.
+PendingZoneMigration = nil
+HideNewZonesOnce = false
+
+function MigrateZonesConfig(configText)
+  local parsed = parseZones(configText)
+  local store = {}
+  for z, e in pairs(parsed) do
+    if e.nameGiven and not e.hidden then store[z] = { name = e.name, from = 'config' } end
+  end
+
+  ZoneStore = store
+  local wrote = PersistSet(ZONE_BACKUP_KEY, configText) and SaveZoneStore()
+    and PersistSet(ZONE_MIGRATION_KEY, 'pending') and PersistSet(ZONE_HIDE_NEW_KEY, 'yes')
+  BuildZones(configText)
+  if not wrote then
+    LogError('Zone migration skipped: the zone store could not be written. ' ..
+      'Nothing was changed; the driver is using Zones Config as before.')
+    return
+  end
+
+  -- The first refresh from the panel may finish before storage confirms, so
+  -- the "hide zones the old list left out" rule is held in memory too.
+  HideNewZonesOnce = true
+  PendingZoneMigration = { config = configText, store = store }
+  LogInfo('Moving zones to the driver\'s zone store; Zones Config will be shortened once ' ..
+    'storage confirms the save (a few seconds).')
+  OnPersistVerifyWhenDone(FinishZoneMigration)
+end
+
+function FinishZoneMigration(ok, detail)
+  local pending = PendingZoneMigration
+  PendingZoneMigration = nil
+  if not pending then return end
+  if not ok then
+    LogError('Zone migration not completed: storage did not confirm the save (' .. tostring(detail) ..
+      '). Nothing was changed; Zones Config still holds your full list and the next driver ' ..
+      'load will try again.')
+    return
+  end
+
+  -- Recomputed from Zones Config AS IT IS NOW: a first refresh may already
+  -- have added "N,,hidden" entries while this was waiting, and those stay.
+  local current = PropShadow['Zones Config'] or Properties['Zones Config'] or pending.config
+  local overridesText = SerializeZoneOverrides(MinimalOverrides(parseZones(current), ZoneStore))
+  local imported = 0
+  for _ in pairs(pending.store) do imported = imported + 1 end
+  LogBlock({
+    'Zones moved to the driver\'s zone store: ' .. imported .. ' zone name(s) imported and verified. ' ..
+      'Zones Config now holds only overrides (' .. #current .. ' -> ' .. #overridesText .. ' bytes).',
+    'Your previous Zones Config is saved and can be put back with the "Restore Zones Config" action. ' ..
+      'It was:',
+    pending.config,
+  })
+  RecordActivity('Zones moved to the zone store (' .. imported .. ' imported)')
+  PersistSet(ZONE_MIGRATION_KEY, 'done')
+  ZoneMigrationMode = 'done'
+  SetProp('Zones Config', overridesText)
+  BuildZones(overridesText)
+end
+
+-- A rename from the app. Stored, so it survives a reload; and if Zones Config
+-- carried a name override for this zone it is dropped, or the override would
+-- win and the rename would appear to do nothing.
+function RenameZoneFromApp(zone, newName)
+  newName = tostring(newName):gsub('[,;]', ' ')
+  ZoneStore[zone] = { name = newName, from = 'app' }
+  SaveZoneStore()
+  local configText = Properties['Zones Config'] or ''
+  local o = ZoneOverrides[zone]
+  if o and o.nameGiven then
+    o.nameGiven = false
+    configText = SerializeZoneOverrides(ZoneOverrides)
+    SetProp('Zones Config', configText)
+  end
+  BuildZones(configText)
+  SendPanelInfo(true)
+end
+
+function ListZones()
+  local lines = { 'Zones (' .. (ZonePersistence and 'zone store + Zones Config overrides' or 'Zones Config only') .. '):' }
+  local SOURCE = { config = 'imported', panel = 'panel', app = 'renamed in app', override = 'Zones Config', default = 'default' }
+  for _, z in ipairs(SortedZoneNumbers()) do
+    local zc = Zones[z]
+    local partition = zc.partition or FallbackPartition()
+    local notes = { 'name: ' .. (SOURCE[zc.nameFrom] or tostring(zc.nameFrom)) }
+    if zc.typeFrom then notes[#notes + 1] = 'type: Zones Config' end
+    if zc.partitionFrom then notes[#notes + 1] = 'partition: Zones Config' end
+    local panelName = PanelZoneNames[z]
+    if panelName and panelName ~= zc.name then notes[#notes + 1] = 'panel calls it "' .. panelName .. '"' end
+    lines[#lines + 1] = string.format('  %3d  %-24s %-9s p%d   (%s)', z, tostring(zc.name),
+      tostring(zc.type or 'contact'), partition, table.concat(notes, '; '))
+  end
+  local hidden = {}
+  for z, o in pairs(ZoneOverrides) do if o.hidden then hidden[#hidden + 1] = z end end
+  table.sort(hidden)
+  if #hidden > 0 then lines[#lines + 1] = '  hidden by Zones Config: ' .. table.concat(hidden, ', ') end
+  LogBlock(lines)
+  SetProp('Last Command Result', 'Listed ' .. (#lines - 1) .. ' zone(s) in the log')
+end
+
+function ListRecentActivity()
+  local lines = { 'Recent activity (newest first, ' .. #RecentActivity .. ' entries):' }
+  for _, l in ipairs(RecentActivity) do lines[#lines + 1] = '  ' .. l end
+  LogBlock(lines)
+end
+
+function RestoreZonesConfig()
+  local backup = PersistGet(ZONE_BACKUP_KEY)
+  if not backup or backup == '' then
+    local msg = 'Restore Zones Config: no saved Zones Config to restore'
+    LogInfo(msg)
+    SetProp('Last Command Result', msg)
+    return
+  end
+  -- 'off' stops the next load from importing it straight back; the driver
+  -- then runs on Zones Config alone, exactly as v42 did.
+  PersistSet(ZONE_MIGRATION_KEY, 'off')
+  ZoneMigrationMode = 'off'
+  PersistDelete(ZONE_STORE_KEY)
+  ZoneStore = {}
+  SetProp('Zones Config', backup)
+  BuildZones(backup)
+  SendPanelInfo(true)
+  LogInfo('Restored the previous Zones Config; the zone store is cleared and will not be rebuilt automatically')
+  SetProp('Last Command Result', 'Restored the previous Zones Config')
 end
 
 --[[=============================================================================
@@ -1422,6 +2143,13 @@ function HandleInboundFrame(handle, frame)
     SyncPartitionStates(true)
     SyncZoneStates()
     RefreshExitTime()
+    -- Once per driver load: learn any zone added at the panel since last
+    -- time. Queued after the state sync, so it never delays what the app
+    -- shows. Adds only; never renames or removes (see FinishZoneDiscovery).
+    if not ZonesAutoRefreshed and ZoneMigrationMode ~= 'off' then
+      ZonesAutoRefreshed = true
+      DiscoverZoneNames({ auto = true })
+    end
     -- Re-publish the zone inventory once per session as insurance against
     -- LateInit having run before Director was ready to receive it. Later
     -- reconnects skip it: the inventory does not depend on the panel, and
@@ -1740,6 +2468,10 @@ function OnTimerExpired(idTimer)
   end
   if LinkWatchdogTimerId and idTimer == LinkWatchdogTimerId then
     CheckLinkAlive()
+    return
+  end
+  if PersistVerifyTimerId and idTimer == PersistVerifyTimerId then
+    RunPersistVerify()
     return
   end
   local exitPid = ExitDelayTimers[idTimer]
@@ -4698,9 +5430,7 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
         newName ~= Zones[zone].name then
       LogInfo('Zone ' .. zone .. ' renamed from the app: "' .. tostring(Zones[zone].name) ..
         '" -> "' .. newName .. '"')
-      Zones[zone].name = newName
-      SetProp('Zones Config', SerializeZones())
-      SendPanelInfo(true)
+      RenameZoneFromApp(zone, newName)
     else
       Dbg('SET_ZONE_INFO for zone ' .. tostring(zone) .. ': nothing to change')
     end
@@ -5101,10 +5831,11 @@ local MAX_ZONE_NUMBER = 144
 -- is normal, an endless run of them means we are past the end.
 local MAX_EMPTY_ZONE_PAGES = 3
 
-function DiscoverZoneNames()
+function DiscoverZoneNames(opts)
+  opts = opts or {}
   local pw = firstPartitionCode()
   if not pw then
-    LogInfo('Discover Zone Names: configure at least one partition user code first')
+    LogInfo('Refresh Zones From Panel: configure at least one partition user code first')
     return
   end
   -- Ask how many zones exist, so the walk has a real end rather than relying
@@ -5122,13 +5853,13 @@ function DiscoverZoneNames()
         '); scanning up to ' .. MAX_ZONE_NUMBER .. ' zones instead.')
       total = MAX_ZONE_NUMBER
     end
-    DiscoverZoneNamesPage(1, total, pw, {}, 0)
+    DiscoverZoneNamesPage(1, total, pw, {}, 0, opts)
   end)
 end
 
-function DiscoverZoneNamesPage(startOrder, total, pw, acc, emptyRuns)
+function DiscoverZoneNamesPage(startOrder, total, pw, acc, emptyRuns, opts)
   if startOrder > total then
-    FinishZoneDiscovery(acc)
+    FinishZoneDiscovery(acc, true, opts)
     return
   end
   local stopOrder = math.min(startOrder + ZONE_NAME_PAGE - 1, total)
@@ -5137,9 +5868,11 @@ function DiscoverZoneNamesPage(startOrder, total, pw, acc, emptyRuns)
   RequestData(PARAM_ZONE_NAMES, startOrder, stopOrder, pw, function(frame, err)
     if err then
       -- Keep whatever we already collected rather than losing the whole run.
-      LogInfo('Discover Zone Names stopped at zone ' .. startOrder .. ': ' .. tostring(err) ..
+      LogInfo('Zone refresh stopped at zone ' .. startOrder .. ': ' .. tostring(err) ..
         ' (keeping the ' .. #acc .. ' zones found so far)')
-      FinishZoneDiscovery(acc)
+      -- Incomplete: new zones found so far are still added, but nothing is
+      -- reported as missing from the panel on the strength of a partial walk.
+      FinishZoneDiscovery(acc, false, opts)
       return
     end
     -- `parameters` is panel-supplied: type-check before iterating, or a
@@ -5155,14 +5888,10 @@ function DiscoverZoneNamesPage(startOrder, total, pw, acc, emptyRuns)
       -- name -- skip naming it without shifting everything after it.
       if not JSON.isNull(name) and JSON.scalar(name) ~= '' then
         local decoded = DecodePanelText(JSON.scalar(name))
-        -- Guard the "zone,name,type,partition;..." format against a name
-        -- that happens to contain our own delimiters.
+        -- Keep names free of the Zones Config separators, so a name can
+        -- always be copied into an override without corrupting it.
         decoded = decoded:gsub('[,;]', ' ')
-        -- Default the partition field to 1 rather than leaving it empty:
-        -- these lines are meant to be pasted straight into Zones Config, and
-        -- a zone with no partition never shows up in any partition's zone
-        -- list on the native widget. Edit it if the zone lives elsewhere.
-        acc[#acc+1] = zoneNum .. ',' .. decoded .. ',contact,1'
+        acc[#acc+1] = { zone = zoneNum, name = decoded }
       end
     end
     -- Advance by however many entries the panel actually returned. If it
@@ -5176,38 +5905,95 @@ function DiscoverZoneNamesPage(startOrder, total, pw, acc, emptyRuns)
       nextEmptyRuns = (emptyRuns or 0) + 1
       if nextEmptyRuns >= MAX_EMPTY_ZONE_PAGES then
         Dbg('No names in the last ' .. nextEmptyRuns .. ' pages; ending discovery at zone ' .. stopOrder)
-        FinishZoneDiscovery(acc)
+        FinishZoneDiscovery(acc, true, opts)
         return
       end
     end
 
-    DiscoverZoneNamesPage(startOrder + advance, total, pw, acc, nextEmptyRuns)
+    DiscoverZoneNamesPage(startOrder + advance, total, pw, acc, nextEmptyRuns, opts)
   end)
 end
 
-function FinishZoneDiscovery(acc)
-  -- Keep the COMPLETE list in memory. The property below is only a
-  -- human-readable preview and may be shortened to keep it manageable;
-  -- "Apply Discovered Zones" uses this full copy, so a long zone list is
-  -- never silently reduced to whatever happened to fit in a property.
-  DiscoveredZonesFull = table.concat(acc, ';')
+function FinishZoneDiscovery(acc, complete, opts)
+  opts = opts or {}
   DiscoveredZonesCount = #acc
-
-  local preview = DiscoveredZonesFull
-  if #preview > DISCOVERED_PREVIEW_BYTES then
-    -- Cut at an entry boundary, never mid-entry: a hard byte cut can also
-    -- split a multi-byte Hebrew character and render as mojibake.
-    local cut = preview:sub(1, DISCOVERED_PREVIEW_BYTES)
-    local lastSep = cut:match('.*();')
-    if lastSep then cut = cut:sub(1, lastSep - 1) end
-    local shown = select(2, cut:gsub(';', ';')) + 1
-    preview = cut .. ' ... (preview shows ' .. shown .. ' of ' .. #acc ..
-      ' zones -- use the "Apply Discovered Zones" action, which applies all ' .. #acc .. ')'
+  local added, seen = {}, {}
+  local shownBefore = {}
+  for z in pairs(Zones or {}) do shownBefore[z] = true end
+  PanelZoneNames = {}
+  for _, r in ipairs(acc) do
+    seen[r.zone] = true
+    PanelZoneNames[r.zone] = r.name
+    -- Adds only. A zone already in the store keeps its name: it may be one
+    -- the installer corrected by hand (reversed Hebrew, a clearer label),
+    -- and the panel re-reporting its own text must never undo that.
+    if not ZoneStore[r.zone] then
+      ZoneStore[r.zone] = { name = r.name, from = 'panel' }
+      added[#added + 1] = r.zone
+    end
   end
-  SetProp('Discovered Zones', preview)
-  LogInfo('Discover Zone Names complete: ' .. #acc ..
-    ' named zones found. Run the "Apply Discovered Zones" action to write them into Zones Config.')
-  SetProp('Last Command Result', 'Discovered ' .. #acc .. ' named zones.')
+
+  -- Zones the store knows but the panel no longer names. Reported, never
+  -- removed: a zone silently vanishing from the app is worse than a stale
+  -- one, and "hidden" in Zones Config removes it deliberately.
+  local stale = {}
+  if complete then
+    for z in pairs(ZoneStore) do
+      if not seen[z] and not (ZoneOverrides[z] and ZoneOverrides[z].hidden) then
+        stale[#stale + 1] = z
+      end
+    end
+    table.sort(stale)
+  end
+
+  -- First refresh after upgrading from an explicit v42 list: zones the old
+  -- list did not include stay out of the app, as they were.
+  local hideFlag = PersistGet(ZONE_HIDE_NEW_KEY)
+  local hideNew = HideNewZonesOnce or (hideFlag == 'yes' or hideFlag == '1' or hideFlag == 'true')
+  if #added > 0 then
+    table.sort(added)
+    SaveZoneStore()
+    local configText = Properties['Zones Config'] or ''
+    if hideNew then
+      local overrides = parseZones(configText)
+      for _, z in ipairs(added) do
+        overrides[z] = { zone = z, hidden = true, nameGiven = false, typeGiven = false }
+      end
+      configText = SerializeZoneOverrides(overrides)
+      SetProp('Zones Config', configText)
+      LogInfo('Zones: the panel has ' .. #added .. ' zone(s) your previous Zones Config did not ' ..
+        'include (' .. table.concat(added, ', ') .. '). They are added as hidden, so the app ' ..
+        'looks as it did; remove a ",,hidden" entry from Zones Config to show one.')
+    else
+      -- "New" means new to the app. A zone already shown from Zones Config
+      -- and only now entering the store is not news; v43 reported all 35
+      -- zones of an existing install as new.
+      local fresh = {}
+      for _, z in ipairs(added) do if not shownBefore[z] then fresh[#fresh + 1] = z end end
+      if #fresh > 0 then
+        LogInfo('Zones: ' .. #fresh .. ' new zone(s) from the panel: ' ..
+          table.concat(fresh, ', ') .. '. They show as "contact"; set a type in Zones Config if needed.')
+      else
+        Dbg('Zones: ' .. #added .. ' zone(s) recorded in the zone store; none are new to the app')
+      end
+    end
+    BuildZones(configText)
+    SendPanelInfo()
+  end
+  if hideNew and complete then
+    HideNewZonesOnce = false
+    PersistDelete(ZONE_HIDE_NEW_KEY)
+  end
+  if #stale > 0 then
+    LogWarn('Zones ' .. table.concat(stale, ', ') .. ' are known to the driver but the ' ..
+      'panel no longer names them. To remove one from the app, add "N,,hidden" to Zones Config.')
+  end
+
+  local msg = 'Zone refresh: panel names ' .. #acc .. ' zone(s); ' .. #added .. ' new' ..
+    (#stale > 0 and (', ' .. #stale .. ' no longer on the panel') or '') ..
+    (complete and '' or ' (incomplete read)')
+  if opts.auto then Dbg(msg) else LogInfo(msg) end
+  SetProp('Last Command Result', msg)
 end
 
 --[[=============================================================================
@@ -5221,7 +6007,18 @@ function OnDriverInit()
   -- old driver and nothing else in the log means what you think it does.
   LogInfo('PIMA FORCE driver v' .. DRIVER_VERSION .. ' loading')
   Partitions = parsePartitions(Properties['Partitions Config'])
-  Zones = parseZones(Properties['Zones Config'])
+  -- Zones come from the persistent zone store plus the Zones Config
+  -- overrides; the first load of v43 imports an old full Zones Config.
+  ZonesAutoRefreshed = false
+  PersistExpect = {}
+  PersistVerifyWaiters = {}
+  PersistVerifyAttempt = 0
+  if PersistVerifyTimerId then pcall(function() C4:KillTimer(PersistVerifyTimerId) end) end
+  PersistVerifyTimerId = nil
+  PendingZoneMigration = nil
+  HideNewZonesOnce = false
+  ZoneStoreSavedOnce = false
+  InitZoneStore()
   RecvBuffer = ''
   ZoneState = {}
   PartitionStatus = {}
@@ -5233,10 +6030,6 @@ function OnDriverInit()
   ServerDataLayoutLogged = false
   UnparseableWarned = false
   ServerSendForm = nil
-  -- A discovery does not survive a driver reload: applying a zone list
-  -- captured before a restart could write stale names over a config that has
-  -- since been edited. Re-run "Discover Zone Names" after a reload.
-  DiscoveredZonesFull = nil
   DiscoveredZonesCount = 0
   -- Commands outstanding from before a reload are not ours to complete: the
   -- frame counter restarts at 5000 on load, so a stale entry would swallow
@@ -5398,6 +6191,8 @@ end
 
 function OnDriverDestroyed()
   StopLinkWatchdog()
+  if PersistVerifyTimerId then pcall(function() C4:KillTimer(PersistVerifyTimerId) end) end
+  PersistVerifyTimerId = nil
   for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end
   CancelZonePublish()
   CancelEventMuteTimer()
@@ -5412,6 +6207,12 @@ function OnDriverDestroyed()
 end
 
 function OnPropertyChanged(strProperty)
+  -- The installer just set this property, so what the driver last wrote to
+  -- it is no longer the current value. Forget it: otherwise a later driver
+  -- write that happens to equal that stale value is skipped as "unchanged"
+  -- and the installer's edit silently stands where the driver's should have
+  -- (found in v46: an app rename could leave a stale name override behind).
+  PropShadow[strProperty] = nil
   if strProperty == 'Log Level' or strProperty == 'Debug Logging' then
     ResolveLogLevel()
     -- Debug level also reveals the read-only diagnostic properties.
@@ -5460,7 +6261,7 @@ function OnPropertyChanged(strProperty)
     PublishPartitionDisplayText()
     SendPanelInfo()
   elseif strProperty == 'Zones Config' then
-    Zones = parseZones(Properties['Zones Config'])
+    BuildZones(Properties['Zones Config'])
     -- The panel proxy holds its own copy of the zone list; re-push it or the
     -- widget keeps showing the zones from before the edit.
     SendPanelInfo()
@@ -5524,41 +6325,17 @@ function ExecuteCommand(strCommand, tParams)
     SetOutput(output, true)
   elseif strCommand == 'Deactivate Output' and output then
     SetOutput(output, false)
-  elseif strCommand == 'Apply Discovered Zones' then
-    -- Copies what "Discover Zone Names" found into Zones Config, so the
-    -- installer does not have to hand-transcribe a long list (and cannot
-    -- fat-finger a zone number while doing it).
-    -- Prefer the full in-memory list from the last discovery. The property is
-    -- only a preview and may be shortened, so applying it would drop zones.
-    local discovered = DiscoveredZonesFull
-    if not discovered or trim(discovered) == '' then
-      -- No discovery this session (e.g. the driver reloaded since). Fall back
-      -- to the property, but only if it is a complete list rather than a
-      -- shortened preview.
-      local prop = Properties['Discovered Zones'] or ''
-      if trim(prop) ~= '' and not prop:find('preview shows', 1, true) then
-        discovered = prop
-      end
-    end
-
-    if not discovered or trim(discovered) == '' then
-      local msg = 'Apply Discovered Zones: nothing to apply -- run "Discover Zone Names" first.'
-      LogInfo(msg)
-      SetProp('Last Command Result', msg)
-    else
-      SetProp('Zones Config', discovered)
-      Zones = parseZones(discovered)
-      local count = 0
-      for _ in pairs(Zones) do count = count + 1 end
-      LogInfo('Applied ' .. count .. ' discovered zones into Zones Config.')
-      SetProp('Last Command Result', 'Applied ' .. count .. ' zones into Zones Config.')
-      -- Push the new inventory to the app straight away.
-      SendPanelInfo()
-    end
+  elseif strCommand == 'List Zones' then
+    ListZones()
+  elseif strCommand == 'List Recent Activity' then
+    ListRecentActivity()
+  elseif strCommand == 'Restore Zones Config' then
+    RestoreZonesConfig()
   elseif strCommand == 'Sync Partition States' then
     SyncPartitionStates(false)
     SyncZoneStates()
-  elseif strCommand == 'Discover Zone Names' then
+  elseif strCommand == 'Refresh Zones From Panel' or strCommand == 'Discover Zone Names' then
+    -- The old name is still accepted, for anything that was calling it.
     DiscoverZoneNames()
   elseif strCommand == 'Request Zone Status' then
     local pw = firstPartitionCode()

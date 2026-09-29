@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 42
+DRIVER_VERSION = 46
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's
@@ -50,6 +50,10 @@ ARM_LABEL_STAY = 'Stay (Home1)'
 ARM_LABEL_NIGHT = 'Night (Home2)'
 
 import datetime
+import html as htmllib
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Regenerated on every build so Composer sees a fresh modified stamp.
 BUILD_TIME = datetime.datetime.now().strftime('%m/%d/%Y %H:%M')
@@ -58,8 +62,13 @@ def esc(s):
     return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 properties = []
+# Plain metadata alongside the XML, so the Documentation tab's reference
+# section is generated from the same definitions and cannot drift.
+property_meta = []
 
 def add_property(name, ptype, default='', readonly=False, description='', minimum=None, maximum=None, items=None):
+    property_meta.append(dict(name=name, ptype=ptype, default=default, readonly=readonly,
+                              description=description, minimum=minimum, maximum=maximum, items=items))
     lines = ['\t\t\t<property>']
     lines.append(f'\t\t\t\t<name>{esc(name)}</name>')
     lines.append(f'\t\t\t\t<type>{ptype}</type>')
@@ -87,13 +96,13 @@ add_property('Account ID', 'RANGED_INTEGER', 1234, minimum=0, maximum=999999,
 add_property('Partitions Config', 'STRING', '1,Main,1234,ASN',
     description='One entry per partition, separated by ";": id,name,userCode,modes. modes is any combination of A(way) S(tay/Home1) N(ight/Home2) - Disarm is always allowed. Example: 1,Main,1234,ASN;2,Garage,9876,A')
 add_property('Zones Config', 'STRING', '',
-    description='One entry per zone, separated by ";": zone,name,type,partition. type sets the icon shown in the app only (never affects panel behavior) and is one of: contact, door, window, interior, motion, fire, gas, co, heat, leak/water, smoke, pressure, glass, gate, garage - anything else (including a typo) falls back to contact. partition is optional/informational. Use "Discover Zone Names" (Actions) to pull zone names from the panel, then copy from the Discovered Zones property into this one. Example: 1,Front Door,contact,1;13,Kitchen Smoke,smoke,1')
+    description='OVERRIDES only - leave empty unless something needs changing. The zone list itself (numbers and names) is read from the panel automatically and kept in the driver\'s zone store, not here. Each entry is zone,name,type,partition separated by ";", and any field left empty keeps what the zone store has: "5,,motion" sets zone 5\'s icon; "7,,,2" puts zone 7 in partition 2; "12,Garage Side Door" renames zone 12; "9,,hidden" removes zone 9 from the app. type sets the app icon only (never panel behaviour): contact, door, window, interior, motion, fire, gas, co, heat, leak/water, smoke, pressure, glass, gate, garage, or hidden. Zones with no partition use the lowest configured partition. Run "List Zones" (Actions) to see the full table in the log. When upgrading from v42 or earlier, the old full list is imported automatically and this field is shortened to just your changes; "Restore Zones Config" puts the original back.')
 add_property('Zone Bypass Auto-Clear Minutes', 'RANGED_INTEGER', 30, minimum=0, maximum=1440,
     description='When a zone is bypassed via the "Bypass Zone" action, automatically clear the bypass after this many minutes so a forgotten bypass does not leave a detector permanently disabled. 0 disables auto-clear.')
 add_property('Zone/User Name Encoding', 'LIST', 'Windows-1255', items=['Windows-1255', 'UTF-8'],
-    description='Text encoding the panel uses for zone/user names returned by "Discover Zone Names". Windows-1255 is correct for Israeli FORCE panels with Hebrew names (the default). Use UTF-8 for English-only/non-Hebrew panels. If discovered names show as garbled text or "?", try switching this.')
+    description='Text encoding the panel uses for zone/user names read from the panel. Windows-1255 is correct for Israeli FORCE panels with Hebrew names (the default). Use UTF-8 for English-only/non-Hebrew panels. If discovered names show as garbled text or "?", try switching this.')
 add_property('Reverse Zone/User Names', 'LIST', 'Off', items=['Off', 'On'],
-    description='Some panels store names in "visual order" (LCD left-to-right pixel order) rather than logical reading order, which comes out letter-reversed for Hebrew once decoded. Turn On only if names from "Discover Zone Names" come back backwards.')
+    description='Some panels store names in "visual order" (LCD left-to-right pixel order) rather than logical reading order, which comes out letter-reversed for Hebrew once decoded. Turn On only if zone names read from the panel come back backwards.')
 add_property('Log Level', 'LIST', 'Info', items=['Error', 'Warning', 'Info', 'Debug'],
     description='How much this driver writes to Composer Pro\'s Lua Output and Director\'s log. Error: only things that failed. Warning: also things that look wrong but were handled. Info (default): also connection, arming and event activity. Debug: also a full frame-level trace of everything sent to and received from the panel, and it un-hides the read-only diagnostic properties. User codes are redacted at every level, so traces are safe to share.')
 add_property('Non-Bypassable Zones', 'STRING', '',
@@ -120,8 +129,8 @@ add_property('Connection Status', 'STRING', 'Not Connected', readonly=True,
     description='Not Connected / Client Connected (awaiting verification) / Connected.')
 add_property('Panel Verified Account', 'STRING', '', readonly=True,
     description='Account ID the currently-connected panel presented, once verified.')
-add_property('Discovered Zones', 'STRING', '', readonly=True,
-    description='Preview of what the "Discover Zone Names" action found. For a long zone list this shows only the first part - the complete list is held in memory and written by the "Apply Discovered Zones" action, which is the intended way to use it. Copying from here by hand is only reliable when no "preview shows N of M" note is present. A discovery does not survive a driver reload; re-run it if you reload before applying.')
+add_property('Zones Summary', 'STRING', '', readonly=True,
+    description='How many zones the driver knows, by type, and how many overrides Zones Config holds. The full list is printed by the "List Zones" action.')
 add_property('Last Event Type', 'STRING', '', readonly=True, description='Raw CID event type code of the last panel event (Appendix A of the PIMA JSON spec).')
 add_property('Last Event Qualifier', 'STRING', '', readonly=True, description='Raw qualifier of the last panel event (1=new/alarm/disarm, 3=restore/arm).')
 add_property('Last Event Zone', 'STRING', '', readonly=True, description='Zone field of the last panel event.')
@@ -165,8 +174,10 @@ command_defs = [
     ('Deactivate Output', 'Deactivate a panel output.',
         [('OUTPUT', 'RANGED_INTEGER', {'minimum': 1, 'maximum': 41})]),
     ('Sync Partition States', 'Ask the panel for the current arm state of every configured partition and update the driver to match. Runs automatically when the panel connects; use this to re-sync without reloading the driver.', []),
-    ('Discover Zone Names', 'Query the panel for all configured zone names and populate the Discovered Zones property.', []),
-    ('Apply Discovered Zones', 'Copy the contents of the Discovered Zones property into Zones Config, and push the updated zone list to the Control4 app. Run "Discover Zone Names" first. Zones are assigned to partition 1 by default - edit Zones Config afterwards if a zone belongs elsewhere.', []),
+    ('Refresh Zones From Panel', 'Read the zone names from the panel and add any zone the driver does not know yet. Runs automatically once per driver load; use this after adding zones at the panel. Never renames or removes a zone the driver already has - use Zones Config for that.', []),
+    ('List Zones', 'Print every zone to the log: number, name, type, partition, and where each came from (panel, Zones Config, or a rename in the app).', []),
+    ('List Recent Activity', 'Print the full recent-activity buffer (last 25 entries) to the log. The Recent Activity property shows only the newest few.', []),
+    ('Restore Zones Config', 'Put back the full Zones Config you had before upgrading to v43, and stop using the zone store. Only needed if the automatic zone import looks wrong.', []),
     ('Request Zone Status', 'Query current zone status bitfields (parameter 2149) and log a summary.', []),
     ('Report Variables', 'Logs every driver variable and its current value, so a notification that came through with empty text can be diagnosed: either the variables exist and hold values, or they do not.', []),
     ('Request Faults', 'Query current system faults (parameter 2250) and log a summary.', []),
@@ -202,8 +213,11 @@ for name, desc, params in command_defs:
 events = []
 event_id = 1
 
+event_meta = []
+
 def add_event(name, description):
     global event_id
+    event_meta.append((name, description))
     events.append(f'\t\t<event>\n\t\t\t<id>{event_id}</id>\n\t\t\t<name>{esc(name)}</name>\n\t\t\t<description>{esc(description)}</description>\n\t\t</event>')
     event_id += 1
 
@@ -349,34 +363,17 @@ capabilities = f"""\t<capabilities>
 \t\t<functions>Check Status,Arm All,Disarm All,Bypass Open Zones,Clear All Bypasses,Refresh Troubles,Disable Event Notifications,Enable Event Notifications</functions>
 \t</capabilities>"""
 
-documentation = """
-PIMA FORCE Control4 Integration Driver
-=======================================
+# Composer Pro renders a file referenced here in its Documentation tab.
+# Inline text inside <documentation> is shown as plain text, which is why the
+# tab used to be one unformatted block. The file is HTML, generated below from
+# docs/COMPOSER-GUIDE.md plus reference tables built from this script's own
+# property / action / event definitions. The inline text is the fallback for
+# viewers that cannot show the file.
+DOC_FILE = 'www/documentation/index.html'
+documentation_fallback = (
+    'PIMA FORCE Alarm Panel driver v' + str(DRIVER_VERSION) + '. Full documentation: ' + DOC_FILE +
+    ' inside the driver package.')
 
-Talks the PIMA FORCE panel's local "Force Interface using JSON format 2.4"
-CMS protocol. The PANEL dials OUT to this driver (same model as any
-CMS/monitoring-station receiver) - this driver listens on a TCP port and
-waits for the panel to connect in. There is no "panel IP address" property
-because the driver does not initiate the connection.
-
-Setup on the panel (Installer Code -> System Configuration -> CMS &
-Communication -> Monitoring Station -> CMS2 or CMS3 -> Comm.Paths ->
-Network):
-  - IP/host: this Control4 controller's IP address
-  - Port: must match the "Listen Port" property (default 7780)
-  - Protocol: JSON
-  - Account ID: must match the "Account ID" property
-  - Zone/Output Toggle: ON (required for zone open/close events)
-  - Remote Disarm: ON (required for this driver to disarm)
-
-See the driver's README.md (shipped alongside the source) for the full
-setup walkthrough, property/action/event reference, and a list of what has
-been verified against the vendor protocol spec vs. what to double-check
-against Composer Pro's Lua Output on first deploy.
-
-Change log:
-  v1 - initial version
-"""
 
 xml = f"""<devicedata>
 \t<copyright>Provided as a starting point for Efi's own use - not an official PIMA or Control4 product.</copyright>
@@ -397,7 +394,7 @@ xml = f"""<devicedata>
 {capabilities}
 \t<config>
 \t\t<script file="driver.lua"></script>
-\t\t<documentation><![CDATA[{documentation}]]></documentation>
+\t\t<documentation file="{DOC_FILE}"><![CDATA[{documentation_fallback}]]></documentation>
 \t\t<properties>
 {chr(10).join(properties)}
 \t\t</properties>
@@ -423,7 +420,108 @@ xml = f"""<devicedata>
 </devicedata>
 """
 
-with open('/home/claude/pima-force-control4/driver.xml', 'w') as f:
+with open(os.path.join(HERE, 'driver.xml'), 'w') as f:
     f.write(xml)
+
+# --- Documentation tab -------------------------------------------------------
+def _cell(text):
+    return htmllib.escape(str(text))
+
+def _prop_range(m):
+    if m['items']:
+        return ' / '.join(m['items'])
+    if m['minimum'] is not None:
+        return f"{m['minimum']}-{m['maximum']}"
+    return ''
+
+def reference_html():
+    out = ['<h2 id="reference">Reference</h2>',
+           '<p>Generated from the driver definition, so it always matches this version.</p>']
+    settings = [m for m in property_meta if not m['readonly']]
+    status = [m for m in property_meta if m['readonly']]
+    out.append('<h3 id="properties">Properties you set</h3>')
+    out.append('<table><thead><tr><th>Property</th><th>Default</th><th>Values</th><th>What it does</th></tr></thead><tbody>')
+    for m in settings:
+        default = m['default'] if str(m['default']) != '' else '(empty)'
+        out.append(f"<tr><td><b>{_cell(m['name'])}</b></td><td><code>{_cell(default)}</code></td>"
+                   f"<td>{_cell(_prop_range(m))}</td><td>{_cell(m['description'])}</td></tr>")
+    out.append('</tbody></table>')
+    out.append('<h3 id="status-properties">Status properties (read-only)</h3>')
+    out.append('<p>Most of the <i>Last ...</i> properties are hidden unless <b>Log Level</b> is <code>Debug</code>.</p>')
+    out.append('<table><thead><tr><th>Property</th><th>Shows</th></tr></thead><tbody>')
+    for m in status:
+        out.append(f"<tr><td><b>{_cell(m['name'])}</b></td><td>{_cell(m['description'] or '')}</td></tr>")
+    out.append('</tbody></table>')
+    out.append('<h3 id="actions">Actions</h3>')
+    out.append('<table><thead><tr><th>Action</th><th>What it does</th></tr></thead><tbody>')
+    for name, desc, params in command_defs:
+        p = ', '.join(pn for pn, _, _ in params)
+        out.append(f"<tr><td><b>{_cell(name)}</b>{(' <span class=muted>(' + _cell(p) + ')</span>') if p else ''}</td><td>{_cell(desc)}</td></tr>")
+    out.append('</tbody></table>')
+    out.append('<h3 id="events">Events</h3>')
+    per_partition = [(n, d) for n, d in event_meta if n.startswith('Partition 1 ')]
+    others = [(n, d) for n, d in event_meta if not n.startswith('Partition ')]
+    out.append(f'<p>Per partition, for partitions 1-{MAX_PARTITIONS} (partition 1 shown):</p>')
+    out.append('<table><thead><tr><th>Event</th><th>Fires when</th></tr></thead><tbody>')
+    for n, d in per_partition:
+        out.append(f"<tr><td><b>{_cell(n)}</b></td><td>{_cell(d)}</td></tr>")
+    out.append('</tbody></table>')
+    out.append('<p>Panel-wide:</p>')
+    out.append('<table><thead><tr><th>Event</th><th>Fires when</th></tr></thead><tbody>')
+    for n, d in others:
+        out.append(f"<tr><td><b>{_cell(n)}</b></td><td>{_cell(d)}</td></tr>")
+    out.append('</tbody></table>')
+    return '\n'.join(out)
+
+# Self-contained on purpose: no external stylesheet, font or script. Composer
+# may show this with no internet access, and a dealer machine may block it.
+DOC_CSS = """
+:root { color-scheme: light; }
+body { margin: 0; background: #ffffff; color: #1f2328;
+  font: 14px/1.55 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 24px 28px 48px; }
+h1 { font-size: 26px; margin: 0 0 4px; }
+h2 { font-size: 20px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #d0d7de; }
+h3 { font-size: 16px; margin: 22px 0 6px; }
+p, li { max-width: 72ch; }
+a { color: #0969da; text-decoration: none; }
+code, pre { font-family: Consolas, "Courier New", monospace; font-size: 13px; background: #f6f8fa; border-radius: 4px; }
+code { padding: 1px 4px; }
+pre { padding: 10px 12px; overflow-x: auto; }
+pre code { padding: 0; background: none; }
+table { border-collapse: collapse; margin: 8px 0 16px; width: 100%; }
+th, td { border: 1px solid #d0d7de; padding: 6px 9px; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; font-weight: 600; }
+tbody tr:nth-child(even) td { background: #fbfcfd; }
+blockquote { margin: 12px 0; padding: 8px 14px; border-left: 4px solid #d4a72c; background: #fff8e5; color: #3b2e00; }
+blockquote p { margin: 4px 0; }
+.version { color: #57606a; margin: 0 0 20px; }
+.muted { color: #57606a; font-weight: normal; }
+"""
+
+def write_documentation():
+    try:
+        import markdown
+    except ImportError:
+        raise SystemExit('gen_driver_xml.py needs the "markdown" package to build the '
+                         'Documentation tab: pip install markdown')
+    with open(os.path.join(HERE, 'docs', 'COMPOSER-GUIDE.md'), encoding='utf-8') as f:
+        md = f.read()
+    body = markdown.markdown(md, extensions=['tables', 'fenced_code', 'toc'])
+    body = body.replace('<!-- REFERENCE -->', reference_html())
+    # Version line under the title, from the same constant as driver.xml.
+    body = body.replace('</h1>', f'</h1>\n<p class="version">Driver version {DRIVER_VERSION}</p>', 1)
+    page = ('<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            '<title>PIMA FORCE Alarm Panel</title>\n<style>' + DOC_CSS + '</style>\n</head>\n'
+            '<body>\n<main>\n' + body + '\n</main>\n</body>\n</html>\n')
+    path = os.path.join(HERE, DOC_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(page)
+    return path, len(page)
+
+doc_path, doc_len = write_documentation()
+print('Wrote', os.path.relpath(doc_path, HERE) + ':', doc_len, 'bytes')
 
 print('Wrote driver.xml:', len(xml), 'bytes,', len(properties), 'properties,', len(commands), 'commands,', len(actions), 'actions,', len(events), 'events')

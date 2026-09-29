@@ -5,8 +5,8 @@
 	<model>FORCE Series</model>
 	<creator>Community</creator>
 	<created>09/04/2026 00:00</created>
-	<modified>09/29/2026 04:59</modified>
-	<version>42</version>
+	<modified>09/29/2026 08:28</modified>
+	<version>46</version>
 	<small>devices_sm/c4.gif</small>
 	<large>devices_lg/c4.gif</large>
 	<control>lua_gen</control>
@@ -50,34 +50,7 @@
 	</capabilities>
 	<config>
 		<script file="driver.lua"></script>
-		<documentation><![CDATA[
-PIMA FORCE Control4 Integration Driver
-=======================================
-
-Talks the PIMA FORCE panel's local "Force Interface using JSON format 2.4"
-CMS protocol. The PANEL dials OUT to this driver (same model as any
-CMS/monitoring-station receiver) - this driver listens on a TCP port and
-waits for the panel to connect in. There is no "panel IP address" property
-because the driver does not initiate the connection.
-
-Setup on the panel (Installer Code -> System Configuration -> CMS &
-Communication -> Monitoring Station -> CMS2 or CMS3 -> Comm.Paths ->
-Network):
-  - IP/host: this Control4 controller's IP address
-  - Port: must match the "Listen Port" property (default 7780)
-  - Protocol: JSON
-  - Account ID: must match the "Account ID" property
-  - Zone/Output Toggle: ON (required for zone open/close events)
-  - Remote Disarm: ON (required for this driver to disarm)
-
-See the driver's README.md (shipped alongside the source) for the full
-setup walkthrough, property/action/event reference, and a list of what has
-been verified against the vendor protocol spec vs. what to double-check
-against Composer Pro's Lua Output on first deploy.
-
-Change log:
-  v1 - initial version
-]]></documentation>
+		<documentation file="www/documentation/index.html"><![CDATA[PIMA FORCE Alarm Panel driver v46. Full documentation: www/documentation/index.html inside the driver package.]]></documentation>
 		<properties>
 			<property>
 				<name>Listen Port</name>
@@ -109,7 +82,7 @@ Change log:
 				<type>STRING</type>
 				<default></default>
 				<readonly>false</readonly>
-				<description>One entry per zone, separated by ";": zone,name,type,partition. type sets the icon shown in the app only (never affects panel behavior) and is one of: contact, door, window, interior, motion, fire, gas, co, heat, leak/water, smoke, pressure, glass, gate, garage - anything else (including a typo) falls back to contact. partition is optional/informational. Use "Discover Zone Names" (Actions) to pull zone names from the panel, then copy from the Discovered Zones property into this one. Example: 1,Front Door,contact,1;13,Kitchen Smoke,smoke,1</description>
+				<description>OVERRIDES only - leave empty unless something needs changing. The zone list itself (numbers and names) is read from the panel automatically and kept in the driver's zone store, not here. Each entry is zone,name,type,partition separated by ";", and any field left empty keeps what the zone store has: "5,,motion" sets zone 5's icon; "7,,,2" puts zone 7 in partition 2; "12,Garage Side Door" renames zone 12; "9,,hidden" removes zone 9 from the app. type sets the app icon only (never panel behaviour): contact, door, window, interior, motion, fire, gas, co, heat, leak/water, smoke, pressure, glass, gate, garage, or hidden. Zones with no partition use the lowest configured partition. Run "List Zones" (Actions) to see the full table in the log. When upgrading from v42 or earlier, the old full list is imported automatically and this field is shortened to just your changes; "Restore Zones Config" puts the original back.</description>
 			</property>
 			<property>
 				<name>Zone Bypass Auto-Clear Minutes</name>
@@ -129,7 +102,7 @@ Change log:
 				</items>
 				<default>Windows-1255</default>
 				<readonly>false</readonly>
-				<description>Text encoding the panel uses for zone/user names returned by "Discover Zone Names". Windows-1255 is correct for Israeli FORCE panels with Hebrew names (the default). Use UTF-8 for English-only/non-Hebrew panels. If discovered names show as garbled text or "?", try switching this.</description>
+				<description>Text encoding the panel uses for zone/user names read from the panel. Windows-1255 is correct for Israeli FORCE panels with Hebrew names (the default). Use UTF-8 for English-only/non-Hebrew panels. If discovered names show as garbled text or "?", try switching this.</description>
 			</property>
 			<property>
 				<name>Reverse Zone/User Names</name>
@@ -140,7 +113,7 @@ Change log:
 				</items>
 				<default>Off</default>
 				<readonly>false</readonly>
-				<description>Some panels store names in "visual order" (LCD left-to-right pixel order) rather than logical reading order, which comes out letter-reversed for Hebrew once decoded. Turn On only if names from "Discover Zone Names" come back backwards.</description>
+				<description>Some panels store names in "visual order" (LCD left-to-right pixel order) rather than logical reading order, which comes out letter-reversed for Hebrew once decoded. Turn On only if zone names read from the panel come back backwards.</description>
 			</property>
 			<property>
 				<name>Log Level</name>
@@ -250,11 +223,11 @@ Change log:
 				<description>Account ID the currently-connected panel presented, once verified.</description>
 			</property>
 			<property>
-				<name>Discovered Zones</name>
+				<name>Zones Summary</name>
 				<type>STRING</type>
 				<default></default>
 				<readonly>true</readonly>
-				<description>Preview of what the "Discover Zone Names" action found. For a long zone list this shows only the first part - the complete list is held in memory and written by the "Apply Discovered Zones" action, which is the intended way to use it. Copying from here by hand is only reliable when no "preview shows N of M" note is present. A discovery does not survive a driver reload; re-run it if you reload before applying.</description>
+				<description>How many zones the driver knows, by type, and how many overrides Zones Config holds. The full list is printed by the "List Zones" action.</description>
 			</property>
 			<property>
 				<name>Last Event Type</name>
@@ -477,12 +450,20 @@ Change log:
 				<description>Ask the panel for the current arm state of every configured partition and update the driver to match. Runs automatically when the panel connects; use this to re-sync without reloading the driver.</description>
 			</command>
 			<command>
-				<name>Discover Zone Names</name>
-				<description>Query the panel for all configured zone names and populate the Discovered Zones property.</description>
+				<name>Refresh Zones From Panel</name>
+				<description>Read the zone names from the panel and add any zone the driver does not know yet. Runs automatically once per driver load; use this after adding zones at the panel. Never renames or removes a zone the driver already has - use Zones Config for that.</description>
 			</command>
 			<command>
-				<name>Apply Discovered Zones</name>
-				<description>Copy the contents of the Discovered Zones property into Zones Config, and push the updated zone list to the Control4 app. Run "Discover Zone Names" first. Zones are assigned to partition 1 by default - edit Zones Config afterwards if a zone belongs elsewhere.</description>
+				<name>List Zones</name>
+				<description>Print every zone to the log: number, name, type, partition, and where each came from (panel, Zones Config, or a rename in the app).</description>
+			</command>
+			<command>
+				<name>List Recent Activity</name>
+				<description>Print the full recent-activity buffer (last 25 entries) to the log. The Recent Activity property shows only the newest few.</description>
+			</command>
+			<command>
+				<name>Restore Zones Config</name>
+				<description>Put back the full Zones Config you had before upgrading to v43, and stop using the zone store. Only needed if the automatic zone import looks wrong.</description>
 			</command>
 			<command>
 				<name>Request Zone Status</name>
@@ -599,12 +580,20 @@ Change log:
 				<command>Sync Partition States</command>
 			</action>
 			<action>
-				<name>Discover Zone Names</name>
-				<command>Discover Zone Names</command>
+				<name>Refresh Zones From Panel</name>
+				<command>Refresh Zones From Panel</command>
 			</action>
 			<action>
-				<name>Apply Discovered Zones</name>
-				<command>Apply Discovered Zones</command>
+				<name>List Zones</name>
+				<command>List Zones</command>
+			</action>
+			<action>
+				<name>List Recent Activity</name>
+				<command>List Recent Activity</command>
+			</action>
+			<action>
+				<name>Restore Zones Config</name>
+				<command>Restore Zones Config</command>
 			</action>
 			<action>
 				<name>Request Zone Status</name>

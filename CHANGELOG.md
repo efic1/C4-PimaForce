@@ -10,6 +10,169 @@ changes hot-reload.
 
 ---
 
+## v46 — one cause behind three field failures
+
+Field log from v45:
+
+```
+ERROR: Persistent storage changed what was written to pima.zones.v1.part1: came back as a nil.
+```
+
+- **The real cause: on this controller, a value written with
+  `PersistSetValue` becomes readable only some time later.** A brand-new
+  key read straight back is empty. That explains all three reports:
+  - **v43:** the read returned the *previous* value, decoded into a table.
+  - **v44:** the read returned the *previous* value as text, so it looked
+    "changed."
+  - **v45:** the key was new, so the previous value was nothing.
+
+  **Storage was working the whole time; the driver checked too early.**
+  v44's and v45's changes treated symptoms. They stay because they're
+  harmless and guard against real hazards (JSON decoding on read, escape
+  processing, length limits), but they weren't the problem.
+- **Writes are now checked later, not in the same moment.** The first check
+  is 5 seconds after a write, then 30 and 120 seconds if the data hasn't
+  landed. The result is logged either way, and on failure it names exactly
+  which value differs and how.
+- **The migration is two-phase.** It writes the backup and store, keeps
+  running on your full Zones Config (the app is identical either way), and
+  shortens Zones Config only once storage confirms the save. If storage
+  never confirms during this load, nothing changes and the next load tries
+  again. A panel refresh that finishes before confirmation still hides zones
+  your old list left out, and those `N,,hidden` entries survive the rewrite.
+- **Fixed: a Composer edit could be silently undone.** The driver remembers
+  what it last wrote to a property so it doesn't rewrite the same value. When
+  you edited that property in Composer, the memory went stale, and a later
+  driver write that matched the old value was skipped. That could leave a
+  stale name override in place after a rename from the app. The memory is now
+  cleared on every edit.
+- **Tests:** the persistence mock now applies writes late, as this controller
+  does. Every earlier mock applied them instantly, which is why three rounds
+  of fixes passed offline and failed in the field. Tests cover the moment
+  before confirmation, a controller slower than the first check, storage that
+  never confirms, and a controller that applies writes immediately.
+
+## v45 — zone storage that the controller cannot alter
+
+Field log from v44:
+
+```
+ERROR: Zone store did not read back as written (Director returned a string)
+```
+
+- **v44's prefix worked, but the text still came back changed.** Director now
+  returned a string rather than a table, but not the one written. The
+  driver's own encoding round-trips the zone list exactly, as a test with
+  quote marks (ממ"ד), backslashes, Hebrew and padded names proves. So the
+  change happens in storage, and the log didn't say how.
+- **Stored values are now immune to every likely cause at once:**
+  - **base64:** only A–Z, a–z, 0–9, `+`, `/`, `=`. Nothing is left for escape
+    processing, character-set conversion or a JSON reader to touch. It uses a
+    pure-Lua implementation, not `C4:Base64Decode`, which is known to
+    mishandle short input.
+  - **parts of at most 600 characters,** so a length limit can't cut one off.
+  - **a header written last** with the length and a checksum, so a half-written
+    or altered value is never trusted.
+- **Every part is read back after writing.** If storage still changes
+  anything, the log names the part, both lengths and the first differing
+  position, so a further failure is a diagnosis rather than another guess.
+- **A damaged store after a completed migration is rebuilt from the backup** of
+  your original Zones Config. Falling back to the shortened Zones Config alone
+  would have shown every zone as "Zone N".
+- v43 and v44 formats are still read, so no data is stranded.
+- Tests now run the migration against storage that caps length at 1000
+  characters, processes backslash escapes, and decodes JSON, singly and all
+  together, including across a reload.
+
+## v44 — the zone store on a real controller
+
+Field log from v43:
+
+```
+WARNING: Persistent key pima.zones.v1 held a table, not the expected text; ignoring it
+ERROR: Zone store did not read back as written; zone changes will not survive a reload
+Zones: added 35 new zone(s) from the panel: 1, 2, 3, ... 35.
+```
+
+- **Fixed: the controller hands stored JSON back as a decoded Lua table.**
+  v43 stored the zone list as JSON text and verified the save byte for byte,
+  so on this controller every save "failed". The migration's safety check
+  caught it and changed nothing, so **Zones Config was never shortened and no
+  data was lost**. But the migration never completed, and each connection
+  re-stored the panel's zones without the step that hides zones your old list
+  left out.
+- Every value is now stored as **prefixed text that no JSON reader will
+  parse** (`PIMAZONES1:` for the store, `PIMATEXT1:` for the backup and
+  flags). The driver's own lenient JSON reader turns `1,Front Door,...` into
+  the number `1`, and Director's may too.
+- **Read-back compares content, not bytes**, and accepts the store in any
+  form: prefixed text, v43's unprefixed JSON, or an already-decoded table.
+- **Recovery:** the migration flag, which is written only after a verified
+  migration, now decides whether to migrate. v43 left a store with panel
+  names and no flag, so v44 completes the migration on its first load: your
+  names win, Zones Config is shortened, and zones outside your old list are
+  hidden on the next refresh. A test reproduces that exact field state.
+- "N new zone(s)" now means **new to the app**. v43 announced all 35 zones
+  of an existing install as new.
+- **Tests:** the persistence mock now decodes JSON on read the way this
+  controller does. v43's mock returned strings verbatim, which is how a check
+  that fails on hardware passed offline — the same lesson as v40's permissive
+  variable mock.
+
+## v43 — zones out of the property grid, and a real Documentation tab
+
+### Zone store
+
+- **The zone list no longer lives in Composer properties.** Through v42 it
+  was the whole Zones Config string (about 1.7 KB for 40 Hebrew-named zones)
+  plus a copy in Discovered Zones, redrawn by Composer on every write and
+  edited in a one-line box. Zone numbers and names now live in DriverWorks'
+  persistence store, which survives driver updates and Director restarts and
+  is not shown in Composer.
+- **Zones come from the panel automatically.** Once per driver load, on the
+  first connection, the driver reads the zone names and adds zones it does not
+  know. It never renames a known zone and never removes one; a zone the panel
+  stops naming is reported instead. **Refresh Zones From Panel** does it on
+  demand.
+- **Zones Config is now overrides only**, with empty fields keeping the stored
+  value: `5,,motion`, `7,,,2`, `12,New Name`, and new `9,,hidden` to remove a
+  zone from the app.
+- **Upgrading needs no setup.** On first load the old Zones Config is backed
+  up verbatim, imported, verified by reading it back, and only then shortened
+  to your real changes (for example `2,,motion;3,,,2`). Manual types and
+  partitions carry over; the zones in the app are identical, which a test
+  checks field by field. Zones the panel has but your old list left out are
+  added as `N,,hidden` on the first refresh, so they stay out of the app as
+  before. If saving or verification fails, or the controller
+  has no persistent storage, nothing is changed. **Restore Zones Config** puts
+  the original back.
+- New actions **List Zones** (full table in the log, with where each value
+  came from) and **List Recent Activity**. New read-only **Zones Summary**
+  property. Removed: the **Discovered Zones** property and **Apply Discovered
+  Zones** action. **Discover Zone Names** is renamed **Refresh Zones From
+  Panel**; the old name still works.
+- A rename in the app is stored and survives reloads, and drops any name
+  override for that zone so the rename actually shows.
+- **Recent Activity** shows only the newest 5 entries (was 25). It is
+  rewritten on every Info log line, so its size is what Composer redraws each
+  time; **List Recent Activity** prints all 25.
+
+### Documentation tab
+
+- **Fixed: Composer showed the Documentation tab as plain text.** The
+  documentation was inline text inside `<documentation>`, which Composer shows
+  unformatted. It is now an HTML file in the package
+  (`www/documentation/index.html`), referenced with `file=`, the same
+  convention a maintained public driver template uses.
+- Rewritten as an installer guide: panel and driver setup, zones and
+  overrides, the app (exit delay, status line, Functions menu), programming
+  and notifications, troubleshooting. The property, action and event tables
+  are **generated from the driver definition**, so they cannot drift from the
+  build. Self-contained: no remote stylesheet, font or script.
+- `build.sh` now keeps the `www/` path inside the `.c4z` and fails the build
+  if the file driver.xml names is missing. Building needs `pip install
+  markdown`.
+
 ## v42 — exit-delay countdown, and a Director-load review
 
 ### Exit delay

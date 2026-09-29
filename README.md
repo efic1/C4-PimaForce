@@ -21,7 +21,7 @@ Interface JSON Format Specification v2.4* — see
 [docs/SPEC-VALIDATION.md](docs/SPEC-VALIDATION.md) for exactly what is
 confirmed by the spec, what the spec corrected, and what remains ambiguous.
 
-326 offline regression tests, one per defect found in review or in the field.
+369 offline regression tests, one per defect found in review or in the field.
 
 ## Features
 
@@ -69,9 +69,15 @@ confirmed by the spec, what the spec corrected, and what remains ambiguous.
    `id,name,userCode,modes` separated by `;`, where modes is any combination
    of `A` (Away), `S` (Stay), `N` (Night). Example:
    `1,Main,1234,ASN;2,Garage,9876,A`
-5. Run the **Discover Zone Names** action, then **Apply Discovered Zones** to
-   populate **Zones Config**.
-6. Point the panel at the controller and wait for it to dial in.
+5. Point the panel at the controller and wait for it to dial in.
+
+Zones need no setup. On the first connection the driver reads the zone
+numbers and names from the panel into its zone store. **Zones Config** holds
+only overrides, such as `5,,motion` to change zone 5's icon. Run **List
+Zones** to see the full table in the log. Upgrading from v42 or earlier
+imports the old Zones Config automatically.
+
+Composer's **Documentation** tab carries the full installer guide.
 
 ### Panel side
 
@@ -100,7 +106,7 @@ Use an account ID not shared with a real monitoring-station path.
 | Listen Port | `7780` | TCP port the driver listens on for the panel |
 | Account ID | `1234` | Must match the panel's CMS account |
 | Partitions Config | `1,Main,1234,ASN` | `id,name,userCode,modes` per partition |
-| Zones Config | *(empty)* | `zone,name,type,partition` per zone |
+| Zones Config | *(empty)* | Overrides only: `zone,name,type,partition`, with empty fields keeping the stored value. `5,,motion`, `7,,,2`, `9,,hidden` |
 | Zone Bypass Auto-Clear Minutes | `30` | Safety timer so a bypass is never left forever. `0` disables |
 | Zone/User Name Encoding | `Windows-1255` | Set `UTF-8` for non-Hebrew panels |
 | Reverse Zone/User Names | `Off` | For panels storing names in visual order |
@@ -147,8 +153,8 @@ filing a bug:
 ## Development
 
 ```bash
-./build.sh                        # regenerate driver.xml and package PimaForce.c4z
-lua5.4 tests/test_regressions.lua # 326 regression tests
+./build.sh                        # regenerate driver.xml + docs, package PimaForce.c4z (needs: pip install markdown)
+lua5.4 tests/test_regressions.lua # 369 regression tests
 lua5.4 tests/test_driver.lua      # happy-path harness
 ```
 
@@ -171,6 +177,9 @@ alarm.
 - [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md) — how to get push
   notifications for alarms and faults (Push Notification agent + 4Sight), and
   what the driver can and cannot do about it.
+- [docs/COMPOSER-GUIDE.md](docs/COMPOSER-GUIDE.md) — the installer guide shown
+  in Composer's Documentation tab. `build.sh` renders it, with generated
+  property, action and event tables, to `www/documentation/index.html`.
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — what the driver costs Director,
   measured, with a harness to reproduce it.
 - [CHANGELOG.md](CHANGELOG.md) — version history.
