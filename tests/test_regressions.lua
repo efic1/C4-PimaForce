@@ -2177,6 +2177,46 @@ test('an ARM ACK does NOT read the panel back (v41)', function()
   end
 end)
 
+test('the shield does not move to Disarmed until the panel says so (v41)', function()
+  -- The question this answers: is the read-back CHECKING the panel, or just
+  -- changing state? Three moments, one assertion each.
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+
+  DisarmPartition(1)
+  assert(tostring(EffectivePartitionState(1)):find('Armed'),
+    'sending the command must not change state')
+
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  assert(tostring(EffectivePartitionState(1)):find('Armed'),
+    'the ACK alone must not change state -- only the panel\'s answer may')
+
+  -- The panel says it is STILL armed: state must stay armed.
+  answerSyncQueries(h, 3)
+  assert(tostring(EffectivePartitionState(1)):find('Armed'),
+    'a panel that reports armed must leave the shield armed, got ' ..
+    tostring(EffectivePartitionState(1)))
+end)
+
+test('a failed or unrecognised read-back never produces Disarmed (v41)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Away (Full Arm)')
+  DisarmPartition(1)
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  answerSyncQueries(h, 555)     -- a value that maps to neither armed nor disarmed
+  assert(tostring(EffectivePartitionState(1)):find('Armed'),
+    'an unrecognised system key must not be read as Disarmed, got ' ..
+    tostring(EffectivePartitionState(1)))
+end)
+
 test('a disarm ACKed but not applied is reported, not silently accepted (v41)', function()
   freshDriver()
   local h = connectPanel()
@@ -3054,7 +3094,10 @@ test('a property is not rewritten with the value it already holds', function()
   -- unchanged (Last Event Partition is "1" forever on a one-partition house),
   -- so a chatty panel kept the panel redrawing -- the stutter felt when
   -- scrolling the properties list.
-  freshDriver()
+  -- Debug on: since v42 the "Last ..." properties are written on zone events
+  -- only when someone can see them, so the dedupe is exercised where they
+  -- are still written.
+  freshDriver({ ['Log Level'] = 'Debug' })
   local h = connectPanel()
   calls.UpdateProperty = {}
   local function zoneEvent(counter, qualifier)
@@ -3074,6 +3117,55 @@ test('a property is not rewritten with the value it already holds', function()
     assert(u[1] == 'Recent Activity' or u[1] == 'Last Raw Frame In',
       'only genuinely-changing properties may be rewritten, got ' .. tostring(u[1]))
   end
+end)
+
+test('zone events do not write hidden diagnostic properties (v42)', function()
+  -- Measured: 2.5 blocking UpdateProperty calls per zone event, against 3
+  -- for all the useful work. The "Last ..." properties are hidden unless
+  -- Log Level is Debug, so nobody is reading them.
+  freshDriver()                       -- Info
+  local h = connectPanel()
+  calls.UpdateProperty = {}
+  for i = 1, 6 do
+    OnServerDataIn(h, string.format(
+      '{"frame_type":"event","counter":%d,"account":"1234","type":760,"qualifier":%d,"zone":%d,"partition":1}',
+      300 + i, (i % 2 == 1) and 1 or 3, (i % 3) + 1), '10.0.0.50', 5555)
+  end
+  for _, u in ipairs(calls.UpdateProperty) do
+    assert(not tostring(u[1]):find('^Last Zone') and not tostring(u[1]):find('^Last Event'),
+      'a zone event must not write the hidden diagnostic "' .. tostring(u[1]) .. '"')
+  end
+end)
+
+test('non-zone events still write the last-event diagnostics (v42)', function()
+  -- Rare events keep them, so "what was the last alarm" is answerable
+  -- without turning Debug on first.
+  freshDriver()
+  local h = connectPanel()
+  OnServerDataIn(h, '{"frame_type":"event","counter":310,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(Properties['Last Event Type'] == '301', 'got ' .. tostring(Properties['Last Event Type']))
+end)
+
+test('an operation reply timer is retired when the panel answers (v42)', function()
+  -- Until v42 every arm and disarm left a 5s one-shot running after its ACK;
+  -- it fired later, found nothing waiting and did nothing.
+  freshDriver()
+  local h = connectPanel()
+  calls.KillTimer = {}
+  ArmPartition(1, 'away')
+  local op = operations()[1]
+  local timerId
+  for id, counter in pairs(PendingOperationTimers) do
+    if counter == op.counter then timerId = id end
+  end
+  assert(timerId, 'precondition: the operation armed a reply timer')
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  local killed = false
+  for _, id in ipairs(calls.KillTimer) do if id == timerId then killed = true end end
+  assert(killed, 'the ACK must cancel the reply timer')
+  assert(PendingOperationTimers[timerId] == nil, 'and forget it')
 end)
 
 test('a forced write still goes out when the value is unchanged', function()
@@ -4581,6 +4673,320 @@ test('a name containing XML-special characters is escaped in PARTITION_INFO', fu
   local p1 = proxyCalls(5002, 'PARTITION_INFO')
   assert(p1[#p1][3]:find('&amp;') and p1[#p1][3]:find('&lt;East&gt;'),
     'an unescaped name would produce malformed XML: ' .. tostring(p1[#p1][3]))
+end)
+
+--=============================================================================
+section('Exit delay countdown (v42)')
+--=============================================================================
+
+-- Arms partition 1 from the app path and ACKs it, with the panel's exit time
+-- already known. Returns the connection handle.
+local function armAndAck(props, exitSeconds, mode)
+  freshDriver(props)
+  local h = connectPanel()
+  ExitTimeSec = exitSeconds
+  calls.SendToProxy = {}
+  calls.AddTimer = {}
+  ArmPartition(1, mode or 'away')
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  return h
+end
+
+local function lastPartitionState(binding)
+  local c = proxyCalls(binding or 5002, 'PARTITION_STATE')
+  return c[#c] and c[#c][3]
+end
+
+test('the panel exit time is read from parameter 180 and cached', function()
+  freshDriver()
+  local h = connectPanel()
+  ClearInFlight(); ResetQueueState(); calls.ServerSend = {}
+  RefreshExitTime()
+  local req
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 180 then req = f end
+  end
+  assert(req, 'a DATA-REQ for parameter 180 must go out')
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"DATA","account":1234,"counter":%d,"id":180,"start_order":1,"parameters":["45"]}',
+    req.counter), '10.0.0.50', 5555)
+  assert(ExitTimeSec == 45, 'the exit time must be cached, got ' .. tostring(ExitTimeSec))
+end)
+
+test('an unusable exit time is ignored and the last good value kept', function()
+  freshDriver()
+  local h = connectPanel()
+  ExitTimeSec = 30
+  for _, bad in ipairs({ '"abc"', '"9999"', '"-5"' }) do
+    ClearInFlight(); ResetQueueState(); calls.ServerSend = {}
+    RefreshExitTime()
+    local req
+    for _, sent in ipairs(calls.ServerSend) do
+      local f = JSON.decode(sent[2])
+      if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 180 then req = f end
+    end
+    OnServerDataIn(h, string.format(
+      '{"frame_type":"DATA","account":1234,"counter":%d,"id":180,"start_order":1,"parameters":[%s]}',
+      req.counter, bad), '10.0.0.50', 5555)
+    assert(ExitTimeSec == 30, bad .. ' must not replace a good value, got ' .. tostring(ExitTimeSec))
+  end
+end)
+
+test('an ACKed arm starts an EXIT_DELAY countdown with total and remaining', function()
+  armAndAck(nil, 60)
+  local st = lastPartitionState()
+  assert(st and st.STATE == 'EXIT_DELAY', 'expected EXIT_DELAY, got ' .. tostring(st and st.STATE))
+  assert(st.DELAY_TIME_TOTAL == 60, 'total, got ' .. tostring(st.DELAY_TIME_TOTAL))
+  assert(st.DELAY_TIME_REMAINING == 60, 'remaining, got ' .. tostring(st.DELAY_TIME_REMAINING))
+  assert(tostring(st.TYPE):find('Away'), 'the arm type must ride along, got ' .. tostring(st.TYPE))
+end)
+
+test('the countdown is also told to the panel proxy', function()
+  armAndAck(nil, 60)
+  local c = proxyCalls(5001, 'PANEL_PARTITION_STATE')
+  assert(#c > 0 and c[#c][3].STATE == 'EXIT_DELAY',
+    'the panel proxy keeps its own partition table and must agree')
+end)
+
+test('nothing is published until the panel ACKs the arm', function()
+  freshDriver()
+  connectPanel()
+  ExitTimeSec = 60
+  calls.SendToProxy = {}
+  ArmPartition(1, 'away')          -- sent, not yet ACKed
+  assert(#proxyCalls(5002, 'PARTITION_STATE') == 0,
+    'a countdown for an arm the panel has not accepted would be a lie')
+end)
+
+test('an unknown or zero exit time behaves exactly as before v42', function()
+  for _, t in ipairs({ 'nil', '0' }) do
+    armAndAck(nil, t == 'nil' and nil or 0)
+    assert(#proxyCalls(5002, 'PARTITION_STATE') == 0,
+      'no countdown without a known, positive exit time (' .. t .. ')')
+    assert(PartitionStatusFor(1).exit == nil)
+  end
+end)
+
+test('Exit Delay Countdown = Off shows no countdown', function()
+  armAndAck({ ['Exit Delay Countdown'] = 'Off' }, 60)
+  assert(PartitionStatusFor(1).exit == nil)
+  assert(#proxyCalls(5002, 'PARTITION_STATE') == 0)
+end)
+
+test('Away only skips Stay arming but not Away', function()
+  armAndAck({ ['Exit Delay Countdown'] = 'Auto - Away only' }, 60, 'stay')
+  assert(PartitionStatusFor(1).exit == nil, 'Stay must not count down in Away-only mode')
+  armAndAck({ ['Exit Delay Countdown'] = 'Auto - Away only' }, 60, 'away')
+  assert(PartitionStatusFor(1).exit ~= nil, 'Away still does')
+end)
+
+test('Shabbat arming never gets a generic countdown', function()
+  armAndAck(nil, 60, 'shabbat')
+  assert(PartitionStatusFor(1).exit == nil)
+end)
+
+test('partition variables do not claim armed during the countdown', function()
+  armAndAck(nil, 60)
+  assert(Variables['PARTITION_1_ARMED'] ~= 'true',
+    'exiting is not armed; programming testing ARMED must not fire yet')
+end)
+
+test('a panel "armed" report does not end the countdown', function()
+  -- The panel may report the arm at the START of its exit delay. The
+  -- countdown is what tells the user they may still be walking out.
+  local h = armAndAck(nil, 60)
+  calls.FireEvent = {}
+  PostOperationGuardUntil = 0     -- the 500ms post-OPERATION pacing has elapsed
+  OnServerDataIn(h, '{"frame_type":"event","counter":900,"account":"1234","type":401,"qualifier":3,"zone":1,"partition":1}',
+    '10.0.0.50', 5555)
+  PostOperationGuardUntil = 0
+  answerSyncQueries(h, 3)
+  assert(PartitionStatusFor(1).exit ~= nil, 'the countdown must survive an armed report')
+  assert(tostring(EffectivePartitionState(1)):find('^Exit Delay'),
+    'and keep being what the app shows, got ' .. tostring(EffectivePartitionState(1)))
+  local armedEvents = 0
+  for _, e in ipairs(calls.FireEvent) do
+    if tostring(e):find('^Partition 1 Armed') then armedEvents = armedEvents + 1 end
+  end
+  assert(armedEvents == 1, 'the programming event must still fire exactly once, got ' .. armedEvents)
+end)
+
+test('when the countdown ends the driver ASKS the panel, then shows armed', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  local asked = false
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310 then asked = true end
+  end
+  assert(asked, 'the end of the delay must be confirmed with the panel, not assumed')
+  assert(tostring(EffectivePartitionState(1)):find('^Exit Delay'),
+    'still counting until the panel answers')
+
+  calls.SendToProxy = {}
+  answerSyncQueries(h, 3)
+  assert(PartitionStatusFor(1).exit == nil, 'the overlay must be gone')
+  local st = lastPartitionState()
+  assert(st and st.STATE == 'ARMED', 'expected ARMED, got ' .. tostring(st and st.STATE))
+end)
+
+test('a countdown that ends with the panel still disarmed reports the failure', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  calls.SendToProxy = {}
+  local logs = withCapturedLogs(function() answerSyncQueries(h, 97) end)   -- 97: confirmed disarmed fixture
+  assert(table.concat(logs, '\n'):find('did not complete', 1, true),
+    'the log must say arming did not complete')
+  local failed = false
+  for _, c in ipairs(calls.SendToProxy) do if c[2] == 'ARM_FAILED' then failed = true end end
+  assert(failed, 'the app must be told, not left showing a countdown that ended in nothing')
+  assert(tostring(EffectivePartitionState(1)) == 'Disarmed', 'and show what the panel said')
+end)
+
+test('a countdown that ends with no answer shows Unknown, never a guessed Disarmed', function()
+  armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  calls.SendToProxy = {}
+  FailInFlight('panel did not answer')
+  assert(PartitionStatusFor(1).exit == nil)
+  assert(tostring(EffectivePartitionState(1)) == 'Unknown',
+    'an unanswered check must not become a confident Disarmed, got ' .. tostring(EffectivePartitionState(1)))
+end)
+
+test('disarming during the countdown cancels it', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  calls.KillTimer = {}
+  OnServerDataIn(h, '{"frame_type":"event","counter":901,"account":"1234","type":401,"qualifier":1,"zone":1,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(PartitionStatusFor(1).exit == nil, 'a disarm event must end the countdown')
+  local killed = false
+  for _, id in ipairs(calls.KillTimer) do if id == e.timerId then killed = true end end
+  assert(killed, 'and its timer must be cancelled, not left to fire')
+  assert(tostring(EffectivePartitionState(1)) == 'Disarmed')
+end)
+
+test('an alarm during the countdown outranks it', function()
+  armAndAck(nil, 60)
+  SetPartitionAlarm(1, 'Burglary', true)
+  assert(tostring(EffectivePartitionState(1)) == 'Alarm', 'an alarm must win')
+end)
+
+test('losing the panel ends the countdown', function()
+  local h = armAndAck(nil, 60)
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  assert(PartitionStatusFor(1).exit == nil, 'a countdown for a system we cannot see is a lie')
+end)
+
+test('re-arming restarts the countdown without leaking the old timer', function()
+  local h = armAndAck(nil, 60)
+  local first = PartitionStatusFor(1).exit.timerId
+  calls.KillTimer = {}
+  ArmPartition(1, 'away')
+  local op = operations()
+  local latest = op[#op]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', latest.counter), '10.0.0.50', 5555)
+  local killed = false
+  for _, id in ipairs(calls.KillTimer) do if id == first then killed = true end end
+  assert(killed, 'the superseded expiry timer must be cancelled')
+  assert(PartitionStatusFor(1).exit.timerId ~= first)
+end)
+
+test('a stale expiry timer for a cancelled countdown does nothing', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  local id = e.timerId
+  OnServerDataIn(h, '{"frame_type":"event","counter":902,"account":"1234","type":401,"qualifier":1,"zone":1,"partition":1}',
+    '10.0.0.50', 5555)
+  calls.ServerSend = {}
+  -- The mock restarts timer ids at 1 on every freshDriver(), so a bypass
+  -- auto-clear entry leaked from an earlier test can share this id. Real
+  -- Director timer ids are unique; this only keeps the test about its subject.
+  AutoBypassTimers = {}; AutoBypassTimerForZone = {}
+  OnTimerExpired(id)
+  assert(#calls.ServerSend == 0, 'a cancelled countdown must not query the panel when its timer fires anyway')
+end)
+
+test('Exit Delay Refresh Seconds resends a decreasing remaining time', function()
+  armAndAck({ ['Exit Delay Refresh Seconds'] = '5' }, 60)
+  local e = PartitionStatusFor(1).exit
+  assert(e.tickId, 'a refresh timer must exist when the property is set')
+  calls.SendToProxy = {}
+  now = now + 20000
+  OnTimerExpired(e.tickId)
+  local st = lastPartitionState()
+  assert(st and st.STATE == 'EXIT_DELAY' and st.DELAY_TIME_REMAINING == 40,
+    'expected 40 remaining after 20s, got ' .. tostring(st and st.DELAY_TIME_REMAINING))
+  assert(st.DELAY_TIME_TOTAL == 60, 'the total must not change')
+end)
+
+test('with refresh at 0 there is no refresh timer', function()
+  armAndAck(nil, 60)
+  assert(PartitionStatusFor(1).exit.tickId == nil, 'the default is one send and no ticking')
+end)
+
+test('Arm All starts a countdown on every configured partition', function()
+  freshDriver()
+  local h = connectPanel()
+  ExitTimeSec = 60
+  ArmAllPartitions()
+  local op = operations()[1]
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  assert(PartitionStatusFor(1).exit and PartitionStatusFor(2).exit,
+    'both configured partitions must count down')
+end)
+
+test('reloading the driver cancels a live countdown timer', function()
+  armAndAck(nil, 60)
+  local id = PartitionStatusFor(1).exit.timerId
+  calls.KillTimer = {}
+  OnDriverDestroyed()
+  local killed = false
+  for _, k in ipairs(calls.KillTimer) do if k == id then killed = true end end
+  assert(killed, 'a timer left running across a reload would fire into a fresh driver')
+end)
+
+test('the arm-event read is not queued behind an exit-time request', function()
+  -- RefreshExitTime runs after the countdown, never at arm time: a request
+  -- queued right after an arm would sit in front of the state read that
+  -- confirms it.
+  freshDriver()
+  local h = connectPanel()
+  ExitTimeSec = 60
+  ArmPartition(1, 'away')
+  local op = operations()[1]
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    assert(not (f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 180),
+      'no exit-time request may be sent at arm time')
+  end
+end)
+
+test('every function the exit-delay path calls exists', function()
+  for _, name in ipairs({ 'ExitDelayMode', 'ExitDelayRefreshSeconds', 'ExitDelayApplies',
+      'ExitDelayArmType', 'ExitDelayTimes', 'RefreshExitTime', 'CancelExitDelay',
+      'BeginExitDelay', 'TickExitDelay', 'EndExitDelay' }) do
+    assert(type(_G[name]) == 'function', name .. ' must be defined')
+  end
 end)
 
 --=============================================================================
