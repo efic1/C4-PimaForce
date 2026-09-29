@@ -23,12 +23,14 @@ specification, see [SPEC-VALIDATION.md](SPEC-VALIDATION.md).
 - `driver.xml` — generated device metadata: properties, commands, actions,
   programming events, proxies and capabilities. Committed so the tests and
   the packaged `.c4z` have it, and checked for staleness in CI.
-- `tests/test_regressions.lua` — 296 regression tests, one per defect found
+- `tests/test_regressions.lua` — 326 regression tests, one per defect found
   in review or in the field, each named for the failure it locks down. Run
   this before shipping any change; it is the file that will tell you if a
   "small fix" has reintroduced a fail-open disarm or a stuck alarm.
 - `tests/test_driver.lua` — happy-path harness against a mocked Control4 `C4`
   table.
+- `tests/profile_director_calls.lua` — not a test: counts the Director calls and
+  CPU per event. See [PERFORMANCE.md](PERFORMANCE.md).
 - `build.sh` — regenerates the XML, checks syntax, runs the tests and
   packages `PimaForce.c4z` (a zip of `driver.xml` + `driver.lua`).
 
@@ -132,7 +134,7 @@ it refuses to guess: an unknown value is reported as unknown rather than
 assumed, and anything the panel merely acknowledged is verified before it is
 believed.
 
-296 offline regression tests cover these, one per defect, each named for the
+326 offline regression tests cover these, one per defect, each named for the
 failure it locks down. They mock the Control4 runtime, so they cannot prove
 timing or byte-stream behaviour against a real panel — that part is covered by
 the installation it runs on.
@@ -979,3 +981,33 @@ syntax, runs both test suites, and packages `PimaForce.c4z`. Bump
 `DRIVER_VERSION` in **both** `gen_driver_xml.py` and `driver.lua` first —
 Composer Pro only offers an update when the version is higher than the
 installed one, and the tests fail if the two files disagree.
+
+
+## Exit delay (v42)
+
+The countdown is an **overlay on the partition state**, derived exactly like
+an alarm: `EffectivePartitionState` returns `Exit Delay <mode>` while
+`PartitionStatus[pid].exit` exists, and `proxyStateForFriendly` maps that to
+`EXIT_DELAY`. It is never stored as the state, so ending or cancelling it can
+only fall back to whatever the panel last said. Alarms still outrank it.
+
+- **Start:** an arm this driver sent is ACKed (`BeginExitDelay`). The length
+  is the panel's exit time, parameter 180, cached from a read on connect and
+  refreshed after each countdown. Unknown or zero means no countdown and
+  behaviour identical to before v42. The refresh is deliberately *not* done at
+  arm time: a request queued right after an arm would sit in front of the
+  state read that confirms it.
+- **What ends it:** the timer, or `SetPartitionState` with any non-armed
+  state (a disarm event, Cancel, a cold sync reading disarmed, a lost link).
+  An *armed* report does not end it: the panel may report the arm at the start
+  of its exit delay, and the countdown is what says the user may still be
+  leaving.
+- **At expiry the driver asks** (`QueryPartitionArmState` with `onSettle`).
+  `onSettle` runs on every way the query can end, before any state is
+  published, so the overlay can never outlive the question. Armed shows armed;
+  disarmed reports a failed arm (`ARM_FAILED`) — an open zone at the end of the
+  delay is the usual cause; no answer shows Unknown, not Disarmed. This is the
+  same refusal to guess as everywhere else in the driver.
+- **Unverified in the field:** whether Navigator counts down on its own from
+  `DELAY_TIME_REMAINING`, and when the panel emits its arm event. The design
+  does not depend on either; **Exit Delay Refresh Seconds** covers the first.

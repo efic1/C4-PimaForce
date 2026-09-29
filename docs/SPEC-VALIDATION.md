@@ -145,12 +145,14 @@ otherwise dropped. The Control4 security proxy has `TROUBLE_START` /
 zone-level trouble bits into per-zone troubles would put detector faults in
 front of the user instead of in the log.
 
-### 3.3 Exit time (parameter 180)
+### 3.3 Exit time (parameter 180) — implemented in v42
 
-Readable from the panel, and the partition proxy's `PARTITION_STATE` accepts
-`EXIT_DELAY` with a total and remaining time — that is how other drivers show
-a live exit-delay countdown in the app. The driver currently never reports an
-exit delay at all, so arming jumps straight to armed.
+Read from the panel; the partition proxy's `PARTITION_STATE` takes
+`EXIT_DELAY` with a total and remaining time, which the app renders as a
+countdown with Cancel. The driver now shows it after an arm it sent, and asks
+the panel what happened when it ends. Two behaviours are still unconfirmed
+against hardware: when the panel reports its arm event relative to the exit
+delay, and whether the app counts down on its own. See the v42 changelog.
 
 ### 3.4 User names (parameter 411)
 
