@@ -21,7 +21,7 @@ Interface JSON Format Specification v2.4* — see
 [docs/SPEC-VALIDATION.md](docs/SPEC-VALIDATION.md) for exactly what is
 confirmed by the spec, what the spec corrected, and what remains ambiguous.
 
-296 offline regression tests, one per defect found in review or in the field.
+326 offline regression tests, one per defect found in review or in the field.
 
 ## Features
 
@@ -39,6 +39,9 @@ confirmed by the spec, what the spec corrected, and what remains ambiguous.
 - **Alarm and trouble reporting** — burglary, fire, medical, panic, duress,
   tamper, AC loss, low battery and more, as Control4 programming events.
   Panel faults decode to readable text from the spec's fault table.
+- **Exit-delay countdown** — after arming from the app, the panel's own exit
+  time is shown as a live countdown with Cancel. When it ends the driver asks
+  the panel what happened, and reports a failed arm rather than a silent one.
 - **Functions menu in the app** — Check Status, Arm All, Disarm All, Bypass
   Open Zones, Clear All Bypasses, Refresh Troubles, and Disable / Enable
   Event Notifications for muting a misbehaving panel.
@@ -106,6 +109,8 @@ Use an account ID not shared with a real monitoring-station path.
 | Quiet Zones | *(empty)* | Zone numbers and/or type words that stop reporting open/close to the app |
 | Zone State Reporting | `Partition + Panel` | Which proxies carry live zone state |
 | Partition Display Text | *(empty)* | Fixed prefix for the partition status line on the app's Status tab |
+| Exit Delay Countdown | `Auto - all arm modes` | Show the panel's exit delay as a countdown after arming from the app. `Auto - Away only`, or `Off` |
+| Exit Delay Refresh Seconds | `0` | Only if the countdown sits still: resend the remaining time every N seconds |
 | Event Mute Minutes | `60` | How long *Disable Event Notifications* lasts before events resume by themselves. `0` = until re-enabled by hand |
 | Link Timeout Seconds | `600` | Treat the link as dead after this much silence. `0` disables |
 
@@ -143,7 +148,7 @@ filing a bug:
 
 ```bash
 ./build.sh                        # regenerate driver.xml and package PimaForce.c4z
-lua5.4 tests/test_regressions.lua # 296 regression tests
+lua5.4 tests/test_regressions.lua # 326 regression tests
 lua5.4 tests/test_driver.lua      # happy-path harness
 ```
 
@@ -166,6 +171,8 @@ alarm.
 - [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md) — how to get push
   notifications for alarms and faults (Push Notification agent + 4Sight), and
   what the driver can and cannot do about it.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — what the driver costs Director,
+  measured, with a harness to reproduce it.
 - [CHANGELOG.md](CHANGELOG.md) — version history.
 
 ## Credits

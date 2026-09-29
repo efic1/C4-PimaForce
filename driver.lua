@@ -54,6 +54,7 @@ local OUTPUT_INTERNAL_SIREN  = 2
 local PARAM_ZONE_NAMES       = 260
 local PARAM_USER_NAMES       = 411
 local PARAM_ZONE_COUNT       = 2148
+local PARAM_EXIT_TIME        = 180     -- Appendix C: exit time, seconds
 local PARAM_ZONE_STATUS      = 2149
 local PARAM_BYPASS           = 2150
 local PARAM_FAULTS           = 2250
@@ -96,7 +97,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 41
+local DRIVER_VERSION = 42
 
 -- How much of a discovered zone list to show in the read-only preview
 -- property. Only affects display: the full list is kept in memory and is what
@@ -1420,6 +1421,7 @@ function HandleInboundFrame(handle, frame)
     -- partition would sit at OFFLINE on a working system.
     SyncPartitionStates(true)
     SyncZoneStates()
+    RefreshExitTime()
     -- Re-publish the zone inventory once per session as insurance against
     -- LateInit having run before Director was ready to receive it. Later
     -- reconnects skip it: the inventory does not depend on the panel, and
@@ -1740,6 +1742,17 @@ function OnTimerExpired(idTimer)
     CheckLinkAlive()
     return
   end
+  local exitPid = ExitDelayTimers[idTimer]
+  if exitPid then
+    ExitDelayTimers[idTimer] = nil
+    EndExitDelay(exitPid)
+    return
+  end
+  local tickPid = ExitDelayTicks[idTimer]
+  if tickPid then
+    TickExitDelay(tickPid)
+    return
+  end
   if ZonePublishTimerId and idTimer == ZonePublishTimerId then
     DrainZonePublishQueue()
     return
@@ -1860,6 +1873,7 @@ function SendOperation(partitionId, optype, order, password, onResult)
   local timerId = C4:AddTimer(OPERATION_REPLY_TIMEOUT_MS, 'MILLISECONDS')
   if timerId then
     PendingOperationTimers[timerId] = OpCounter
+    PendingOperations[OpCounter].timerId = timerId
   end
 
   SendRaw(ConnHandle, JSON.encode(frame))
@@ -1870,6 +1884,14 @@ function ResolvePendingOperation(counter, err)
   local pending = counter and PendingOperations[counter]
   if not pending then return false end
   PendingOperations[counter] = nil
+  -- Retire the reply timer with the operation. Until v42 it was left running:
+  -- every arm and disarm left a 5-second one-shot behind that fired later,
+  -- found nothing waiting, and did nothing -- a Director timer round trip
+  -- plus a callback per operation, for no purpose.
+  if pending.timerId and PendingOperationTimers[pending.timerId] then
+    PendingOperationTimers[pending.timerId] = nil
+    pcall(function() C4:KillTimer(pending.timerId) end)
+  end
   RunCallback(pending.onResult, nil, err)
   return true
 end
@@ -1909,6 +1931,7 @@ function ArmPartition(partitionId, mode)
     else
       Dbg('Arm (' .. tostring(mode) .. ') partition ' .. partitionId .. ' ACKed')
       SetProp('Last Command Result', 'Arm ' .. tostring(mode) .. ' partition ' .. partitionId .. ' accepted by panel')
+      BeginExitDelay(partitionId, mode)
     end
   end)
 end
@@ -1980,6 +2003,7 @@ function ArmAllPartitions()
       for pid in pairs(Partitions) do NotifyProxyArmFailed(pid) end
     else
       Dbg('Arm All ACKed')
+      for pid in pairs(Partitions) do BeginExitDelay(pid, 'away') end
     end
   end)
 end
@@ -2323,7 +2347,15 @@ function QueryPartitionArmState(partitionId, opts)
   local pw = part and part.userCode
   if pw == '' then pw = nil end
 
+  -- Called on EVERY way this query can end, before any state is published,
+  -- so a caller (the exit-delay countdown) can retire its overlay first and
+  -- never publish a stale one. `state` is nil when the query settled nothing.
+  local function settle(state)
+    if opts.onSettle then pcall(opts.onSettle, state) end
+  end
+
   local function apply(state, note)
+    settle(state)
     LogInfo('Partition ' .. partitionId .. ': ' .. state ..
       (note and (' (' .. note .. ')') or ''))
     SetPartitionState(partitionId, state, opts.isInit)
@@ -2336,6 +2368,7 @@ function QueryPartitionArmState(partitionId, opts)
       apply('Armed', 'no user code configured to query the mode')
     else
       LogInfo('Partition ' .. partitionId .. ': cannot sync state -- no user code in Partitions Config')
+      settle(nil)
     end
     return
   end
@@ -2359,6 +2392,7 @@ function QueryPartitionArmState(partitionId, opts)
           'Partitions Config, then use the "Sync Partition States" action.'
         LogError(msg)
         SetProp('Last Command Result', msg)
+        settle(nil)
       end
       return
     end
@@ -2391,6 +2425,7 @@ function QueryPartitionArmState(partitionId, opts)
         'panel, so the app is not showing a partition the panel has never heard of.')
       SetProp('Last Command Result', 'Partition ' .. partitionId ..
         ' does not exist on the panel')
+      settle(nil)
     elseif confirmedDisarmed and not mode then
       apply('Disarmed', 'system key ' .. tostring(raw) .. ' is a confirmed disarmed code')
     elseif mode then
@@ -2418,6 +2453,7 @@ function QueryPartitionArmState(partitionId, opts)
         'so it can be added as a confirmed mapping.'
       LogError(msg)
       SetProp('Last Command Result', msg)
+      settle(nil)
     end
   end)
 end
@@ -2472,7 +2508,7 @@ local ALARM_PRIORITY = { 'Fire', 'Police', 'Medical', 'Panic', 'Burglary' }
 function PartitionStatusFor(partitionId)
   local st = PartitionStatus[partitionId]
   if not st then
-    st = { base = 'Unknown', alarms = {} }
+    st = { base = 'Unknown', alarms = {}, exit = nil }
     PartitionStatus[partitionId] = st
   end
   return st
@@ -2483,6 +2519,13 @@ function EffectivePartitionState(partitionId)
   local st = PartitionStatusFor(partitionId)
   for _, t in ipairs(ALARM_PRIORITY) do
     if st.alarms[t] then return 'Alarm', t end
+  end
+  -- An exit-delay countdown we started overlays the arm state, exactly as an
+  -- alarm does, and for the same reason: it is derived, never stored as the
+  -- state, so ending or cancelling it can only ever fall back to whatever the
+  -- panel last said. Alarms still outrank it.
+  if st.exit then
+    return 'Exit Delay' .. (st.exit.armType and (' ' .. st.exit.armType) or ''), nil
   end
   return st.base, nil
 end
@@ -2535,6 +2578,14 @@ end
 -- state, or we lose what to go back to when it clears.
 function SetPartitionState(partitionId, state, isInit)
   PartitionStatusFor(partitionId).base = state
+  -- The panel saying "not armed" (disarmed, unknown, offline) ends any
+  -- countdown we are showing: someone pressed Cancel, disarmed at a keypad,
+  -- or we lost the link. Saying "armed" does NOT end it -- the panel may
+  -- report the arm at the start of its exit delay, and the countdown is
+  -- what tells the user they may still be walking out.
+  if not tostring(state):find('^Armed') then
+    CancelExitDelay(partitionId)
+  end
   PublishPartitionState(partitionId, isInit)
   -- Mirror into driver variables so Composer programming can test partition
   -- state directly, instead of the installer maintaining a Variables-agent
@@ -2556,6 +2607,218 @@ function SetPartitionAlarm(partitionId, alarmType, active, scope)
   local st = PartitionStatusFor(partitionId)
   st.alarms[alarmType] = active and (scope or 'partition') or nil
   PublishPartitionState(partitionId)
+end
+
+--[[=============================================================================
+    Exit delay (v42).
+
+    Arming from the app or programming starts the panel's exit delay, during
+    which the app shows a countdown with a Cancel button. The driver never
+    reported one: arming simply jumped to armed.
+
+    What is known, and what is not.
+      * KNOWN (PIMA spec, Appendix C): parameter 180 is the system's exit time
+        in seconds. Read on connect and again after each countdown ends, so a
+        change made at the panel is picked up by the next arm -- never at arm
+        time, where the request would queue ahead of the state read that
+        confirms the arm.
+      * KNOWN (Control4 proxy): PARTITION_STATE takes STATE=EXIT_DELAY with
+        DELAY_TIME_TOTAL and DELAY_TIME_REMAINING.
+      * NOT KNOWN: whether the panel reports its arm event at the START or at
+        the END of the exit delay, and whether Navigator counts down on its
+        own from DELAY_TIME_REMAINING or needs the driver to resend it. Both
+        are answered by one field test, and the design does not depend on the
+        answer: the countdown is an overlay that a panel "armed" report does
+        not end, and "Exit Delay Refresh Seconds" resends the remaining time
+        if the app turns out not to count by itself.
+
+    Scope: the countdown starts when an arm command this driver sent is ACKed.
+    An arm made at the keypad has no such moment, so it shows no countdown.
+
+    Nothing is assumed about the outcome. When the timer elapses the driver
+    ASKS the panel: armed -> shown armed; disarmed -> the arm did not complete
+    (an open zone at the end of the delay, typically) and the app is told it
+    failed rather than left showing a countdown that ended in nothing; no
+    answer -> Unknown, never a confident guess in either direction.
+===============================================================================]]
+ExitTimeSec = nil            -- the panel's exit time, from parameter 180
+ExitDelayTimers = {}         -- expiry timer id  -> partition
+ExitDelayTicks = {}          -- refresh timer id -> partition
+EXIT_DELAY_MAX_S = 600
+
+-- 'all' | 'away' | 'off'
+function ExitDelayMode()
+  local v = trim(tostring(Properties['Exit Delay Countdown'] or ''))
+  if v:find('^Off') then return 'off' end
+  if v:find('Away only', 1, true) then return 'away' end
+  return 'all'
+end
+
+function ExitDelayRefreshSeconds()
+  local n = math.floor(tonumber(Properties['Exit Delay Refresh Seconds']) or 0)
+  if n < 0 then n = 0 end
+  if n > 30 then n = 30 end
+  return n
+end
+
+function ExitDelayApplies(mode)
+  local m = ExitDelayMode()
+  if m == 'off' then return false end
+  -- Shabbat arming has its own semantics; a generic countdown would be wrong.
+  if mode == 'shabbat' then return false end
+  if m == 'away' and mode ~= 'away' then return false end
+  return true
+end
+
+function ExitDelayArmType(mode)
+  if mode == 'stay' then return ARM_LABEL_STAY end
+  if mode == 'night' then return ARM_LABEL_NIGHT end
+  if mode == 'home3' then return 'Home3' end
+  if mode == 'home4' then return 'Home4' end
+  return ARM_LABEL_AWAY
+end
+
+-- total, remaining (whole seconds) for the partition's live countdown.
+function ExitDelayTimes(partitionId)
+  local e = PartitionStatusFor(partitionId).exit
+  if not e then return 0, 0 end
+  local remaining = 0
+  if not e.elapsed then
+    remaining = math.ceil((e.endsAt - nowMs()) / 1000)
+    if remaining < 0 then remaining = 0 end
+    if remaining > e.total then remaining = e.total end
+  end
+  return e.total, remaining
+end
+
+-- Reads parameter 180. Failures keep the last known value: a panel that
+-- will not answer must not switch the countdown off after it has worked.
+function RefreshExitTime()
+  if ExitDelayMode() == 'off' then return end
+  local pw = firstPartitionCode()
+  if not pw then return end
+  RequestData(PARAM_EXIT_TIME, 1, 1, pw, function(frame, err)
+    local params = frame and frame.parameters
+    local first = (type(params) == 'table') and params[1] or nil
+    if err or first == nil or JSON.isNull(first) then
+      LogWarn('Could not read the panel exit time (parameter 180): ' ..
+        tostring(err or 'no data') .. '. ' ..
+        (ExitTimeSec and ('Keeping the last known value, ' .. ExitTimeSec .. 's.')
+          or 'No exit-delay countdown will be shown.'))
+      return
+    end
+    local n = tonumber(JSON.scalar(first))
+    if not n or n < 0 or n > EXIT_DELAY_MAX_S then
+      LogWarn('Panel exit time (parameter 180) came back as "' ..
+        tostring(JSON.scalar(first)) .. '", which is not a usable number of seconds; ignoring it')
+      return
+    end
+    n = math.floor(n)
+    if n ~= ExitTimeSec then
+      LogInfo('Panel exit time: ' .. n .. ' seconds' ..
+        (n == 0 and ' (no exit delay configured -- no countdown will be shown)' or ''))
+    end
+    ExitTimeSec = n
+  end)
+end
+
+function CancelExitDelay(partitionId)
+  local st = PartitionStatus[partitionId]
+  local e = st and st.exit
+  if not e then return end
+  if e.timerId then
+    ExitDelayTimers[e.timerId] = nil
+    pcall(function() C4:KillTimer(e.timerId) end)
+  end
+  if e.tickId then
+    ExitDelayTicks[e.tickId] = nil
+    pcall(function() C4:KillTimer(e.tickId) end)
+  end
+  st.exit = nil
+end
+
+function BeginExitDelay(partitionId, mode)
+  if not ExitDelayApplies(mode) then return end
+  local total = ExitTimeSec
+  -- Unknown or zero: behave exactly as before v42. A countdown built on a
+  -- guess would be wrong more often than absent.
+  if not total or total <= 0 then return end
+  if not Partitions[partitionId] then return end
+
+  CancelExitDelay(partitionId)
+  local timerId = C4:AddTimer(total, 'SECONDS')
+  if not timerId then
+    LogWarn('Could not create the exit-delay timer; no countdown will be shown')
+    return
+  end
+  local e = {
+    total = total,
+    endsAt = nowMs() + total * 1000,
+    armType = ExitDelayArmType(mode),
+    timerId = timerId,
+  }
+  local refresh = ExitDelayRefreshSeconds()
+  if refresh > 0 then
+    e.tickId = C4:AddTimer(refresh, 'SECONDS', true)
+    if e.tickId then ExitDelayTicks[e.tickId] = partitionId end
+  end
+  ExitDelayTimers[timerId] = partitionId
+  PartitionStatusFor(partitionId).exit = e
+  LogInfo('Partition ' .. partitionId .. ': exit delay started (' .. total ..
+    's, ' .. e.armType .. ')')
+  PublishPartitionState(partitionId)
+end
+
+-- Resends the remaining time. Only runs when Exit Delay Refresh Seconds > 0.
+function TickExitDelay(partitionId)
+  local e = PartitionStatusFor(partitionId).exit
+  if not e or e.elapsed then return end
+  PublishPartitionState(partitionId)
+end
+
+function EndExitDelay(partitionId)
+  local st = PartitionStatusFor(partitionId)
+  local e = st.exit
+  if not e then return end
+  e.timerId = nil
+  if e.tickId then
+    ExitDelayTicks[e.tickId] = nil
+    pcall(function() C4:KillTimer(e.tickId) end)
+    e.tickId = nil
+  end
+  -- Held at 0 while the panel is asked; cleared by onSettle before anything
+  -- else is published, so the countdown can never outlive the question.
+  e.elapsed = true
+  LogInfo('Partition ' .. partitionId .. ': exit delay elapsed; asking the panel what it did')
+  QueryPartitionArmState(partitionId, {
+    fireEvents = false,
+    onSettle = function(state)
+      CancelExitDelay(partitionId)
+      -- Pick up an exit time changed at the panel, for the NEXT arm. Done
+      -- here, once the countdown is over, rather than at arm time: a request
+      -- queued right after an arm would sit in front of the state read that
+      -- confirms the arm, and delay the one thing the user is watching.
+      RefreshExitTime()
+      if state == nil then
+        -- No usable answer. Fall back to what the panel last said if that
+        -- was an arm; otherwise say Unknown rather than assert "Disarmed"
+        -- for a house that may be armed.
+        local base = tostring(PartitionStatusFor(partitionId).base)
+        if base:find('^Armed') then
+          PublishPartitionState(partitionId)
+        else
+          SetPartitionState(partitionId, 'Unknown')
+        end
+      elseif state == 'Disarmed' then
+        LogWarn('Partition ' .. partitionId .. ': the exit delay finished but ' ..
+          'the panel reports Disarmed -- arming did not complete (an open zone ' ..
+          'at the end of the delay is the usual cause)')
+        SetProp('Last Command Result', 'Arm partition ' .. partitionId ..
+          ' did not complete after the exit delay')
+        NotifyProxyArmFailed(partitionId)
+      end
+    end,
+  })
 end
 
 -- Clears an alarm type, honouring how it was raised. A panel-wide alarm that
@@ -2630,6 +2893,9 @@ end
 -- file and a `local` declared below it would resolve to a nil global there.
 function proxyStateForFriendly(friendly)
   if friendly == 'Disarmed' then return 'DISARMED_READY', '' end
+  if friendly == 'Exit Delay' then return 'EXIT_DELAY', '' end
+  local exitType = friendly and friendly:match('^Exit Delay (.+)$')
+  if exitType then return 'EXIT_DELAY', exitType end
   if friendly == 'Alarm' then return 'ALARM', 'Burglary' end
   if friendly == 'Armed' then return 'ARMED', '' end
   -- We have no live link to the panel, so we do not know the state. Saying
@@ -2655,11 +2921,15 @@ function NotifyProxyPartitionState(partitionId, friendlyState, alarmType, isInit
   LogInfo('Partition ' .. tostring(partitionId) .. ' -> binding ' .. bindingId ..
     ': STATE=' .. state .. ' TYPE="' .. tostring(armType) .. '"' ..
     (isInit and ' (seed + live)' or ''))
+  local delayTotal, delayRemaining = 0, 0
+  if state == 'EXIT_DELAY' then
+    delayTotal, delayRemaining = ExitDelayTimes(partitionId)
+  end
   local stateParams = {
     STATE = state,
     TYPE = armType,
-    DELAY_TIME_TOTAL = 0,
-    DELAY_TIME_REMAINING = 0,
+    DELAY_TIME_TOTAL = delayTotal,
+    DELAY_TIME_REMAINING = delayRemaining,
     CODE_REQUIRED_TO_CLEAR = (state == 'ALARM'),
   }
   if isInit then
@@ -2693,6 +2963,7 @@ end
 function NotifyProxyAllPartitionsOffline()
   for pid = 1, MAX_DECLARED_PARTITIONS do
     if Partitions[pid] then
+      CancelExitDelay(pid)
       NotifyProxyPartitionState(pid, 'Offline')
     end
   end
@@ -4596,19 +4867,32 @@ function DispatchEvent(frame)
   local zone = tonumber(frame.zone) or 0
   local partition = tonumber(frame.partition) or 0
 
-  SetProp('Last Event Type', tostring(etype))
-  SetProp('Last Event Qualifier', tostring(qualifier))
-  SetProp('Last Event Zone', tostring(zone))
-  SetProp('Last Event Partition', tostring(partition))
+  -- Zone open/close is the hot path: a house with motion sensors produces
+  -- hundreds a day, in bursts. These "Last ..." properties are hidden
+  -- diagnostics unless Log Level is Debug, and each write is a blocking
+  -- Director round trip -- measured at 2.5 per zone event, against 3 for the
+  -- whole of the useful work (two proxy notifies and the programming event).
+  -- So on zone events they are written only when someone can see them.
+  -- Everything else is rare and keeps writing unconditionally, so "what was
+  -- the last alarm" is still answerable without Debug.
+  local hotPath = (etype == EV_ZONE and zone > 0)
+  if DEBUG_ON or not hotPath then
+    SetProp('Last Event Type', tostring(etype))
+    SetProp('Last Event Qualifier', tostring(qualifier))
+    SetProp('Last Event Zone', tostring(zone))
+    SetProp('Last Event Partition', tostring(partition))
+  end
 
   -- Zone open/closed
   if etype == EV_ZONE and zone > 0 then
     local zcfg = Zones[zone]
     local zname = zcfg and zcfg.name or ('Zone ' .. zone)
     local isOpen = (qualifier == QUALIFIER_NEW)
-    SetProp('Last Zone Number', tostring(zone))
-    SetProp('Last Zone Name', zname)
-    SetProp('Last Zone Partition', tostring(partition))
+    if DEBUG_ON then
+      SetProp('Last Zone Number', tostring(zone))
+      SetProp('Last Zone Name', zname)
+      SetProp('Last Zone Partition', tostring(partition))
+    end
     FireDriverEvent(isOpen and 'Zone Opened' or 'Zone Closed')
     -- Pass nil for bypassed so the zone's tracked bypass state is preserved:
     -- hardcoding false here used to silently clear the bypass flag on the
@@ -5114,6 +5398,7 @@ end
 
 function OnDriverDestroyed()
   StopLinkWatchdog()
+  for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end
   CancelZonePublish()
   CancelEventMuteTimer()
   StopServer()

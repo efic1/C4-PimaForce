@@ -10,6 +10,44 @@ changes hot-reload.
 
 ---
 
+## v42 — exit-delay countdown, and a Director-load review
+
+### Exit delay
+
+- **Added: the app now shows the exit delay as a live countdown**, with its
+  Cancel button, after you arm from the app or from programming. The length
+  is read from the panel (exit time, parameter 180) — there is nothing to
+  type in, and a panel with no exit delay configured shows no countdown.
+- When the countdown ends the driver **asks the panel** what happened.
+  Armed is shown armed. If the panel is still disarmed — an open zone at the
+  end of the delay, typically — the app is told the arm **failed**, instead of
+  being left on a countdown that ended in nothing. No answer shows Unknown,
+  never a guessed Disarmed.
+- Pressing Cancel, disarming at a keypad, or losing the panel ends the
+  countdown; an alarm outranks it. A panel "armed" report does **not** end it,
+  since the panel may report the arm at the start of its exit delay.
+- New properties: **Exit Delay Countdown** (`Auto - all arm modes` /
+  `Auto - Away only` / `Off`) and **Exit Delay Refresh Seconds**.
+- **Two things this build cannot know and needs one field test for:** whether
+  Navigator counts down by itself from the remaining time (the assumption —
+  the driver sends it once), and when the panel reports its arm event. If the
+  number in the app sits still, set **Exit Delay Refresh Seconds** to 1–5.
+  The design does not depend on either answer.
+- Scope: the countdown starts when an arm **this driver sent** is ACKed. An
+  arm made at the keypad shows none.
+
+### Director load (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md))
+
+- **Fixed: hidden diagnostic properties were written on every zone event.**
+  2.5 blocking `UpdateProperty` calls per event for properties nobody can see
+  unless Debug is on — more than the useful work. A zone open+close pair drops
+  from **13 Director calls to 8**. Rare events still write them.
+- **Fixed: every arm and disarm left a stale 5-second timer running** after the
+  panel had already answered.
+- Measured, not assumed: CPU is ~0.1 ms per zone event, memory is flat over
+  20,000 events, and there is no polling. The profiling harness is committed
+  as `tests/profile_director_calls.lua`.
+
 ## v41 — the app catches up with a disarm immediately
 
 - **Fixed: the shield stayed on "Armed" for a few seconds after disarming.**
