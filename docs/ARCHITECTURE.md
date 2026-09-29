@@ -23,7 +23,7 @@ specification, see [SPEC-VALIDATION.md](SPEC-VALIDATION.md).
 - `driver.xml` — generated device metadata: properties, commands, actions,
   programming events, proxies and capabilities. Committed so the tests and
   the packaged `.c4z` have it, and checked for staleness in CI.
-- `tests/test_regressions.lua` — 326 regression tests, one per defect found
+- `tests/test_regressions.lua` — 369 regression tests, one per defect found
   in review or in the field, each named for the failure it locks down. Run
   this before shipping any change; it is the file that will tell you if a
   "small fix" has reintroduced a fail-open disarm or a stuck alarm.
@@ -31,8 +31,11 @@ specification, see [SPEC-VALIDATION.md](SPEC-VALIDATION.md).
   table.
 - `tests/profile_director_calls.lua` — not a test: counts the Director calls and
   CPU per event. See [PERFORMANCE.md](PERFORMANCE.md).
-- `build.sh` — regenerates the XML, checks syntax, runs the tests and
-  packages `PimaForce.c4z` (a zip of `driver.xml` + `driver.lua`).
+- `build.sh` — regenerates the XML and the Documentation tab, checks syntax,
+  runs the tests and packages `PimaForce.c4z` (`driver.xml`, `driver.lua`, and
+  `www/documentation/index.html`, whose path inside the zip must match
+  driver.xml).
+- `docs/COMPOSER-GUIDE.md` — source of Composer's Documentation tab.
 
 ## Hebrew (Windows-1255) zone names
 
@@ -43,9 +46,8 @@ straight into the JSON string. Left alone, that shows up as garbled text (or
 
 - **Zone/User Name Encoding** property (default `Windows-1255`, matching
   what Israeli FORCE panels actually use): the driver transcodes every name
-  returned by **Discover Zone Names** from Windows-1255 to proper UTF-8
-  before writing it into the **Discovered Zones** property, so what you copy
-  into **Zones Config** is correct Hebrew text, not mojibake. Switch this to
+  it reads from the panel from Windows-1255 to proper UTF-8 before it enters
+  the zone store, so the app shows correct Hebrew text, not mojibake. Switch this to
   `UTF-8` for English-only/non-Hebrew panels (no transcoding needed, pure
   passthrough).
 - **Reverse Zone/User Names** property (default `Off`): some panels store
@@ -62,8 +64,7 @@ published codepage spec, and is exercised end-to-end in `tests/test_driver.lua`
 against an actual Hebrew zone name ("דלת כניסה" / front door) -- both the
 plain transcode and the visual-order-reversed variant.
 
-Only zone names discovered through the **Discover Zone Names** action go
-through this decoding step. Anything you type directly into **Zones Config**
+Only zone names read from the panel go through this decoding step. Anything you type directly into **Zones Config**
 in Composer Pro is already whatever text you typed (Composer's property
 fields are UTF-8), so no decoding is applied there.
 
@@ -134,7 +135,7 @@ it refuses to guess: an unknown value is reported as unknown rather than
 assumed, and anything the panel merely acknowledged is verified before it is
 believed.
 
-326 offline regression tests cover these, one per defect, each named for the
+369 offline regression tests cover these, one per defect, each named for the
 failure it locks down. They mock the Control4 runtime, so they cannot prove
 timing or byte-stream behaviour against a real panel — that part is covered by
 the installation it runs on.
@@ -177,8 +178,10 @@ and `Off` to Info, so a deliberate trace is not silently turned off.
 
 Navigator pushes zone identity at the panel proxy whenever the security agent
 refreshes, which was logging `unhandled command SET_ZONE_INFO` repeatedly. The
-reference driver accepts it as a no-op; this driver takes the rename, writes it
-back into **Zones Config** (so it survives a reload) and republishes. Commas
+reference driver accepts it as a no-op; this driver takes the rename, saves it
+in the zone store (so it survives a reload) and republishes. Since v43 a name
+override in Zones Config for that zone is dropped at the same time, or it
+would win and the rename would look like it did nothing. Commas
 and semicolons in a name are replaced with spaces -- they are the field and
 record separators and there is no escape syntax to read back.
 
@@ -222,7 +225,8 @@ The read-only diagnostic properties -- `Last Event *`, `Last Zone *`,
 Director that lacks it cannot take driver init down). They still exist and are
 still written, because the driver's Events reference them by name in Composer
 programming; they are just not in the way while you are setting a port number.
-`Discovered Zones` stays visible -- it is part of the setup workflow.
+(`Discovered Zones`, which used to stay visible for setup, was removed in v43;
+see *Zone store* below.)
 
 ### The "Unknown" partition header (v15)
 
@@ -254,13 +258,14 @@ renders long STRING values badly. Three things keep it responsive:
   without touching Director if nothing changed. A single zone event used to
   rewrite seven properties, most of them identical to what they already held;
   a 20-event burst costs **26 property writes instead of 140**.
-- **`Recent Activity`** is capped at 25 entries of 100 characters (~2.5 KB).
+- **`Recent Activity`** keeps 25 entries of 100 characters, but since v43 the
+  property shows only the newest 5 (~0.5 KB); **List Recent Activity** prints
+  all 25. It is rewritten on every Info line, so its size is what Composer
+  redraws each time.
   Full frame-level history belongs in the log, not in a property -- see
   "Recent Activity is a critical-events log" below for what actually lands
   here.
-- **`Discovered Zones`** is a 600-byte *preview* only. The complete discovered
-  list is held in memory and that is what **Apply Discovered Zones** writes,
-  so a shorter preview never means fewer zones applied.
+- **The zone list is not a property at all since v43** -- see *Zone store*.
 
 ### Security properties worth knowing
 
@@ -604,7 +609,7 @@ update when the decoded value actually differs from what was already
 tracked. Bits 3, 0, 1 and 9 (tamper, supervision loss, low battery, alarmed)
 are logged at Warning if seen, since this driver does not yet carry them on
 the proxy and they should never be silently dropped. A zone number in the
-response that isn't in **Zones Config** is ignored rather than guessed at.
+response that isn't a known zone is ignored rather than guessed at.
 
 **Arm OPERATION now sends `order=1`, not `order=0` (v21).** Every arm optype
 (Away/Home1-4/Shabbat) sent `order=0` through v20, on no particular evidence
@@ -1011,3 +1016,102 @@ only fall back to whatever the panel last said. Alarms still outrank it.
 - **Unverified in the field:** whether Navigator counts down on its own from
   `DELAY_TIME_REMAINING`, and when the panel emits its arm event. The design
   does not depend on either; **Exit Delay Refresh Seconds** covers the first.
+
+
+## Zone store (v43)
+
+**Why.** Through v42 the zone list lived in the Zones Config property: about
+1.7 KB for 40 Hebrew-named zones, with the same again in Discovered Zones.
+Composer redraws a property on every write and edits it in a one-line box, so
+the grid was slow and the list miserable to change, and every rename from the
+app rewrote the whole string.
+
+**What.** Zone numbers and names live in DriverWorks' persistence store
+(`C4:PersistSetValue` / `PersistGetValue`, OS 2.10+), which survives driver
+updates and Director restarts and is not drawn in Composer. It is one JSON
+document under `pima.zones.v1`, written as `PIMAZONES1:` + JSON.
+
+**Writes are verified later, not immediately (v46).** On the field
+controller a `PersistSetValue` becomes readable only some time after it
+returns; a new key read straight back is `nil`. That single fact was behind
+the v43, v44 and v45 failures, each of which read back the *previous* value.
+`PersistWriteBlob` now records what it wrote and a timer checks it after 5 s,
+then 30 s and 120 s if needed (`RunPersistVerify`), logging the exact raw
+difference on final failure. The migration is two-phase: `MigrateZonesConfig`
+writes backup, store and a `pending` flag and keeps running on the full Zones
+Config; `FinishZoneMigration` runs only on confirmation, recomputes the
+overrides from Zones Config *as it is then* (so `N,,hidden` entries added by a
+refresh in the meantime survive), writes `done` and shortens the property. A
+load that finds `pending` simply migrates again. `HideNewZonesOnce` holds the
+hide rule in memory because the first refresh can finish before confirmation.
+The test mock applies writes late (`commitPersist` / `settlePersist`), as the
+controller does; earlier mocks applied them instantly, which is why three
+rounds passed offline.
+
+**How values are stored (v45).** Every persisted value is a *blob*: the
+text is base64-encoded (pure Lua, no bit operators), split into parts of at
+most 600 characters under `<key>.partN` (each `PIMAB64:`-prefixed), and
+described by a header at `<key>` -- `PIMABLOB1:<parts>:<length>:<checksum>`
+-- written last. Each part and the header are read back after writing, and a
+mismatch is logged with the part, both lengths and the first differing
+position. Two field failures led here: v43's JSON came back as a table, and
+v44's prefixed string came back as a *different* string, while the
+driver's own encoding round-trips exactly. base64 leaves nothing for escape
+processing, charset conversion or JSON decoding to change; the parts defeat
+a length cap. Reads still accept v43/v44 values. A store that is present but
+unreadable after a completed migration is rebuilt from the backup's names,
+because Zones Config alone is overrides by then.
+
+**Why the prefix (v44, superseded).** On the installed controller, `PersistGetValue`
+returned a stored JSON string as a decoded Lua *table*. v43 compared the
+read-back byte for byte, so every save looked failed and the migration
+refused to run. Now every persisted value is prefixed text that no JSON
+reader parses (`PIMATEXT1:` for the backup and flags), since a lenient reader
+turns `1,Front Door,...` into the number 1. Reads accept the store as
+prefixed text, as v43's plain JSON, or as an already-decoded table, and the
+read-back compares *content* (`ZoneStoresEqual`), not bytes. The regression
+mock decodes JSON on read the way that controller did.
+
+**Zones Config is overrides.** `BuildZones` merges the store with the parsed
+Zones Config into the same `Zones` table the rest of the driver always used,
+so nothing downstream changed. An override changes only the fields it gives
+(`parseZones` now records which were given): `5,,motion`, `7,,,2`,
+`12,New Name`, `9,,hidden`.
+
+**Filling it.** Once per driver load, on the first verified connection, the
+driver reads the zone count and names (the existing paged discovery) and
+**adds** zones it does not know. It never renames a known zone -- a name the
+installer corrected must not be undone by the panel re-reporting its own
+text -- and never removes one: a zone the panel stops naming is reported,
+and `hidden` removes it deliberately. **Refresh Zones From Panel** runs the
+same thing on demand (the old **Discover Zone Names** command is still
+accepted).
+
+**Migration from v42**, once, in `OnDriverInit`. The trigger is the migration
+flag, written only after a verified migration, not the store's existence: v43
+left a store with no flag on the field controller, and v44 completes the
+migration over it.
+
+1. Save the old Zones Config verbatim under `pima.zonesConfig.backup` and
+   read it back.
+2. Import every named entry into the store (`from = 'config'`), save, read
+   back.
+3. Only then rewrite Zones Config to `MinimalOverrides`: entries whose type
+   is not `contact`, or whose partition differs from the one an unassigned
+   zone falls back to anyway.
+
+4. Set `pima.zones.hideNewOnce`. The old Zones Config was an explicit list,
+   so a zone the installer deleted from it was deliberately absent. The first
+   *complete* refresh adds any such panel zone as `N,,hidden` rather than
+   showing it, then clears the flag; later refreshes add zones normally.
+
+If either save fails verification, nothing is rewritten and the driver runs
+on Zones Config exactly as v42 did; the same applies when the controller has
+no persistence API. **Restore Zones Config** writes the backup back, clears
+the store and sets `pima.zones.migration = off`, so later loads neither
+re-import it nor auto-refresh zones. A test compares the effective zone list
+before and after migration field by field.
+
+**Reports without churn.** **List Zones** and **List Recent Activity** print
+through `LogBlock`, which does not record each line in Recent Activity:
+through `LogInfo` a 40-line report would rewrite that property 40 times.
