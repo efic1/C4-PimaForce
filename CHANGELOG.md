@@ -10,6 +10,42 @@ changes hot-reload.
 
 ---
 
+## v47 — the partition no longer gets stuck Offline after a restart
+
+Field report: after a Director restart the app showed **Trouble created →
+Communication trouble → Trouble cleared**. After that the partition stayed
+**Offline** and couldn't be armed or disarmed, even though zone events kept
+arriving in History.
+
+- **Fixed: a failed state check left the partition Offline indefinitely.**
+  When the panel connects, the driver asks it once for each partition's
+  state. Right after a restart the panel is busy delivering everything it
+  saved up during the outage, and that one question can time out. The driver
+  logged `state query FAILED`, left the partition Unknown (Offline in the
+  app), and **never asked again**. Offline blocks arming, so the only thing
+  that could have corrected it, an arm or disarm, couldn't happen from the
+  app. A deadlock.
+- **The driver now keeps asking while any partition is Unknown and the panel
+  is connected:** after 10 s, 30 s, 60 s, then every 5 minutes. It stops as
+  soon as every partition has a state, and on disconnect.
+- **It also asks immediately when the panel reports its communication
+  restored.** That's exactly when the first question is likely to have been
+  missed.
+- The trouble sequence itself was correct. While Director restarted the panel
+  couldn't reach it, raised its own communication trouble, and reported the
+  trouble and the restore once it reconnected.
+- The *"Set the 4th field of each Zones Config entry"* log line is now quiet
+  on a single-partition system. Leaving the partition out is the intended
+  form since v43. With several partitions it still points out zones on the
+  fallback partition, with the correct override syntax.
+- Tests reproduce the field sequence: the first state check times out while
+  zone events keep arriving, then a retry succeeds and the app leaves
+  Offline. They also cover back-off timing, stopping on disconnect, and the
+  communication-restored trigger.
+- Repo: restored the missing `docs/COMPOSER-GUIDE.md` (it rebuilds the
+  committed Documentation tab byte for byte), and brought
+  `tests/test_driver.lua` up to date.
+
 ## v46 — one cause behind three field failures
 
 Field log from v45:

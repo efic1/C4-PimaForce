@@ -192,7 +192,7 @@ local passthrough = DecodePanelText('Front Door')
 assert(passthrough == 'Front Door')
 print('OK UTF-8 mode passes ASCII text through unchanged')
 
-print('=== Discover Zone Names applies Hebrew decoding end-to-end ===')
+print('=== Zone refresh applies Hebrew decoding end-to-end ===')
 -- Reconnect (the previous section tested disconnect handling).
 OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
 OnServerDataIn(2, '{"frame_type":"null","account":"1234","counter":1}', '10.0.0.50', 5555)
@@ -226,9 +226,9 @@ local zoneNamesResp = string.format(
   '{"frame_type":"DATA","account":1234,"counter":%d,"id":260,"start_order":1,"parameters":["%s"]}',
   discoverReq.counter, win1255Bytes)
 OnServerDataIn(2, zoneNamesResp, '10.0.0.50', 5555)
-assert(Properties['Discovered Zones'] == '1,דלת כניסה,contact,1',
-  'expected discovered zone entry with decoded Hebrew name, got: ' .. tostring(Properties['Discovered Zones']))
-print('OK Discover Zone Names end-to-end produces decoded Hebrew name:', Properties['Discovered Zones'])
+assert(PanelZoneNames[1] == 'דלת כניסה',
+  'expected the decoded Hebrew name from the panel, got: ' .. tostring(PanelZoneNames[1]))
+print('OK zone refresh end-to-end produces decoded Hebrew name:', PanelZoneNames[1])
 
 print('=== Native Security proxy: init notifies panel + partition bindings ===')
 -- These seeds are sent from OnDriverLateInit (proxy bindings are not

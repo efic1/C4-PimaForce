@@ -5,8 +5,8 @@
 	<model>FORCE Series</model>
 	<creator>Community</creator>
 	<created>09/04/2026 00:00</created>
-	<modified>09/29/2026 08:28</modified>
-	<version>46</version>
+	<modified>10/05/2026 17:22</modified>
+	<version>47</version>
 	<small>devices_sm/c4.gif</small>
 	<large>devices_lg/c4.gif</large>
 	<control>lua_gen</control>
@@ -50,7 +50,7 @@
 	</capabilities>
 	<config>
 		<script file="driver.lua"></script>
-		<documentation file="www/documentation/index.html"><![CDATA[PIMA FORCE Alarm Panel driver v46. Full documentation: www/documentation/index.html inside the driver package.]]></documentation>
+		<documentation file="www/documentation/index.html"><![CDATA[PIMA FORCE Alarm Panel driver v47. Full documentation: www/documentation/index.html inside the driver package.]]></documentation>
 		<properties>
 			<property>
 				<name>Listen Port</name>

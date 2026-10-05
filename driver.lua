@@ -97,7 +97,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 46
+local DRIVER_VERSION = 47
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -1676,6 +1676,8 @@ PanelWasConnected = false
 -- until v30 the driver detected it (the link watchdog) but offered nothing to
 -- program against.
 function NotePanelDisconnected(reason)
+  -- Nothing to re-ask without a panel; the next connection starts afresh.
+  CancelUnknownResync()
   if not PanelWasConnected then return end
   PanelWasConnected = false
   SetDriverVariable('PANEL_CONNECTED', false)
@@ -1723,6 +1725,7 @@ function OnServerConnectionStatusChanged(nHandle, nPort, strStatus)
     -- A reconnect is exactly when our picture is most likely stale: start
     -- from "we don't know" rather than from whatever we last believed.
     ResetPartitionStatus()
+    CancelUnknownResync()
     -- Fail (not silently discard) anything still queued from the previous
     -- session: callers -- including the native widget waiting on an arm --
     -- must be told, or a command just evaporates with no error anywhere.
@@ -2450,6 +2453,10 @@ function OnTimerExpired(idTimer)
     ProcessQueue()
     return
   end
+  if PartitionResyncTimerId and idTimer == PartitionResyncTimerId then
+    RunUnknownResync()
+    return
+  end
   if InFlight and InFlight.timerId == idTimer then
     local cb = InFlight.onResult
     ClearInFlight()
@@ -3119,12 +3126,17 @@ function QueryPartitionArmState(partitionId, opts)
         -- there is nothing anywhere explaining that the state query is what
         -- failed.
         local msg = 'Partition ' .. partitionId .. ' state query FAILED (' ..
-          tostring(err or 'no data') .. '). The partition will read Unknown in the app ' ..
-          'until the panel reports an arm or disarm. Check the partition user code in ' ..
-          'Partitions Config, then use the "Sync Partition States" action.'
+          tostring(err or 'no data') .. '). Retrying automatically; until it succeeds ' ..
+          'the partition reads Offline in the app. If it keeps failing, check the ' ..
+          'partition user code in Partitions Config.'
         LogError(msg)
         SetProp('Last Command Result', msg)
         settle(nil)
+        -- Until v47 there was no retry: one failed query (a panel busy
+        -- replaying its backlog right after a Director restart) left the
+        -- partition Unknown -- Offline in the app, which blocks arming --
+        -- with nothing but an arm or disarm event to ever correct it.
+        ScheduleUnknownResync()
       end
       return
     end
@@ -3193,6 +3205,68 @@ end
 -- Kept as the post-arm entry point so existing call sites read clearly.
 function QueryArmModeAndFire(partitionId)
   QueryPartitionArmState(partitionId, { fireEvents = true })
+end
+
+--[[---------------------------------------------------------------------------
+    Re-asking until the state is known (v47).
+
+    Field report: after a Director restart the panel reconnected, delivered its
+    buffered troubles and kept sending zone events -- but the partition stayed
+    Offline and could not be armed or disarmed. The cold-sync state query had
+    failed once (the panel was busy replaying its backlog) and nothing ever
+    asked again; Offline blocks arming, so the only event that could have
+    corrected it could not happen from the app. A deadlock.
+
+    While the panel is connected and any configured partition is Unknown, the
+    driver now asks again: after 10 s, 30 s, 60 s, then every 5 minutes. It
+    stops the moment every partition has a state, and on disconnect.
+-----------------------------------------------------------------------------]]
+PARTITION_RESYNC_DELAYS_S = { 10, 30, 60, 300 }
+PartitionResyncTimerId = nil
+PartitionResyncAttempt = 0
+
+function UnknownPartitions()
+  local out = {}
+  for pid in pairs(Partitions) do
+    if PartitionStatusFor(pid).base == 'Unknown' then out[#out + 1] = pid end
+  end
+  table.sort(out)
+  return out
+end
+
+function CancelUnknownResync()
+  if PartitionResyncTimerId then
+    pcall(function() C4:KillTimer(PartitionResyncTimerId) end)
+  end
+  PartitionResyncTimerId = nil
+  PartitionResyncAttempt = 0
+end
+
+function ScheduleUnknownResync()
+  if PartitionResyncTimerId then return end
+  if not (ConnHandle and PanelVerified) then return end
+  if #UnknownPartitions() == 0 then
+    PartitionResyncAttempt = 0
+    return
+  end
+  local i = math.min(PartitionResyncAttempt + 1, #PARTITION_RESYNC_DELAYS_S)
+  PartitionResyncTimerId = C4:AddTimer(PARTITION_RESYNC_DELAYS_S[i], 'SECONDS')
+end
+
+function RunUnknownResync()
+  PartitionResyncTimerId = nil
+  if not (ConnHandle and PanelVerified) then return end
+  local unknown = UnknownPartitions()
+  if #unknown == 0 then
+    PartitionResyncAttempt = 0
+    return
+  end
+  PartitionResyncAttempt = PartitionResyncAttempt + 1
+  LogInfo('Partition state still unknown for ' .. table.concat(unknown, ', ') ..
+    '; asking the panel again (attempt ' .. PartitionResyncAttempt .. ')')
+  for _, pid in ipairs(unknown) do
+    QueryPartitionArmState(pid, { fireEvents = false })
+  end
 end
 
 -- Cold sync of every configured partition. Runs when the panel verifies, and
@@ -4462,10 +4536,19 @@ function PublishZoneInventory()
     local plist = {}
     for pid in pairs(Partitions) do plist[#plist + 1] = pid end
     table.sort(plist)
-    LogInfo('Zone inventory: ' .. explicit .. ' zone(s) name their own partition, ' ..
+    local msg = 'Zone inventory: ' .. explicit .. ' zone(s) name their own partition, ' ..
       defaulted .. ' fall back to partition ' .. tostring(FallbackPartition()) ..
-      ' (configured partitions: ' .. (#plist > 0 and table.concat(plist, ',') or 'none') ..
-      '). Set the 4th field of each Zones Config entry to place zones explicitly.')
+      ' (configured partitions: ' .. (#plist > 0 and table.concat(plist, ',') or 'none') .. ')'
+    if #plist > 1 then
+      -- Only worth saying when there is a choice: with several partitions a
+      -- zone left to the fallback may be in the wrong one.
+      LogInfo(msg .. '. To place a zone in another partition, add "zone,,,partition" ' ..
+        'to Zones Config, e.g. "7,,,2".')
+    else
+      -- One partition: every zone belongs to it, and since v43 leaving the
+      -- partition out of Zones Config is the intended form, not a gap.
+      Dbg(msg)
+    end
   end
 
   -- Arm the drain rather than running the first batch inline. v13 left one
@@ -5757,6 +5840,13 @@ function DispatchEvent(frame)
     FireDriverEvent(isNew and 'Communication Trouble' or 'Communication Restored')
     if isNew then FireTrouble('Communication', 'Panel communication trouble') end
     NotifyProxyTrouble('Communication trouble', isNew)
+    -- The panel just said its link is back: exactly the moment a state query
+    -- may have been missed. Ask now rather than wait for the retry timer.
+    if not isNew then
+      for _, pid in ipairs(UnknownPartitions()) do
+        QueryPartitionArmState(pid, { fireEvents = false })
+      end
+    end
     return
   end
 
@@ -6191,6 +6281,7 @@ end
 
 function OnDriverDestroyed()
   StopLinkWatchdog()
+  CancelUnknownResync()
   if PersistVerifyTimerId then pcall(function() C4:KillTimer(PersistVerifyTimerId) end) end
   PersistVerifyTimerId = nil
   for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end

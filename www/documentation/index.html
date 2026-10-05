@@ -31,7 +31,7 @@ blockquote p { margin: 4px 0; }
 <body>
 <main>
 <h1 id="pima-force-alarm-panel">PIMA FORCE Alarm Panel</h1>
-<p class="version">Driver version 46</p>
+<p class="version">Driver version 47</p>
 <p>A Control4 driver for <strong>PIMA FORCE</strong> alarm panels. It talks directly to the
 panel over the panel's own local JSON interface. There's no cloud service,
 bridge or extra hardware.</p>
@@ -337,6 +337,10 @@ checked against <code>PARTITION_n_ARMED</code>.</p>
 <tr>
 <td>Can't disarm from the app</td>
 <td><strong>Remote Disarm</strong> is <code>ON</code> at the panel, and the partition's code has disarm rights.</td>
+</tr>
+<tr>
+<td>Partition shows Offline while zones still update</td>
+<td>The driver keeps re-asking the panel for the state, so it clears on its own within a few minutes. <strong>Sync Partition States</strong> (Actions) asks immediately.</td>
 </tr>
 <tr>
 <td>No zone open/close in the app</td>

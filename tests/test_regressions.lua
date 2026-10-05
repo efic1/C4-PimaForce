@@ -2378,6 +2378,101 @@ test('SYSTEM_KEY_DISARMED does not accumulate across a driver reload', function(
   assert(SYSTEM_KEY_DISARMED[2] == true, 'but the shipped confirmed value must still be there')
 end)
 
+-- Times out whatever request is in flight, as a panel too busy to answer would.
+local function timeOutInFlight()
+  local g = 0
+  while InFlight and g < 10 do
+    g = g + 1
+    OnTimerExpired(InFlight.timerId)
+  end
+end
+
+test('a failed state check after connecting is retried until it succeeds (v47)', function()
+  -- Field report: after a Director restart the panel reconnected, replayed its
+  -- buffered troubles and kept sending zone events, but the partition stayed
+  -- Offline -- which blocks arming -- because the one state query had failed
+  -- and nothing ever asked again.
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  timeOutInFlight()                                   -- the panel never answers
+  assert(EffectivePartitionState(1) == 'Unknown', 'precondition: the state is not known')
+  assert(PartitionResyncTimerId, 'a retry must be scheduled, not left to an arm event')
+
+  -- Zone events keep flowing meanwhile, as in the field.
+  OnServerDataIn(h, '{"frame_type":"event","counter":950,"account":"1234","type":760,"qualifier":1,"zone":1,"partition":1}',
+    '10.0.0.50', 5555)
+
+  calls.ServerSend = {}
+  calls.SendToProxy = {}
+  PostOperationGuardUntil = 0
+  OnTimerExpired(PartitionResyncTimerId)
+  local asked = false
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310 then asked = true end
+  end
+  assert(asked, 'the retry must ask the panel again')
+  answerSyncQueries(h, 2)                             -- 2 = Disarmed
+  assert(EffectivePartitionState(1) == 'Disarmed', 'got ' .. tostring(EffectivePartitionState(1)))
+  local st = proxyCalls(5002, 'PARTITION_STATE')
+  assert(#st > 0 and st[#st][3].STATE == 'DISARMED_READY', 'and the app must stop showing Offline')
+  assert(PartitionResyncTimerId == nil, 'once the state is known, retrying stops')
+end)
+
+test('retries back off and keep going while the state stays unknown (v47)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  connectPanel(1, true)
+  timeOutInFlight()
+  local delays = {}
+  for i = 1, 6 do
+    local id = PartitionResyncTimerId
+    assert(id, 'retry ' .. i .. ' must be scheduled')
+    for _, t in ipairs(calls.AddTimer) do if t[1] == id then delays[#delays + 1] = t[2] end end
+    PostOperationGuardUntil = 0
+    OnTimerExpired(id)
+    timeOutInFlight()
+  end
+  assert(delays[1] == 10 and delays[2] == 30 and delays[3] == 60 and delays[4] == 300 and delays[6] == 300,
+    'expected 10, 30, 60, then 300 s, got ' .. table.concat(delays, ', '))
+end)
+
+test('a disconnect stops the retries (v47)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  timeOutInFlight()
+  local id = PartitionResyncTimerId
+  assert(id)
+  calls.KillTimer = {}
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  assert(PartitionResyncTimerId == nil, 'no panel, nothing to ask')
+  calls.ServerSend = {}
+  OnTimerExpired(id)                                  -- a stale fire must do nothing
+  assert(#calls.ServerSend == 0)
+end)
+
+test('a successful first check schedules no retry (v47)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  answerSyncQueries(h, 2)
+  assert(PartitionResyncTimerId == nil, 'the normal path must not poll the panel')
+end)
+
+test('the panel reporting communication restored re-asks at once (v47)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  timeOutInFlight()
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, '{"frame_type":"event","counter":951,"account":"1234","type":350,"qualifier":3,"zone":0,"partition":0}',
+    '10.0.0.50', 5555)
+  local asked = false
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310 then asked = true end
+  end
+  assert(asked, 'communication restored is exactly when a missed state check should be repeated')
+end)
+
 test('a failed state sync explains why the partition reads Unknown', function()
   freshDriver()
   local h = connectPanel(1, true)
@@ -2394,7 +2489,7 @@ test('a failed state sync explains why the partition reads Unknown', function()
   local result = Properties['Last Command Result'] or ''
   assert(result:find('state query FAILED', 1, true),
     'the failure must be visible in a property, got: ' .. result)
-  assert(result:find('Unknown', 1, true),
+  assert(result:find('Offline', 1, true),
     'and must connect it to what the app shows')
 end)
 

@@ -21,7 +21,7 @@ Interface JSON Format Specification v2.4* — see
 [docs/SPEC-VALIDATION.md](docs/SPEC-VALIDATION.md) for exactly what is
 confirmed by the spec, what the spec corrected, and what remains ambiguous.
 
-369 offline regression tests, one per defect found in review or in the field.
+374 offline regression tests, one per defect found in review or in the field.
 
 ## Features
 
@@ -154,7 +154,7 @@ filing a bug:
 
 ```bash
 ./build.sh                        # regenerate driver.xml + docs, package PimaForce.c4z (needs: pip install markdown)
-lua5.4 tests/test_regressions.lua # 369 regression tests
+lua5.4 tests/test_regressions.lua # 374 regression tests
 lua5.4 tests/test_driver.lua      # happy-path harness
 ```
 
