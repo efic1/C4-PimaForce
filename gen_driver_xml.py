@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 47
+DRIVER_VERSION = 48
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's

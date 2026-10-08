@@ -10,6 +10,76 @@ changes hot-reload.
 
 ---
 
+## v48 — fixes from the v47 code review
+
+**Alarms and arming**
+
+- **Fixed: a burglary alarm never fired Any Alarm.** Only `Partition N Alarm`
+  fired, or `Unmapped Panel Event` when the panel named no partition. A
+  notification on Any Alarm therefore sent nothing for an intrusion. It now
+  fires, with `ALERT_TYPE` = `Burglary` and the zone name in `ALERT_TEXT`.
+- **Fixed: an arm could end as "Disarmed".** The panel reports an arm when its
+  exit delay *starts*, while it still reads Disarmed. The follow-up check then
+  applied Disarmed, cancelled the countdown and fired `Partition N Disarmed`.
+  Now the driver leaves the state alone and asks again after the exit delay
+  (up to three times). An armed answer fires the arm event then; if the panel
+  never reads armed, nothing is fired.
+- **Fixed: a burglary alarm stayed on the shield after a disarm** when the
+  panel sent no restore, and entering the code in the app could not clear it.
+  A confirmed disarm now clears the burglary alarm. Fire, medical, panic and
+  duress still wait for their own restore.
+- **Fixed: a fire, medical or panic alarm with no partition never reached the
+  shield.** It is now shown on every configured partition, and its restore
+  clears it everywhere.
+- **Fixed: re-arming quickly could cancel the new countdown** and report
+  `ARM_FAILED`, when the answer for the previous countdown arrived late. That
+  answer is now ignored.
+- **Fixed: more ways to get stuck Offline.** An exit delay ending with an
+  unrecognised or "partition does not exist" answer, or a retry answered with
+  an unrecognised value, left the partition Unknown with no retry. They now
+  retry like a failed query. The same unrecognised value is logged once.
+- **`PARTITION_n_STATE` / `_ARMED` are now updated on every change**,
+  including alarms, restores and the end of an exit delay. `_ARMED` follows
+  the panel's arm state, so it stays `true` during an alarm on an armed house.
+- Editing Partitions Config while connected now re-reads the partition states
+  straight away.
+
+**Connection**
+
+- **Fixed: any TCP connection to the listen port dropped the panel session.**
+  A port scan or network probe that opened and closed the port caused
+  "connection lost", Offline and refused arm/disarm until the panel's next
+  frame. While a session is live, a new connection now takes over only once it
+  sends a frame with the configured account, which the panel does at once
+  when it really reconnects. A blocked client can no longer de-verify the
+  panel, and a session adopted from incoming data now has its link watchdog.
+
+**Zone store**
+
+- **Fixed: a reload at the wrong moment of the migration could empty the
+  store** and hide every zone. The driver now recognises that the migration
+  already finished, and never overwrites the backup of your original Zones
+  Config.
+- **Fixed: Refresh Zones From Panel during a pending migration stopped it
+  completing.**
+- **Fixed: a save interrupted by a reload lost every rename since the
+  migration.** Saves now alternate between two copies, so an incomplete save
+  falls back to the previous one. Stores written by v47 are still read.
+
+**Performance** (see `docs/PERFORMANCE.md`)
+
+- The exit-delay refresh timer no longer leaks on a reconnect or a Partitions
+  Config edit.
+- Recent Activity is written once per burst instead of once per log line.
+- An unchanged partition state is not re-sent or re-logged. A full
+  arm/disarm cycle went from 85 Director calls to 69.
+
+**Tests**
+
+- 34 new regression tests, one or more per finding. The suite now runs under
+  Lua 5.1, the controller's version (four tests used `\x` escapes that 5.1
+  does not have), and `build.sh` prefers `lua5.1`.
+
 ## v47 — the partition no longer gets stuck Offline after a restart
 
 Field report: after a Director restart the app showed **Trouble created →

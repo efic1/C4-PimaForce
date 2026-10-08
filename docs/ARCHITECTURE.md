@@ -185,6 +185,23 @@ would win and the rename would look like it did nothing. Commas
 and semicolons in a name are replaced with spaces -- they are the field and
 record separators and there is no escape syntax to read back.
 
+### Which socket is the panel (v48)
+
+The panel keeps one connection per CMS path, and a half-open session (see
+the watchdog below) never reports a close, so a reconnect on a new socket has
+to be able to replace the old session. Through v47 the newest socket replaced
+it the moment it **opened**. Anything that touched the listen port -- a port
+scan, a network probe -- therefore ended a healthy session: Connection Lost,
+Offline, arm/disarm refused until the panel's next frame.
+
+Since v48, while a verified session is live, a new socket is a *candidate*.
+Its bytes are buffered separately and never touch the live session. The first
+frame it sends with the configured account makes it the session (the panel
+does this at once on a real reconnect); wrong-account frames count towards
+blocking it, as before. With no verified session the newest socket is adopted
+at once, as before. Blocked sockets are checked before anything else, so they
+cannot de-verify the panel.
+
 ### The link watchdog (v16) -- "Connected" for a panel that is gone
 
 `OnServerConnectionStatusChanged` was the only thing that moved

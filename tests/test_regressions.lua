@@ -275,6 +275,13 @@ function advanceClock(ms)
   now = now + ms
 end
 
+-- Recent Activity is written on a short timer since v48 (one property write
+-- per burst). Fire it, as two seconds passing would, and return the value.
+function activityProp()
+  if RecentActivityFlushTimerId then OnTimerExpired(RecentActivityFlushTimerId) end
+  return Properties['Recent Activity']
+end
+
 local function proxyCalls(binding, cmd)
   local out = {}
   for _, c in ipairs(calls.SendToProxy) do
@@ -495,10 +502,11 @@ end)
 section('Transport: connection trust')
 --=============================================================================
 
--- Connection policy: NEWEST WINS. The panel keeps one connection per CMS
--- path and reconnects on a new socket; a "first verified session wins" rule
--- locks the driver onto a dead socket after a half-open drop. Trust is
--- enforced by the account check, not by which socket arrived first.
+-- Connection policy: NEWEST *PROVEN* SOCKET WINS (v48). The panel keeps one
+-- connection per CMS path and reconnects on a new socket; a "first verified
+-- session wins" rule locks the driver onto a dead socket after a half-open
+-- drop. But a socket that merely opens (a port scan) must not end a live
+-- session: a newcomer takes over once it presents the configured account.
 
 test('the panel reconnecting on a new handle is picked up, not ignored', function()
   freshDriver()
@@ -507,14 +515,13 @@ test('the panel reconnecting on a new handle is picked up, not ignored', functio
   -- Panel reconnects on a new socket without the old one ever reporting
   -- OFFLINE (half-open: power cut, network path died).
   OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
-  assert(ConnHandle == 2, 'the driver must follow the panel to its new socket')
-  assert(not PanelVerified, 'the new session must re-verify before being trusted')
+  assert(ConnHandle == 1 and PanelVerified, 'a socket that only opened has proved nothing yet')
   calls.FireEvent = {}
   OnServerDataIn(2, '{"frame_type":"event","counter":905,"account":"1234","type":760,"qualifier":1,"zone":1,"partition":1}', '10.0.0.50', 5555)
   local fired = false
   for _, e in ipairs(calls.FireEvent) do if e == 'Zone Opened' then fired = true end end
   assert(fired, 'traffic on the new session must be processed once verified')
-  assert(PanelVerified)
+  assert(PanelVerified and ConnHandle == 2, 'the driver must follow the panel to its new socket')
 end)
 
 test('a replaced session is announced so the churn is visible in the log', function()
@@ -522,6 +529,7 @@ test('a replaced session is announced so the churn is visible in the log', funct
   connectPanel(1)
   local logs = withCapturedLogs(function()
     OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
+    OnServerDataIn(2, '{"frame_type":"null","account":"1234","counter":2}', '10.0.0.50', 5555)
   end)
   local announced = false
   for _, l in ipairs(logs) do
@@ -533,11 +541,12 @@ end)
 test('an unverified connection is still never sent a user code', function()
   freshDriver()
   connectPanel(1)
-  OnServerConnectionStatusChanged(2, 7780, 'ONLINE')   -- unverified takes the slot
+  OnServerConnectionStatusChanged(2, 7780, 'ONLINE')   -- unverified newcomer
   calls.ServerSend = {}
   ArmPartition(1, 'away')
-  for _, f in ipairs(wireFrames()) do
-    assert(not (f and f.password),
+  for _, sent in ipairs(calls.ServerSend) do
+    local f = JSON.decode(sent[2])
+    assert(not (sent[1] == 2 and f and f.password),
       'no credential may go to a connection that has not presented the account')
   end
 end)
@@ -1115,8 +1124,9 @@ test('disarming during a burglary alarm survives the alarm restoring', function(
   assert(Properties['Partition 1 State'] == 'Alarm')
   -- User disarms while the siren is going.
   OnServerDataIn(h, '{"frame_type":"event","counter":901,"account":"1234","type":401,"qualifier":1,"zone":0,"partition":1}', '10.0.0.50', 5555)
-  calls.SendToProxy = {}
-  -- Alarm restores.
+  -- Alarm restores. (Since v48 the disarm itself clears the burglary alarm,
+  -- so the restore changes nothing and sends nothing; the last state the
+  -- widget was given is the one to check.)
   OnServerDataIn(h, '{"frame_type":"event","counter":902,"account":"1234","type":130,"qualifier":3,"zone":3,"partition":1}', '10.0.0.50', 5555)
   assert(Properties['Partition 1 State'] == 'Disarmed',
     'the house is disarmed; the alarm restoring must not resurrect "Armed Away", got ' ..
@@ -1489,7 +1499,7 @@ test('an alarm is recorded in Recent Activity without any log window open', func
   freshDriver()   -- Info level, nobody watching
   local h = connectPanel()
   OnServerDataIn(h, '{"frame_type":"event","counter":700,"account":"1234","type":130,"qualifier":1,"zone":3,"partition":1}', '10.0.0.50', 5555)
-  local activity = Properties['Recent Activity'] or ''
+  local activity = activityProp() or ''
   assert(activity:find('BURGLARY ALARM', 1, true),
     'the single most important event to find after the fact must be recorded: ' .. activity)
   assert(activity:find('zone 3', 1, true), 'and should say which zone')
@@ -1501,7 +1511,7 @@ test('fire, trouble and disarm events are all recorded', function()
   OnServerDataIn(h, '{"frame_type":"event","counter":710,"account":"1234","type":110,"qualifier":1,"zone":5,"partition":1}', '10.0.0.50', 5555)
   OnServerDataIn(h, '{"frame_type":"event","counter":711,"account":"1234","type":301,"qualifier":1,"zone":0,"partition":1}', '10.0.0.50', 5555)
   OnServerDataIn(h, '{"frame_type":"event","counter":712,"account":"1234","type":401,"qualifier":1,"zone":0,"partition":1}', '10.0.0.50', 5555)
-  local a = Properties['Recent Activity'] or ''
+  local a = activityProp() or ''
   assert(a:find('FIRE ALARM', 1, true), 'fire alarm missing: ' .. a)
   assert(a:find('AC power lost', 1, true), 'AC loss missing: ' .. a)
   assert(a:find('disarmed', 1, true), 'disarm missing: ' .. a)
@@ -1511,7 +1521,7 @@ test('Recent Activity is newest-first and bounded', function()
   freshDriver()
   connectPanel()
   for i = 1, 40 do LogInfo('event number ' .. i) end
-  local a = Properties['Recent Activity'] or ''
+  local a = activityProp() or ''
   local lines = {}
   for line in a:gmatch('[^\n]+') do lines[#lines+1] = line end
   assert(#lines <= 25, 'the buffer must stay bounded, got ' .. #lines .. ' lines')
@@ -1524,7 +1534,7 @@ test('Recent Activity redacts, and a huge message cannot bloat the property', fu
   connectPanel()
   LogInfo('sending {"password":"1111"} to the panel')
   LogInfo(string.rep('x', 5000))
-  local a = Properties['Recent Activity'] or ''
+  local a = activityProp() or ''
   assert(not a:find('1111', 1, true), 'Recent Activity leaked a user code')
   for line in a:gmatch('[^\n]+') do
     assert(#line < 200, 'a single entry must be truncated, got ' .. #line .. ' chars')
@@ -1754,14 +1764,14 @@ test('non-JSON data from the panel is reported, not silently swallowed', functio
   logs = withCapturedLogs(function()
     OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
     -- Contact-ID-over-IP style binary, i.e. the CMS path set to the wrong protocol.
-    OnServerDataIn(1, '\x01\x02\x18\x34\x56\x78\xFF', '10.0.0.50', 5555)
+    OnServerDataIn(1, '\001\002\024\052\086\120\255', '10.0.0.50', 5555)
   end)
   local warned = false
   for _, l in ipairs(logs) do
     if l:find('not the JSON protocol', 1, true) then warned = true end
   end
   assert(warned, 'unparseable data must produce an actionable warning, got: ' .. table.concat(logs, ' | '))
-  local activity = Properties['Recent Activity'] or ''
+  local activity = activityProp() or ''
   assert(activity:find('not the JSON protocol', 1, true),
     'and it must land in Recent Activity where the installer will find it')
 end)
@@ -1772,7 +1782,7 @@ test('SIA DC-09 is named precisely, with the account the panel is using', functi
     OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
     -- A real capture from a PIMA panel left on Contact ID instead of JSON.
     OnServerDataIn(1,
-      '\x0A1F180041"ADM-CID"0003R1L0#111111[#111111|1306 01 000]_16:58:04,09-04-2026\x0D',
+      '\0101F180041"ADM-CID"0003R1L0#111111[#111111|1306 01 000]_16:58:04,09-04-2026\013',
       '192.168.1.156', 10077)
   end)
   local named, gaveAccount, saidReportOnly = false, false, false
@@ -1790,7 +1800,7 @@ test('the DC-09 heartbeat frame is recognised too', function()
   freshDriver()
   local logs = withCapturedLogs(function()
     OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
-    OnServerDataIn(1, '\x0A6D7E002B"NULL"0001R1L0#111111[]_16:59:43,09-04-2026\x0D',
+    OnServerDataIn(1, '\0106D7E002B"NULL"0001R1L0#111111[]_16:59:43,09-04-2026\013',
       '192.168.1.156', 10077)
   end)
   local named = false
@@ -1804,10 +1814,10 @@ test('DetectDC09 does not misfire on JSON or on arbitrary binary', function()
   freshDriver()
   assert(DetectDC09('{"frame_type":"null","account":"1234"}') == nil,
     'a JSON frame must never be reported as DC-09')
-  assert(DetectDC09('\xAA\xBB\xCC') == nil, 'random binary is not DC-09')
+  assert(DetectDC09('\170\187\204') == nil, 'random binary is not DC-09')
   assert(DetectDC09('') == nil)
   assert(DetectDC09(nil) == nil)
-  local token, acct = DetectDC09('\x0A1F180041"ADM-CID"0003R1L0#111111[]_x\x0D')
+  local token, acct = DetectDC09('\0101F180041"ADM-CID"0003R1L0#111111[]_x\013')
   assert(token == 'ADM-CID' and acct == '111111', 'got ' .. tostring(token) .. '/' .. tostring(acct))
 end)
 
@@ -1815,7 +1825,7 @@ test('the raw byte trace shows what actually arrived', function()
   freshDriver({ ['Log Level'] = 'Debug' })
   local logs = withCapturedLogs(function()
     OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
-    OnServerDataIn(1, '\x00\x01ABC', '10.0.0.50', 5555)
+    OnServerDataIn(1, '\000\001ABC', '10.0.0.50', 5555)
   end)
   local sawRaw = false
   for _, l in ipairs(logs) do
@@ -1828,7 +1838,7 @@ test('the unparseable warning fires once per connection, not per packet', functi
   freshDriver()
   local logs = withCapturedLogs(function()
     OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
-    for i = 1, 25 do OnServerDataIn(1, '\xFF\xFE', '10.0.0.50', 5555) end
+    for i = 1, 25 do OnServerDataIn(1, '\255\254', '10.0.0.50', 5555) end
   end)
   local count = 0
   for _, l in ipairs(logs) do
@@ -1942,7 +1952,8 @@ test('an IP address argument is never mistaken for the payload', function()
   OnServerConnectionStatusChanged(1, 7780, 'ONLINE')
   -- Non-JSON payload, so the JSON shortcut cannot help; the IPv4 literal
   -- must still be rejected as a payload candidate.
-  OnServerDataIn(1, '10.0.0.50', 5555, '\xAA\xBB\xCC\xDD')
+  OnServerDataIn(1, '10.0.0.50', 5555, '\170\187\204\221')
+  activityProp()
   local raw = nil
   for _, c in ipairs(calls.UpdateProperty) do
     if c[1] == 'Recent Activity' then raw = c[2] end
@@ -2866,7 +2877,7 @@ test('the store survives a controller that decodes JSON on read (v44)', function
   assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'the migration must complete')
   assert(Properties['Zones Config'] == '2,,motion;3,,,2', 'and shorten Zones Config, got: ' ..
     tostring(Properties['Zones Config']))
-  assert(Persisted[ZONE_STORE_KEY]:sub(1, #PERSIST_BLOB_PREFIX) == PERSIST_BLOB_PREFIX,
+  assert(Persisted[ZONE_STORE_KEY]:sub(1, #PERSIST_BLOB2_PREFIX) == PERSIST_BLOB2_PREFIX,
     'the store is written as an opaque blob, not JSON a controller would decode')
 end)
 
@@ -3411,9 +3422,9 @@ end)
 test('Recent Activity shows only the newest few; the full buffer is kept', function()
   freshDriver()
   for i = 1, 20 do RecordActivity('event ' .. i) end
-  local shown = select(2, (Properties['Recent Activity'] or ''):gsub('\n', '\n')) + 1
+  local shown = select(2, (activityProp() or ''):gsub('\n', '\n')) + 1
   assert(shown == RECENT_ACTIVITY_SHOWN, 'expected ' .. RECENT_ACTIVITY_SHOWN .. ' lines, got ' .. shown)
-  assert(Properties['Recent Activity']:find('event 20', 1, true), 'newest first')
+  assert(activityProp():find('event 20', 1, true), 'newest first')
   assert(#RecentActivity >= 20, 'the buffer itself is not shortened')
   local logs = withCapturedLogs(function() ExecuteCommand('List Recent Activity', {}) end)
   assert(table.concat(logs, '\n'):find('event 1', 1, true), 'the full buffer is printable')
@@ -3850,8 +3861,8 @@ test('the properties panel is never handed multi-kilobyte values', function()
   for i = 1, 40 do
     RecordActivity(string.rep('x', 400) .. ' event ' .. i)
   end
-  assert(#Properties['Recent Activity'] < 3500,
-    'Recent Activity must stay small; it is ' .. #Properties['Recent Activity'] .. ' bytes')
+  assert(#activityProp() < 3500,
+    'Recent Activity must stay small; it is ' .. #activityProp() .. ' bytes')
 
   local names = {}
   for i = 1, 60 do names[i] = 'A rather long zone name number ' .. i end
@@ -4071,7 +4082,7 @@ test('a burst of zone open/close never displaces arm/disarm/alarm from Recent Ac
   -- A burglary alarm goes in...
   OnServerDataIn(h, '{"frame_type":"event","counter":300,"account":"1234","type":130,"qualifier":1,"zone":0,"partition":1}',
     '10.0.0.50', 5555)
-  assert(Properties['Recent Activity']:find('BURGLARY ALARM'), 'precondition: the alarm must be recorded')
+  assert(activityProp():find('BURGLARY ALARM'), 'precondition: the alarm must be recorded')
 
   -- ...then 40 zones open and close, one event per zone.
   local counter = 301
@@ -4086,10 +4097,10 @@ test('a burst of zone open/close never displaces arm/disarm/alarm from Recent Ac
     counter = counter + 1
   end
 
-  assert(Properties['Recent Activity']:find('BURGLARY ALARM'),
-    '80 zone events must not evict the alarm entry: ' .. Properties['Recent Activity'])
-  assert(not Properties['Recent Activity']:find('[Zz]one 1 '),
-    'zone open/close text must never appear in this property at all: ' .. Properties['Recent Activity'])
+  assert(activityProp():find('BURGLARY ALARM'),
+    '80 zone events must not evict the alarm entry: ' .. activityProp())
+  assert(not activityProp():find('[Zz]one 1 '),
+    'zone open/close text must never appear in this property at all: ' .. activityProp())
 end)
 
 test('arm and disarm are recorded in Recent Activity', function()
@@ -4100,13 +4111,13 @@ test('arm and disarm are recorded in Recent Activity', function()
   -- Local disarm event (CID 401-family), then an arm.
   OnServerDataIn(handle, '{"frame_type":"event","counter":400,"account":"1234","type":401,"qualifier":1,"zone":0,"partition":1}',
     '10.0.0.50', 5555)
-  assert(Properties['Recent Activity']:find('disarmed'),
-    'a disarm must be recorded: ' .. Properties['Recent Activity'])
+  assert(activityProp():find('disarmed'),
+    'a disarm must be recorded: ' .. activityProp())
   OnServerDataIn(handle, '{"frame_type":"event","counter":401,"account":"1234","type":401,"qualifier":3,"zone":0,"partition":1}',
     '10.0.0.50', 5555)
   answerSyncQueries(handle, 3)                 -- the follow-up mode query
-  assert(Properties['Recent Activity']:find('Armed'),
-    'an arm must be recorded too: ' .. Properties['Recent Activity'])
+  assert(activityProp():find('Armed'),
+    'an arm must be recorded too: ' .. activityProp())
 end)
 
 
@@ -5695,6 +5706,479 @@ test('driver.xml points the Documentation tab at a file that exists', function()
     'and state the same version as driver.xml')
   assert(not html:find('src="http', 1, true) and not html:find('href="http[^"]*%.css') and
     not html:find('<script', 1, true), 'and be self-contained: no remote stylesheet or script')
+end)
+
+--=============================================================================
+section('v48: fixes from the v47 code review')
+--=============================================================================
+
+local function ev48(h, c, t, q, z, p)
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"event","counter":%d,"account":"1234","type":%d,"qualifier":%d,"zone":%d,"partition":%d}',
+    c, t, q, z, p), '10.0.0.50', 5555)
+end
+local function firedCount(name)
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == name then n = n + 1 end end
+  return n
+end
+local AWAY = 'Armed ' .. ARM_LABEL_AWAY
+
+-- Fix-first 1 ---------------------------------------------------------------
+
+test('a burglary alarm fires Any Alarm with the zone in ALERT_TEXT (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, AWAY)
+  calls.FireEvent = {}
+  ev48(h, 700, 130, 1, 1, 1)
+  assert(firedCount('Any Alarm') == 1, 'Any Alarm must fire for an intrusion: ' .. table.concat(calls.FireEvent, ' | '))
+  assert(firedCount('Partition 1 Alarm') == 1, 'the specific event still fires')
+  assert(Variables['ALERT_TYPE'] == 'Burglary', tostring(Variables['ALERT_TYPE']))
+  assert(Variables['ALERT_TEXT']:find('Front Door', 1, true), tostring(Variables['ALERT_TEXT']))
+  calls.FireEvent = {}
+  ev48(h, 701, 130, 3, 1, 1)
+  assert(firedCount('Any Alarm') == 0, 'a restore is not an alarm')
+end)
+
+test('a burglary alarm with no partition still fires Any Alarm (v48)', function()
+  freshDriver(); local h = connectPanel()
+  calls.FireEvent = {}
+  ev48(h, 702, 130, 1, 7, 0)
+  assert(firedCount('Any Alarm') == 1, table.concat(calls.FireEvent, ' | '))
+end)
+
+-- Fix-first 2 ---------------------------------------------------------------
+
+test('an arm event whose mode query still reads Disarmed is not reported as a disarm (v48)', function()
+  local h = armAndAck(nil, 60)
+  calls.FireEvent = {}
+  PostOperationGuardUntil = 0
+  ev48(h, 901, 401, 3, 0, 1)        -- panel reports the arm at the START of its exit delay
+  answerSyncQueries(h, 2)           -- and still reads Disarmed
+  assert(firedCount('Partition 1 Disarmed') == 0, 'fired Disarmed off an ARM event: ' .. table.concat(calls.FireEvent, ' | '))
+  assert(EffectivePartitionState(1):find('^Exit Delay'), 'countdown must survive: ' .. tostring(EffectivePartitionState(1)))
+  assert(ArmRecheck[1], 'the driver must ask again later')
+end)
+
+test('a keypad arm that reads Disarmed at first is re-checked and reported once armed (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed'); calls.FireEvent = {}
+  ev48(h, 902, 401, 3, 0, 1)
+  answerSyncQueries(h, 2)
+  assert(firedCount('Partition 1 Disarmed') == 0, 'no Disarmed event for an arm event')
+  assert(ArmRecheck[1] and ArmRecheck[1].timerId, 'a re-check must be scheduled')
+  OnTimerExpired(ArmRecheck[1].timerId)
+  answerSyncQueries(h, 3)
+  assert(EffectivePartitionState(1) == AWAY, tostring(EffectivePartitionState(1)))
+  assert(firedCount('Partition 1 ' .. AWAY) == 1, 'the arm event fires once the mode is known: ' .. table.concat(calls.FireEvent, ' | '))
+  assert(ArmRecheck[1] == nil, 'and the re-check stops')
+end)
+
+test('an arm that never completes stops re-checking without inventing an event (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed'); calls.FireEvent = {}
+  ev48(h, 903, 401, 3, 0, 1)
+  answerSyncQueries(h, 2)
+  for _ = 1, 10 do
+    if not ArmRecheck[1] then break end
+    OnTimerExpired(ArmRecheck[1].timerId)
+    answerSyncQueries(h, 2)
+  end
+  assert(ArmRecheck[1] == nil, 're-checks must be bounded')
+  assert(EffectivePartitionState(1) == 'Disarmed', 'the panel says Disarmed: ' .. tostring(EffectivePartitionState(1)))
+  assert(firedCount('Partition 1 Disarmed') == 0 and firedCount('Partition 1 Armed') == 0,
+    'no programming event for an arm that did not happen: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
+test('a disarm event cancels a pending arm re-check (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed')
+  ev48(h, 904, 401, 3, 0, 1)
+  answerSyncQueries(h, 2)
+  local id = ArmRecheck[1] and ArmRecheck[1].timerId
+  assert(id)
+  ev48(h, 905, 401, 1, 0, 1)
+  assert(ArmRecheck[1] == nil and timers[id] == nil, 'the re-check timer must be killed')
+end)
+
+-- Fix-first 3 ---------------------------------------------------------------
+
+test('disarming during a burglary alarm clears it even with no restore (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, AWAY)
+  ev48(h, 910, 130, 1, 3, 1)
+  assert(EffectivePartitionState(1) == 'Alarm')
+  ev48(h, 911, 401, 1, 0, 1)
+  assert(EffectivePartitionState(1) == 'Disarmed', 'still ' .. tostring(EffectivePartitionState(1)))
+  assert(lastPartitionState().STATE == 'DISARMED_READY')
+  calls.FireEvent = {}
+  ev48(h, 912, 130, 3, 3, 1)        -- a late restore is harmless
+  assert(EffectivePartitionState(1) == 'Disarmed')
+end)
+
+test('a disarm does not clear a fire alarm (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, AWAY)
+  ev48(h, 913, 110, 1, 5, 1)
+  ev48(h, 914, 401, 1, 0, 1)
+  assert(EffectivePartitionState(1) == 'Alarm', 'fire stays until the panel restores it')
+end)
+
+-- Fix-first 4 ---------------------------------------------------------------
+
+test('an exit delay ending with an unrecognised value schedules a retry (v48)', function()
+  local h = armAndAck(nil, 60)
+  PartitionStatusFor(1).base = 'Disarmed'
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  answerSyncQueries(h, 50)
+  assert(EffectivePartitionState(1) == 'Unknown')
+  assert(PartitionResyncTimerId ~= nil, 'Unknown with no retry')
+end)
+
+test('an exit delay ending with "not exist" schedules a retry (v48)', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  answerSyncQueries(h, 1)
+  assert(PartitionResyncTimerId ~= nil)
+end)
+
+test('a retry answered with an unrecognised value keeps retrying, and logs once (v48)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  timeOutInFlight()
+  assert(PartitionResyncTimerId)
+  local errors = 0
+  for _ = 1, 3 do
+    calls.ServerSend = {}; PostOperationGuardUntil = 0
+    local logs = withCapturedLogs(function()
+      OnTimerExpired(PartitionResyncTimerId)
+      answerSyncQueries(h, 50)
+    end)
+    for _, l in ipairs(logs) do if l:find('ERROR', 1, true) and l:find('system key 50', 1, true) then errors = errors + 1 end end
+    assert(PartitionResyncTimerId ~= nil, 'retries stopped while still Unknown')
+  end
+  assert(errors == 1, 'the same unrecognised value is logged as an error once, got ' .. errors)
+end)
+
+-- Fix-first 5 ---------------------------------------------------------------
+
+local HB48 = '{"frame_type":"null","account":"1234","counter":%d}'
+
+test('a port scan does not drop the verified panel session (v48)', function()
+  freshDriver(); connectPanel(1)
+  calls.FireEvent = {}
+  OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
+  OnServerConnectionStatusChanged(2, 7780, 'OFFLINE')
+  assert(ConnHandle == 1 and PanelVerified, 'session lost: handle ' .. tostring(ConnHandle))
+  assert(firedCount('Panel Connection Lost') == 0)
+  assert(Properties['Connection Status'] == 'Connected', tostring(Properties['Connection Status']))
+  local errs = {}
+  SendOperation(1, 17, 0, nil, function(f, e) errs[#errs + 1] = e end)
+  assert(errs[1] == nil, 'a disarm must still go out: ' .. tostring(errs[1]))
+end)
+
+test('a stray client sending garbage cannot de-verify the panel (v48)', function()
+  freshDriver(); connectPanel(1)
+  OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
+  OnServerDataIn(2, 'GET / HTTP/1.1\r\n\r\n', '1.2.3.4', 5555)
+  OnServerDataIn(2, '{"frame_type":"null","account":"9999","counter":1}', '1.2.3.4', 5555)
+  assert(ConnHandle == 1 and PanelVerified, 'verified session must survive')
+end)
+
+test('a blocked client cannot de-verify the panel (v48)', function()
+  freshDriver(); connectPanel(1)
+  for i = 1, 6 do OnServerDataIn(2, '{"frame_type":"null","account":"9999","counter":' .. i .. '}', '1.2.3.4', 5555) end
+  assert(BlockedHandles[2], 'the wrong-account client is blocked')
+  OnServerDataIn(2, 'x', '1.2.3.4', 5555)
+  assert(ConnHandle == 1 and PanelVerified)
+end)
+
+test('the panel reconnecting on a new socket takes over, with the watchdog running (v48)', function()
+  freshDriver(); connectPanel(1)
+  OnServerConnectionStatusChanged(2, 7780, 'ONLINE')
+  assert(ConnHandle == 1, 'a silent new socket is not trusted yet')
+  OnServerDataIn(2, HB48:format(5), '10.0.0.50', 5555)
+  assert(ConnHandle == 2 and PanelVerified, 'the panel proved itself on the new socket')
+  assert(LinkWatchdogTimerId and timers[LinkWatchdogTimerId], 'watchdog must be running')
+  calls.FireEvent = {}
+  OnServerDataIn(1, 'late-bytes', '10.0.0.50', 5555)
+  OnServerConnectionStatusChanged(1, 7780, 'OFFLINE')
+  assert(ConnHandle == 2 and PanelVerified, 'the old socket closing does not end the new session')
+  assert(firedCount('Panel Connection Lost') == 0)
+end)
+
+test('a half-open old session is still replaced when the panel reconnects (v48)', function()
+  freshDriver(); connectPanel(1)
+  advanceClock(10 * 60 * 1000)      -- old socket silently dead
+  OnServerConnectionStatusChanged(3, 7780, 'ONLINE')
+  OnServerDataIn(3, HB48:format(9), '10.0.0.50', 5555)
+  assert(ConnHandle == 3 and PanelVerified)
+end)
+
+-- High 6/7/8: zone store ---------------------------------------------------
+
+test('a reload before "done" lands does not re-migrate an overrides-only config (v48)', function()
+  upgradeUnsettled(LEGACY)
+  commitPersist()
+  OnTimerExpired(PersistVerifyTimerId)          -- verify passes; Finish writes 'done' (deferred)
+  local cfg = Properties['Zones Config']
+  assert(cfg == '2,,motion;3,,,2', tostring(cfg))
+  PersistPending = {}                           -- reload before 'done' becomes readable
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = cfg })
+  KeepPersisted = false
+  assert(Zones[1] and Zones[1].name == 'דלת כניסה', 'name lost: ' .. tostring(Zones[1] and Zones[1].name))
+  assert(PersistGet(ZONE_BACKUP_KEY) == LEGACY, 'the backup must never be overwritten')
+  assert(Properties['Zones Config'] == cfg)
+  local h = connectPanel()
+  runDiscovery(h, { 'P1', 'P2', 'P3', 'P4' })
+  assert(Zones[1] and Zones[4], 'no zone may be hidden')
+end)
+
+test('a refresh while the migration is pending does not stop it completing (v48)', function()
+  upgradeUnsettled(LEGACY)
+  local h = connectPanel()
+  PostOperationGuardUntil = 0
+  local realSettle = settlePersist
+  settlePersist = function() end
+  runDiscovery(h, { 'a', 'b', 'c', 'd' })
+  settlePersist = realSettle
+  settlePersist()
+  assert(PersistGet(ZONE_MIGRATION_KEY) == 'done', 'migration did not complete')
+end)
+
+test('a half-written store falls back to the last complete one, not the original backup (v48)', function()
+  upgradeFrom(LEGACY)
+  RenameZoneFromApp(1, 'First Rename')
+  settlePersist()
+  RenameZoneFromApp(1, 'Second Rename')
+  -- Only the new parts land before the reload; the header does not.
+  for k, e in pairs(PersistPending) do if k:find('%.part') then Persisted[k] = e.v end end
+  PersistPending = {}
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = Properties['Zones Config'] })
+  KeepPersisted = false
+  assert(Zones[1].name == 'First Rename', 'got ' .. tostring(Zones[1].name))
+end)
+
+test('a header that landed without its parts falls back too (v48)', function()
+  upgradeFrom(LEGACY)
+  RenameZoneFromApp(1, 'First Rename')
+  settlePersist()
+  RenameZoneFromApp(1, 'Second Rename')
+  for k, e in pairs(PersistPending) do if not k:find('%.part') then Persisted[k] = e.v end end
+  PersistPending = {}
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = Properties['Zones Config'] })
+  KeepPersisted = false
+  assert(Zones[1].name == 'First Rename', 'got ' .. tostring(Zones[1].name))
+end)
+
+test('a v47 store (single-generation blob) is still read (v48)', function()
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '2,,motion'
+  mockC4()
+  dofile('driver.lua')
+  local text = EncodeZoneStore({ [1] = { name = 'Front', from = 'panel' }, [2] = { name = 'Kitchen', from = 'app' } })
+  local b64 = Base64Encode(text)
+  Persisted[ZONE_STORE_KEY .. '.part1'] = PERSIST_PART_PREFIX .. b64
+  Persisted[ZONE_STORE_KEY] = PERSIST_BLOB_PREFIX .. '1:' .. #text .. ':' .. PersistChecksum(text)
+  local d = Base64Encode('done')
+  Persisted[ZONE_MIGRATION_KEY .. '.part1'] = PERSIST_PART_PREFIX .. d
+  Persisted[ZONE_MIGRATION_KEY] = PERSIST_BLOB_PREFIX .. '1:4:' .. PersistChecksum('done')
+  Variables = {}; VariableTypes = {}
+  SYSTEM_KEY_DISARMED[97] = true
+  OnDriverInit(); OnDriverLateInit(); drainZonePublish(); settlePersist()
+  assert(Zones[1].name == 'Front' and Zones[2].name == 'Kitchen' and Zones[2].type == 'motion')
+  RenameZoneFromApp(2, 'Kitchen 2'); settlePersist()
+  KeepPersisted = true
+  freshDriver({ ['Zones Config'] = '2,,motion' })
+  KeepPersisted = false
+  assert(Zones[2].name == 'Kitchen 2', 'a store rewritten in the new format reads back')
+end)
+
+-- High 9: variables ---------------------------------------------------------
+
+test('PARTITION_n variables follow alarms, restores and arming (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, AWAY)
+  ev48(h, 920, 130, 1, 3, 1)
+  assert(Variables['PARTITION_1_STATE'] == 'Alarm', tostring(Variables['PARTITION_1_STATE']))
+  assert(Variables['PARTITION_1_ARMED'] == 'true', 'an armed house in alarm is still armed')
+  ev48(h, 921, 401, 1, 0, 1)
+  assert(Variables['PARTITION_1_STATE'] == 'Disarmed' and Variables['PARTITION_1_ARMED'] == 'false')
+end)
+
+test('PARTITION_n variables leave "Exit Delay" when the delay ends unanswered (v48)', function()
+  local h = armAndAck(nil, 60)
+  PostOperationGuardUntil = 0
+  ev48(h, 940, 401, 3, 0, 1); answerSyncQueries(h, 3)
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)
+  timeOutInFlight()
+  assert(Variables['PARTITION_1_STATE'] == AWAY, tostring(Variables['PARTITION_1_STATE']))
+  assert(Variables['PARTITION_1_ARMED'] == 'true')
+end)
+
+-- High 10 -------------------------------------------------------------------
+
+test('a stale end-of-delay answer does not cancel a newer countdown (v48)', function()
+  local h = armAndAck(nil, 60)
+  local e = PartitionStatusFor(1).exit
+  PostOperationGuardUntil = 0
+  OnTimerExpired(e.timerId)               -- 2310 query now in flight
+  local staleCounter = InFlight.counter
+  calls.ServerSend = {}
+  ArmPartition(1, 'away')                 -- the user re-arms before it is answered
+  local op = operations()[1]
+  OnServerDataIn(h, string.format('{"frame_type":"ACK","account":1234,"counter":%d,"kc":1}', op.counter), '10.0.0.50', 5555)
+  local newExit = PartitionStatusFor(1).exit
+  assert(newExit and newExit ~= e and not newExit.elapsed, 'precondition: a new countdown')
+  calls.SendToProxy = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format('{"frame_type":"DATA","account":1234,"counter":%d,"id":2310,"start_order":1,"parameters":["2"]}', staleCounter), '10.0.0.50', 5555)
+  assert(PartitionStatusFor(1).exit == newExit, 'the new countdown was cancelled')
+  assert(#proxyCalls(5002, 'ARM_FAILED') == 0, 'ARM_FAILED sent for the new arm')
+end)
+
+-- High 11 -------------------------------------------------------------------
+
+test('a fire alarm with no partition reaches every partition, and its restore clears it (v48)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, AWAY); SetPartitionState(2, 'Disarmed')
+  ev48(h, 960, 110, 1, 5, 0)
+  assert(EffectivePartitionState(1) == 'Alarm' and EffectivePartitionState(2) == 'Alarm',
+    tostring(EffectivePartitionState(1)) .. '/' .. tostring(EffectivePartitionState(2)))
+  ev48(h, 961, 110, 3, 5, 0)
+  assert(EffectivePartitionState(1) == AWAY and EffectivePartitionState(2) == 'Disarmed')
+end)
+
+-- Performance ---------------------------------------------------------------
+
+test('a disconnect during the exit delay kills the repeating refresh timer (v48)', function()
+  local h = armAndAck({ ['Exit Delay Refresh Seconds'] = '5' }, 60)
+  local tick = PartitionStatusFor(1).exit.tickId
+  assert(tick)
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  assert(timers[tick] == nil and ExitDelayTicks[tick] == nil, 'repeating tick timer leaked')
+end)
+
+test('a Partitions Config edit during the exit delay kills the refresh timer (v48)', function()
+  local h = armAndAck({ ['Exit Delay Refresh Seconds'] = '5' }, 60)
+  local tick = PartitionStatusFor(1).exit.tickId
+  Properties['Partitions Config'] = '1,Main,1111,ASN'
+  OnPropertyChanged('Partitions Config')
+  assert(timers[tick] == nil and ExitDelayTicks[tick] == nil, 'repeating tick timer leaked')
+end)
+
+test('Recent Activity is written once per burst, not once per log line (v48)', function()
+  freshDriver()
+  calls.UpdateProperty = {}
+  for i = 1, 10 do LogInfo('burst line ' .. i) end
+  local writes = 0
+  for _, u in ipairs(calls.UpdateProperty) do if u[1] == 'Recent Activity' then writes = writes + 1 end end
+  assert(writes == 0, 'written ' .. writes .. ' times inline')
+  assert(RecentActivityFlushTimerId, 'a flush is scheduled')
+  OnTimerExpired(RecentActivityFlushTimerId)
+  writes = 0
+  for _, u in ipairs(calls.UpdateProperty) do if u[1] == 'Recent Activity' then writes = writes + 1 end end
+  assert(writes == 1 and Properties['Recent Activity']:find('burst line 10', 1, true))
+end)
+
+test('an unchanged partition state is not re-sent to the proxy (v48)', function()
+  freshDriver(); connectPanel()
+  SetPartitionState(1, AWAY)
+  calls.SendToProxy = {}
+  local logs = withCapturedLogs(function() SetPartitionState(1, AWAY) end)
+  assert(#calls.SendToProxy == 0, 'sent ' .. #calls.SendToProxy .. ' proxy calls for no change')
+  assert(#logs == 0, 'logged ' .. #logs .. ' lines for no change: ' .. tostring(logs[1]))
+  SetPartitionState(1, 'Disarmed')
+  assert(#proxyCalls(5002, 'PARTITION_STATE') == 1, 'a real change still goes out')
+end)
+
+test('the exit-delay refresh still re-sends the remaining time (v48)', function()
+  local h = armAndAck({ ['Exit Delay Refresh Seconds'] = '5' }, 60)
+  local tick = PartitionStatusFor(1).exit.tickId
+  calls.SendToProxy = {}
+  advanceClock(5000)
+  OnTimerExpired(tick)
+  local st = lastPartitionState()
+  assert(st and st.STATE == 'EXIT_DELAY' and st.DELAY_TIME_REMAINING == 55, 'remaining not refreshed')
+end)
+
+test('an unanswered arm re-check does not claim Armed (v48 review)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed'); calls.FireEvent = {}
+  ev48(h, 990, 401, 3, 0, 1)
+  answerSyncQueries(h, 2)
+  PostOperationGuardUntil = 0
+  OnTimerExpired(ArmRecheck[1].timerId)
+  timeOutInFlight()
+  assert(EffectivePartitionState(1) == 'Disarmed', 'the panel last read Disarmed, got ' .. tostring(EffectivePartitionState(1)))
+  assert(firedCount('Partition 1 Armed') == 0)
+  assert(ArmRecheck[1] and ArmRecheck[1].timerId, 'it counts as an attempt and asks again')
+end)
+
+test('a disconnect during an arm re-check fires no Armed event (v48 review)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed'); calls.FireEvent = {}
+  ev48(h, 991, 401, 3, 0, 1)
+  answerSyncQueries(h, 2)
+  PostOperationGuardUntil = 0
+  OnTimerExpired(ArmRecheck[1].timerId)
+  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
+  assert(firedCount('Partition 1 Armed') == 0, table.concat(calls.FireEvent, ' | '))
+  assert(ArmRecheck[1] == nil, 'no re-check survives the disconnect')
+end)
+
+test('an unrecognised re-check answer keeps the attempt count bounded (v48 review)', function()
+  freshDriver(); local h = connectPanel()
+  SetPartitionState(1, 'Disarmed'); calls.FireEvent = {}
+  ev48(h, 994, 401, 3, 0, 1); answerSyncQueries(h, 2)
+  for _ = 1, 10 do
+    if not (ArmRecheck[1] and ArmRecheck[1].timerId) then break end
+    PostOperationGuardUntil = 0
+    OnTimerExpired(ArmRecheck[1].timerId); answerSyncQueries(h, 50)
+  end
+  assert(ArmRecheck[1] == nil and firedCount('Partition 1 Armed') == 0)
+end)
+
+test('whatever subset of a save lands, the last complete save is kept (v48 review)', function()
+  upgradeFrom(LEGACY)
+  RenameZoneFromApp(1, 'R-one'); settlePersist()
+  RenameZoneFromApp(1, 'R-two'); settlePersist()
+  local base = {}
+  for k, v in pairs(Persisted) do base[k] = v end
+  RenameZoneFromApp(1, 'R-three')
+  local pendingKeys = {}
+  for k in pairs(PersistPending) do pendingKeys[#pendingKeys + 1] = k end
+  table.sort(pendingKeys)
+  local pendingVals = {}
+  for k, e in pairs(PersistPending) do pendingVals[k] = e.v end
+  local cfg = Properties['Zones Config']
+  assert(#pendingKeys >= 3, 'precondition: parts, copy header, main header')
+  for mask = 0, 2 ^ #pendingKeys - 1 do
+    Persisted = {}
+    for k, v in pairs(base) do Persisted[k] = v end
+    local m = mask
+    for _, k in ipairs(pendingKeys) do
+      if m % 2 == 1 then Persisted[k] = pendingVals[k] end
+      m = math.floor(m / 2)
+    end
+    PersistPending = {}
+    KeepPersisted = true
+    freshDriver({ ['Zones Config'] = cfg })
+    KeepPersisted = false
+    local n = Zones[1] and Zones[1].name
+    assert(n == 'R-two' or n == 'R-three', 'subset ' .. mask .. ' gave ' .. tostring(n))
+  end
 end)
 
 --=============================================================================
