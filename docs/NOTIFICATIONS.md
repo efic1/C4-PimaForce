@@ -196,7 +196,8 @@ Wiring one script per event across 44 events is not a reasonable ask, so the
 driver now offers consolidated hooks. **`Any Alarm`** fires for every
 alarm-class condition — burglary, fire, medical, panic, duress, tamper, on any
 partition — and **`Any Trouble`** for every fault, including the panel
-connection being lost. The specific events still fire alongside, so nothing
+connection being lost. (Burglary was missing from `Any Alarm` until v48: an
+intrusion fired only `Partition N Alarm`.) The specific events still fire alongside, so nothing
 existing breaks and per-condition scripts remain possible for anyone who wants
 them.
 

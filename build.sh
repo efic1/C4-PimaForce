@@ -5,7 +5,7 @@
 # must be kept (driver.xml references www/documentation/index.html).
 #
 # Needs: python3 with the "markdown" package (pip install markdown), zip,
-# and lua5.4 for the tests. luac5.1 is preferred for the syntax check because
+# and lua5.1 (or lua5.4) for the tests. luac5.1 is preferred for the syntax check because
 # Control4 runs Lua 5.1.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,11 +23,17 @@ else
 fi
 
 echo "==> Running tests"
-if command -v lua5.4 >/dev/null 2>&1; then
-  lua5.4 tests/test_regressions.lua | tail -1
-  lua5.4 tests/test_driver.lua | tail -1
+# Lua 5.1 first: it is what the controller runs. The suite also passes on 5.4.
+LUA=""
+for c in lua5.1 lua5.4 lua; do
+  if command -v "$c" >/dev/null 2>&1; then LUA="$c"; break; fi
+done
+if [ -n "$LUA" ]; then
+  echo "    using $LUA"
+  "$LUA" tests/test_regressions.lua | tail -1
+  "$LUA" tests/test_driver.lua | tail -1
 else
-  echo "    lua5.4 not found, skipping tests"
+  echo "    no Lua interpreter found, skipping tests"
 fi
 
 echo "==> Packaging PimaForce.c4z"

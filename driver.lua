@@ -97,7 +97,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 47
+local DRIVER_VERSION = 48
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -664,6 +664,25 @@ function RecordActivity(msg)
   while #RecentActivity > MAX_RECENT_ENTRIES do
     table.remove(RecentActivity)
   end
+  -- The property is written once per burst, not once per line (v48): every
+  -- Info line used to rewrite it, which was most of the property writes in
+  -- an arm/disarm cycle, each one a Director round trip and a Composer
+  -- redraw. A short timer collects the burst. If no timer can be created the
+  -- write happens at once, so activity is never silently lost.
+  if RecentActivityFlushTimerId then return end
+  local ok, id = pcall(function() return C4:AddTimer(RECENT_ACTIVITY_FLUSH_S, 'SECONDS') end)
+  if ok and id then
+    RecentActivityFlushTimerId = id
+  else
+    FlushRecentActivity()
+  end
+end
+
+RECENT_ACTIVITY_FLUSH_S = 2
+RecentActivityFlushTimerId = nil
+
+function FlushRecentActivity()
+  RecentActivityFlushTimerId = nil
   -- Attempt the property write unconditionally (inside a pcall). Gating it on
   -- the property already existing in the Properties table meant that if it
   -- was ever missing, activity was silently not recorded -- the one failure
@@ -954,6 +973,29 @@ PERSIST_PART_CHARS = 600
 PERSIST_BLOB_PREFIX = 'PIMABLOB1:'
 PERSIST_PART_PREFIX = 'PIMAB64:'
 
+--[[---------------------------------------------------------------------------
+    Two copies (v48).
+
+    A v47 blob kept its parts at fixed keys, so a save interrupted by a reload
+    -- some keys landed, others not -- left a header and parts that did not
+    match. The store was then unreadable and rebuilt from the original
+    Zones Config backup, losing every rename made since the migration.
+
+    Each save now goes to whichever of two copies ("a", "b") does NOT hold
+    the newest complete save, and carries a sequence number:
+
+        <key>.<copy>.partN   this save's parts
+        <key>.<copy>.hdr     "PIMABLOB2:<copy>:<seq>:<parts>:<length>:<checksum>"
+        <key>                the same header (marks the key as set)
+
+    The reader checks every header it can find and takes the highest
+    sequence number whose parts check out. The other copy is never touched
+    by a save, so whatever subset of a save lands before a reload, the
+    previous complete save is still there to fall back to. Only the save in
+    progress can be lost. v47's "PIMABLOB1:" blobs are read as sequence 0.
+-----------------------------------------------------------------------------]]
+PERSIST_BLOB2_PREFIX = 'PIMABLOB2:'
+
 local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local B64_INDEX = {}
 for i = 1, 64 do B64_INDEX[B64:sub(i, i)] = i - 1 end
@@ -1012,6 +1054,63 @@ function PersistChecksum(s)
 end
 
 local function blobPartKey(key, i) return key .. '.part' .. i end
+local function genPartKey(key, gen, i) return key .. '.' .. gen .. '.part' .. i end
+local function genHeaderKey(key, gen) return key .. '.' .. gen .. '.hdr' end
+
+-- Parses either header format: returns { gen = 'a'|'b'|nil, seq, parts, len,
+-- sum }, or nil if `raw` is not a blob header.
+local function parseBlobHeader(raw)
+  if type(raw) ~= 'string' then return nil end
+  local gen, q, p, l, c = raw:match('^' .. PERSIST_BLOB2_PREFIX .. '([ab]):(%d+):(%d+):(%d+):(%d+)$')
+  if gen then
+    return { gen = gen, seq = tonumber(q), parts = tonumber(p), len = tonumber(l), sum = tonumber(c) }
+  end
+  p, l, c = raw:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):(%d+):(%d+)$')
+  if p then return { seq = 0, parts = tonumber(p), len = tonumber(l), sum = tonumber(c) } end
+  return nil
+end
+
+-- Reads the text a parsed header describes, or nil plus why not.
+local function readBlobFromHeader(key, h)
+  local b64 = {}
+  for i = 1, h.parts do
+    local pk = h.gen and genPartKey(key, h.gen, i) or blobPartKey(key, i)
+    local v = PersistGetRaw(pk)
+    if type(v) ~= 'string' or v:sub(1, #PERSIST_PART_PREFIX) ~= PERSIST_PART_PREFIX then
+      return nil, 'part ' .. i .. ' of ' .. h.parts .. ' missing or altered'
+    end
+    b64[i] = v:sub(#PERSIST_PART_PREFIX + 1)
+  end
+  local text = Base64Decode(table.concat(b64))
+  if not text then return nil, 'parts do not form valid base64' end
+  if #text ~= h.len then return nil, 'length ' .. #text .. ', expected ' .. h.len end
+  if PersistChecksum(text) ~= h.sum then return nil, 'checksum mismatch' end
+  return text
+end
+
+-- The newest complete save among every header present: text, header, and
+-- the main header's own failure reason (nil if it read cleanly).
+local function newestCompleteBlob(key, mainRaw)
+  local best, bestH, mainWhy = nil, nil, nil
+  local seen = {}
+  local sources = { mainRaw, PersistGetRaw(genHeaderKey(key, 'a')), PersistGetRaw(genHeaderKey(key, 'b')) }
+  for i = 1, 3 do
+    local raw = sources[i]
+    local h = parseBlobHeader(raw)
+    if i == 1 and not h then mainWhy = 'unreadable header' end
+    if h and not seen[raw] then
+      seen[raw] = true
+      local text, why = readBlobFromHeader(key, h)
+      if i == 1 and not text then mainWhy = why end
+      if text and (not bestH or h.seq > bestH.seq) then best, bestH = text, h end
+    end
+  end
+  return best, bestH, mainWhy
+end
+
+-- Highest sequence number written per key this load. Writes become readable
+-- only later (see below), so the stored headers can lag behind.
+PersistSeqWritten = {}
 
 -- Describes how `got` differs from `want`, for the log.
 function DescribeDifference(want, got)
@@ -1073,24 +1172,25 @@ function PersistWriteBlob(key, text)
   local b64 = Base64Encode(text)
   local parts = math.max(1, math.ceil(#b64 / PERSIST_PART_CHARS))
 
-  local previousParts = 0
-  local prev = PersistGetRaw(key)
-  if type(prev) == 'string' and prev:sub(1, #PERSIST_BLOB_PREFIX) == PERSIST_BLOB_PREFIX then
-    previousParts = tonumber(prev:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):')) or 0
-  end
+  -- Write to the copy that does NOT hold the newest complete save, so that
+  -- save survives whatever part of this one fails to land (see "Two copies").
+  local _, newest = newestCompleteBlob(key, PersistGetRaw(key))
+  local gen = (newest and newest.gen == 'a') and 'b' or 'a'
+  local seq = math.max(newest and newest.seq or 0, PersistSeqWritten[key] or 0) + 1
+  PersistSeqWritten[key] = seq
 
   local raw = {}
   for i = 1, parts do
     local value = PERSIST_PART_PREFIX .. b64:sub((i - 1) * PERSIST_PART_CHARS + 1, i * PERSIST_PART_CHARS)
-    if not PersistSetRaw(blobPartKey(key, i), value) then return false end
-    raw[blobPartKey(key, i)] = value
+    if not PersistSetRaw(genPartKey(key, gen, i), value) then return false end
+    raw[genPartKey(key, gen, i)] = value
   end
-  local header = PERSIST_BLOB_PREFIX .. parts .. ':' .. #text .. ':' .. PersistChecksum(text)
+  local header = PERSIST_BLOB2_PREFIX .. gen .. ':' .. seq .. ':' .. parts .. ':' ..
+    #text .. ':' .. PersistChecksum(text)
+  if not PersistSetRaw(genHeaderKey(key, gen), header) then return false end
+  raw[genHeaderKey(key, gen)] = header
   if not PersistSetRaw(key, header) then return false end
   raw[key] = header
-  for i = parts + 1, previousParts do
-    if C4.PersistDeleteValue then pcall(function() C4:PersistDeleteValue(blobPartKey(key, i)) end) end
-  end
 
   PersistExpect[key] = { text = text, raw = raw }
   PersistVerifyAttempt = 0
@@ -1105,21 +1205,25 @@ function RunPersistVerify()
   local failures = {}
   for key, want in pairs(PersistExpect) do
     local got = PersistReadBlob(key)
-    if got == want.text then
+    -- Every raw value written must read back exactly, not just the decoded
+    -- text: since v48 a blob has two copies, and the older one could
+    -- otherwise satisfy this check while the new one was being damaged.
+    -- The raw values are plain ASCII (base64 and headers), so there is
+    -- nothing for a controller to reinterpret.
+    local detail = nil
+    local rawKeys = {}
+    for rk in pairs(want.raw) do rawKeys[#rawKeys + 1] = rk end
+    table.sort(rawKeys)
+    for _, rk in ipairs(rawKeys) do
+      local back = PersistGetRaw(rk)
+      if back ~= want.raw[rk] then
+        detail = rk .. ': ' .. DescribeDifference(want.raw[rk], back)
+        break
+      end
+    end
+    if got == want.text and not detail then
       PersistExpect[key] = nil
     else
-      -- Name the first raw value that differs, exactly.
-      local detail = nil
-      local rawKeys = {}
-      for rk in pairs(want.raw) do rawKeys[#rawKeys + 1] = rk end
-      table.sort(rawKeys)
-      for _, rk in ipairs(rawKeys) do
-        local back = PersistGetRaw(rk)
-        if back ~= want.raw[rk] then
-          detail = rk .. ': ' .. DescribeDifference(want.raw[rk], back)
-          break
-        end
-      end
       failures[#failures + 1] = detail or (key .. ': decoded value differs')
     end
   end
@@ -1150,45 +1254,47 @@ end
 -- Returns text, or nil plus a reason. Also reads the formats v43 and v44
 -- wrote: a prefixed string (prefix stripped), a plain string, or a table
 -- (returned as is, for the caller to interpret).
+--
+-- A third return value of true means the latest save was incomplete and the
+-- text is the previous complete one (see "Two generations").
 function PersistReadBlob(key)
   local raw = PersistGetRaw(key)
   if raw == nil then return nil, 'not set' end
   if type(raw) == 'table' then return raw end
   if type(raw) ~= 'string' then return nil, 'held a ' .. type(raw) end
-  if raw:sub(1, #PERSIST_BLOB_PREFIX) ~= PERSIST_BLOB_PREFIX then
+  local isBlob = raw:sub(1, #PERSIST_BLOB_PREFIX) == PERSIST_BLOB_PREFIX
+    or raw:sub(1, #PERSIST_BLOB2_PREFIX) == PERSIST_BLOB2_PREFIX
+  if not isBlob then
     for _, legacy in ipairs({ 'PIMATEXT1:', 'PIMAZONES1:' }) do
       if raw:sub(1, #legacy) == legacy then return raw:sub(#legacy + 1) end
     end
     return raw
   end
-  local parts, len, sum = raw:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):(%d+):(%d+)$')
-  parts, len, sum = tonumber(parts), tonumber(len), tonumber(sum)
-  if not parts then return nil, 'unreadable header' end
-  local b64 = {}
-  for i = 1, parts do
-    local v = PersistGetRaw(blobPartKey(key, i))
-    if type(v) ~= 'string' or v:sub(1, #PERSIST_PART_PREFIX) ~= PERSIST_PART_PREFIX then
-      return nil, 'part ' .. i .. ' of ' .. parts .. ' missing or altered'
-    end
-    b64[i] = v:sub(#PERSIST_PART_PREFIX + 1)
-  end
-  local text = Base64Decode(table.concat(b64))
-  if not text then return nil, 'parts do not form valid base64' end
-  if #text ~= len then return nil, 'length ' .. #text .. ', expected ' .. len end
-  if PersistChecksum(text) ~= sum then return nil, 'checksum mismatch' end
-  return text
+  local text, h, mainWhy = newestCompleteBlob(key, raw)
+  if not text then return nil, mainWhy or 'no complete copy' end
+  -- A fallback is when the main header itself did not read back cleanly and
+  -- an older copy was used instead.
+  local mainH = parseBlobHeader(raw)
+  local fellBack = (mainWhy ~= nil) and not (mainH and mainH.seq < h.seq)
+  return text, mainWhy, fellBack
 end
 
 function PersistDeleteBlob(key)
-  local raw = PersistGetRaw(key)
-  local parts = 0
-  if type(raw) == 'string' then
-    parts = tonumber(raw:match('^' .. PERSIST_BLOB_PREFIX .. '(%d+):')) or 0
+  -- A deleted key has nothing left to verify. Until v48 an outstanding
+  -- check for it stayed behind and could never pass, so anything waiting on
+  -- storage -- the zone migration's second phase -- never ran.
+  PersistExpect[key] = nil
+  if not (C4 and C4.PersistDeleteValue) then return end
+  local del = function(k) pcall(function() C4:PersistDeleteValue(k) end) end
+  for _, hk in ipairs({ key, genHeaderKey(key, 'a'), genHeaderKey(key, 'b') }) do
+    local h = parseBlobHeader(PersistGetRaw(hk))
+    if h then
+      for i = 1, h.parts do del(h.gen and genPartKey(key, h.gen, i) or blobPartKey(key, i)) end
+    end
   end
-  if C4 and C4.PersistDeleteValue then
-    pcall(function() C4:PersistDeleteValue(key) end)
-    for i = 1, parts do pcall(function() C4:PersistDeleteValue(blobPartKey(key, i)) end) end
-  end
+  del(genHeaderKey(key, 'a'))
+  del(genHeaderKey(key, 'b'))
+  del(key)
 end
 
 -- Returns whatever Director hands back, unmodified: a string, but on some
@@ -1385,14 +1491,39 @@ function InitZoneStore()
   end
 
   ZoneMigrationMode = PersistGet(ZONE_MIGRATION_KEY)
-  local stored, storedWhy = PersistReadBlob(ZONE_STORE_KEY)
+  local stored, storedWhy, storedFellBack = PersistReadBlob(ZONE_STORE_KEY)
+  if storedFellBack then
+    LogWarn('The last save of the zone store did not complete before the driver reloaded (' ..
+      tostring(storedWhy) .. '); using the save before it. A rename made just before ' ..
+      'the reload may need repeating.')
+  end
 
   -- The migration flag, not the store's existence, decides. 'done' is only
   -- written after a verified migration; v43 on a controller that returned
   -- the store as a table left a store behind WITHOUT the flag, holding only
   -- panel names. With a non-empty Zones Config and no flag, the migration
   -- has never completed, so it runs now and replaces that store.
+  local store = (stored ~= nil) and DecodeZoneStore(stored) or nil
   if ZoneMigrationMode ~= 'done' and ZoneMigrationMode ~= 'off' and trim(configText) ~= '' then
+    -- Phase 2 already ran -- Zones Config was shortened -- but the driver
+    -- reloaded before 'done' became readable. Re-migrating the overrides-only
+    -- text emptied the store, overwrote the backup and hid every zone on the
+    -- next refresh (v48 fix). Recognised by Zones Config no longer matching
+    -- the backup of the original, with a readable store.
+    local pending = (ZoneMigrationMode == 'pending')
+    local backup = pending and PersistGet(ZONE_BACKUP_KEY) or nil
+    local hasNames = false
+    for _, e in pairs(parseZones(configText)) do
+      if e.nameGiven and not e.hidden then hasNames = true break end
+    end
+    if pending and store and ((backup and trim(backup) ~= trim(configText)) or not hasNames) then
+      ZoneStore = store
+      LogInfo('Zone migration had already completed before the last reload; marking it done')
+      PersistSet(ZONE_MIGRATION_KEY, 'done')
+      ZoneMigrationMode = 'done'
+      BuildZones(configText)
+      return
+    end
     -- 'pending' (a previous load wrote everything but could not confirm it
     -- before unloading) goes through the same path: the data is written
     -- again and confirmed on a timer, so the result does not depend on how
@@ -1401,9 +1532,9 @@ function InitZoneStore()
     return
   end
 
-  local store = (stored ~= nil) and DecodeZoneStore(stored) or nil
   if store then
     ZoneStore = store
+    if storedFellBack then SaveZoneStore() end
   elseif stored ~= nil or (storedWhy and storedWhy ~= 'not set') then
     -- Present but unreadable. After a migration Zones Config holds only
     -- overrides, so falling back to it alone would drop every zone name.
@@ -1445,7 +1576,10 @@ function MigrateZonesConfig(configText)
   end
 
   ZoneStore = store
-  local wrote = PersistSet(ZONE_BACKUP_KEY, configText) and SaveZoneStore()
+  -- The backup is the user's ORIGINAL list and is written once. A repeat of
+  -- the migration must never replace it with whatever Zones Config holds now.
+  local haveBackup = PersistGet(ZONE_BACKUP_KEY) ~= nil
+  local wrote = (haveBackup or PersistSet(ZONE_BACKUP_KEY, configText)) and SaveZoneStore()
     and PersistSet(ZONE_MIGRATION_KEY, 'pending') and PersistSet(ZONE_HIDE_NEW_KEY, 'yes')
   BuildZones(configText)
   if not wrote then
@@ -1692,49 +1826,84 @@ function NotePanelDisconnected(reason)
   FireDriverEvent('Any Trouble')
 end
 
+--[[---------------------------------------------------------------------------
+    Which socket is the panel (v48).
+
+    The panel keeps one connection per CMS path open, and when its session
+    half-opens (power loss, a dead network path) no OFFLINE ever arrives, so
+    a reconnect on a new socket must be able to replace the old session.
+    Until v48 the newest connection replaced it the moment it OPENED. That
+    let anything that touched the port -- a port scan, a network probe, a
+    stray client -- end a healthy session: "connection lost", Offline, and
+    arm/disarm refused until the panel's next frame. Bytes from a client
+    already blocked for presenting the wrong account de-verified the panel
+    too, and a session adopted through the data path ran with no watchdog.
+
+    Now, while a verified session is live, a new socket is only a candidate.
+    It replaces the session when it sends a frame carrying the configured
+    account: the panel proving itself, which it does at once on reconnect.
+    Anything else it sends is ignored (and a wrong account counts towards
+    blocking it). With no verified session the newest socket is adopted at
+    once, as before.
+-----------------------------------------------------------------------------]]
+CandidateHandles = {}       -- [handle] = { buf = '', failures = n }
+MAX_CANDIDATES = 8
+
+-- Makes `nHandle` the panel session, discarding everything known about the
+-- previous one. Used for a new connection and for a candidate that proved
+-- itself.
+function AdoptSession(nHandle)
+  if ConnHandle ~= nil and nHandle ~= ConnHandle then
+    LogInfo('New inbound connection (handle ' .. tostring(nHandle) ..
+      ') replacing the previous session on handle ' .. tostring(ConnHandle))
+  end
+  CandidateHandles[nHandle] = nil
+  ConnHandle = nHandle
+  PanelVerified = false
+  -- NOT resetting the event dedupe here on purpose: the panel replays its
+  -- buffered events on reconnect, and forgetting what we already processed
+  -- is what turned that replay into fresh alarm notifications.
+  LastEventKey = nil
+  RecvBuffer = ''
+  VerifyFailures = 0
+  BlockedHandles = {}
+  UnparseableWarned = false
+  -- A reconnect is exactly when our picture is most likely stale: start
+  -- from "we don't know" rather than from whatever we last believed.
+  ResetPartitionStatus()
+  CancelUnknownResync()
+  -- Fail (not silently discard) anything still queued from the previous
+  -- session: callers -- including the native widget waiting on an arm --
+  -- must be told, or a command just evaporates with no error anywhere.
+  FailInFlight('connection reset')
+  ResetQueueState()
+  SetProp('Connection Status', 'Client Connected (awaiting verification)')
+  NoteInboundActivity()
+  StartLinkWatchdog()
+end
+
 function OnServerConnectionStatusChanged(nHandle, nPort, strStatus)
   Dbg('OnServerConnectionStatusChanged handle=' .. tostring(nHandle) .. ' port=' .. tostring(nPort) .. ' status=' .. tostring(strStatus))
   local isOnline = (strStatus == 'ONLINE' or strStatus == 'CONNECTED' or strStatus == 'true' or strStatus == true)
   if isOnline then
-    -- NEWEST CONNECTION WINS.
-    --
-    -- The panel keeps exactly one connection per CMS path open, and the
-    -- reference implementation explicitly destroys the previous socket when
-    -- a new one arrives. That behaviour matters: if a session half-opens
-    -- (panel loses power, network path dies) no OFFLINE ever arrives, so a
-    -- "first verified session wins" rule -- which this driver used to have --
-    -- would ignore the panel's reconnect forever and sit permanently silent
-    -- on a socket that is already dead.
-    --
-    -- The account check below is what actually gates trust; nothing is sent
-    -- to a connection until it has presented the configured account.
-    if ConnHandle ~= nil and nHandle ~= ConnHandle then
-      LogInfo('New inbound connection (handle ' .. tostring(nHandle) ..
-        ') replacing the previous session on handle ' .. tostring(ConnHandle))
+    if ConnHandle ~= nil and PanelVerified and nHandle ~= ConnHandle then
+      -- A verified session is live: hold the newcomer as a candidate.
+      local n = 0
+      for _ in pairs(CandidateHandles) do n = n + 1 end
+      if n >= MAX_CANDIDATES then CandidateHandles = {} end
+      CandidateHandles[nHandle] = { buf = '', failures = 0 }
+      LogInfo('New inbound connection on handle ' .. tostring(nHandle) ..
+        ' while the panel session on handle ' .. tostring(ConnHandle) .. ' is live; ' ..
+        'it takes over only once it presents the panel account')
+      return
     end
-    ConnHandle = nHandle
-    PanelVerified = false
-    -- NOT resetting the event dedupe here on purpose: the panel replays its
-    -- buffered events on reconnect, and forgetting what we already processed
-    -- is what turned that replay into fresh alarm notifications.
-    LastEventKey = nil
-    RecvBuffer = ''
-    VerifyFailures = 0
-    BlockedHandles = {}
-    UnparseableWarned = false
-    -- A reconnect is exactly when our picture is most likely stale: start
-    -- from "we don't know" rather than from whatever we last believed.
-    ResetPartitionStatus()
-    CancelUnknownResync()
-    -- Fail (not silently discard) anything still queued from the previous
-    -- session: callers -- including the native widget waiting on an arm --
-    -- must be told, or a command just evaporates with no error anywhere.
-    FailInFlight('connection reset')
-    ResetQueueState()
-    SetProp('Connection Status', 'Client Connected (awaiting verification)')
-    NoteInboundActivity()
-    StartLinkWatchdog()
+    AdoptSession(nHandle)
   else
+    if CandidateHandles[nHandle] then
+      CandidateHandles[nHandle] = nil
+      Dbg('Candidate connection on handle ' .. tostring(nHandle) .. ' closed; the panel session is unaffected')
+      return
+    end
     if ConnHandle == nHandle then
       ConnHandle = nil
       PanelVerified = false
@@ -1872,6 +2041,60 @@ function ServerDataIn(...)
   if data then return HandleServerData(handle, data) end
 end
 
+-- Data on a socket other than the live, verified session (v48). Buffered per
+-- socket; the first frame carrying the configured account makes it the
+-- session (AdoptSession) and is then handled normally. Nothing else it sends
+-- touches the live session.
+function HandleCandidateData(nHandle, strData)
+  local c = CandidateHandles[nHandle]
+  if not c then
+    c = { buf = '', failures = 0 }
+    CandidateHandles[nHandle] = c
+  end
+  c.buf = c.buf .. (strData or '')
+  if #c.buf > MAX_RECV_BUFFER then c.buf = '' end
+  local frames, remainder = splitFrames(c.buf)
+  c.buf = remainder
+  local expected = tonumber(Properties['Account ID'])
+  for i, frameText in ipairs(frames) do
+    local frame = JSON.decode(frameText)
+    if type(frame) == 'table' then
+      if tonumber(frame.account) == expected then
+        LogInfo('The panel reconnected on handle ' .. tostring(nHandle) ..
+          ' (it presented the configured account); switching to it')
+        AdoptSession(nHandle)
+        -- This frame and any after it go through the normal path, which
+        -- verifies the session and ACKs.
+        local rest = {}
+        for j = i, #frames do rest[#rest + 1] = frames[j] end
+        RecvBuffer = remainder
+        for _, t in ipairs(rest) do
+          local f = JSON.decode(t)
+          if type(f) == 'table' then
+            local ok, err = pcall(HandleInboundFrame, nHandle, f)
+            if not ok then
+              LogInfo('ERROR handling inbound frame: ' .. tostring(err))
+              pcall(ProcessQueue)
+            end
+          end
+        end
+        return
+      end
+      c.failures = c.failures + 1
+      LogWarn('Ignoring a frame on handle ' .. tostring(nHandle) .. ' with account "' ..
+        tostring(frame.account) .. '"; the panel session on handle ' .. tostring(ConnHandle) ..
+        ' is unaffected (' .. c.failures .. '/' .. MAX_VERIFY_FAILURES .. ')')
+      if c.failures >= MAX_VERIFY_FAILURES then
+        BlockedHandles = BlockedHandles or {}
+        BlockedHandles[nHandle] = true
+        CandidateHandles[nHandle] = nil
+        LogError('Too many unverified frames on handle ' .. tostring(nHandle) .. ' -- ignoring this connection')
+        return
+      end
+    end
+  end
+end
+
 function HandleServerData(nHandle, strData)
   -- If the argument layout gave us no identifiable handle, assume the data
   -- belongs to the connection we already know about. Dropping it instead
@@ -1879,9 +2102,21 @@ function HandleServerData(nHandle, strData)
   -- mode this whole path exists to avoid.
   if nHandle == nil then nHandle = ConnHandle end
 
+  -- A handle we already gave up on (too many wrong-account frames) must stay
+  -- given up on, and must not touch the live session either. Checked first
+  -- since v48: it used to come after the code below had already de-verified
+  -- the panel because a different socket was talking.
+  if BlockedHandles and BlockedHandles[nHandle] then
+    return
+  end
+
   -- Any bytes at all mean the link is alive, even bytes we cannot parse: the
   -- watchdog is asking "is the panel still there", not "is it well".
   if nHandle == ConnHandle then NoteInboundActivity() end
+
+  if nHandle ~= ConnHandle and ConnHandle ~= nil and PanelVerified then
+    return HandleCandidateData(nHandle, strData)
+  end
 
   -- Data is processed from WHICHEVER socket delivers it.
   --
@@ -1892,23 +2127,17 @@ function HandleServerData(nHandle, strData)
   -- slot and the driver went deaf to the real panel: no ACKs, no events, and
   -- the silent socket never tripped the verification limit, so nothing
   -- un-stuck it. The panel is whichever socket is actually talking to us.
+  --
+  -- Reached only when no session is verified (a verified one is handled
+  -- above). Adopting goes through AdoptSession so the new session gets its
+  -- watchdog; until v48 a socket adopted here ran without one.
   if nHandle ~= ConnHandle then
     Dbg('Data on handle ' .. tostring(nHandle) .. ' (current session was ' ..
       tostring(ConnHandle) .. '); following the socket that is talking')
-    -- A different socket means a different session: re-verify before trusting.
-    if ConnHandle ~= nil then
-      PanelVerified = false
-      RecvBuffer = ''
-      LastEventKey = nil          -- dedupe set deliberately preserved
-    end
+    local blocked = BlockedHandles
+    AdoptSession(nHandle)
+    BlockedHandles = blocked or {}
   end
-  -- A handle we already gave up on (too many wrong-account frames) must stay
-  -- given up on. Without this the next byte it sends re-adopts it below and
-  -- the failure limit means nothing.
-  if BlockedHandles and BlockedHandles[nHandle] then
-    return
-  end
-  ConnHandle = nHandle
 
   -- Reassemble across TCP segment boundaries: carry any trailing partial
   -- frame over to the next chunk rather than dropping it.
@@ -2050,7 +2279,7 @@ end
 -- How many frames with a wrong account we tolerate on one connection before
 -- we stop looking at it. Without a limit, a listening socket lets anything
 -- on the LAN sit there guessing the account ID indefinitely.
-local MAX_VERIFY_FAILURES = 5
+MAX_VERIFY_FAILURES = 5
 
 -- Run an in-flight request's completion callback without letting a Lua error
 -- inside it park the queue forever. Historically the callback ran bare: a
@@ -2439,6 +2668,10 @@ function ProcessQueue()
 end
 
 function OnTimerExpired(idTimer)
+  if RecentActivityFlushTimerId and idTimer == RecentActivityFlushTimerId then
+    FlushRecentActivity()
+    return
+  end
   if EventMuteTimerId and idTimer == EventMuteTimerId then
     EventMuteTimerId = nil
     SetEventsEnabled(true, 'mute period elapsed')
@@ -2456,6 +2689,12 @@ function OnTimerExpired(idTimer)
   if PartitionResyncTimerId and idTimer == PartitionResyncTimerId then
     RunUnknownResync()
     return
+  end
+  for pid, r in pairs(ArmRecheck) do
+    if r.timerId == idTimer then
+      RunArmRecheck(pid)
+      return
+    end
   end
   if InFlight and InFlight.timerId == idTimer then
     local cb = InFlight.onResult
@@ -3089,14 +3328,30 @@ function QueryPartitionArmState(partitionId, opts)
   -- Called on EVERY way this query can end, before any state is published,
   -- so a caller (the exit-delay countdown) can retire its overlay first and
   -- never publish a stale one. `state` is nil when the query settled nothing.
+  -- onSettle may return false to drop a stale answer entirely (v48).
   local function settle(state)
-    if opts.onSettle then pcall(opts.onSettle, state) end
+    if opts.onSettle then
+      local ok, keep = pcall(opts.onSettle, state)
+      if ok and keep == false then return false end
+    end
+    return true
   end
 
   local function apply(state, note)
-    settle(state)
-    LogInfo('Partition ' .. partitionId .. ': ' .. state ..
-      (note and (' (' .. note .. ')') or ''))
+    if not settle(state) then return end
+    -- An answer to a post-arm query resolves any re-check that was pending.
+    if fireEvents then CancelArmRecheck(partitionId) end
+    local line = 'Partition ' .. partitionId .. ': ' .. state ..
+      (note and (' (' .. note .. ')') or '')
+    -- Only a change, or an event, is worth an Info line (and the Recent
+    -- Activity write that comes with it).
+    if fireEvents or PartitionStatusFor(partitionId).base ~= state then
+      LogInfo(line)
+    else
+      Dbg(line)
+    end
+    local st = PartitionStatusFor(partitionId)
+    st.unmappedLogged, st.notExistWarned = nil, nil
     SetPartitionState(partitionId, state, opts.isInit)
     if fireEvents then FirePartitionEvent(partitionId, state) end
     if opts.onApplied then pcall(opts.onApplied, state) end
@@ -3118,7 +3373,12 @@ function QueryPartitionArmState(partitionId, opts)
     local params = frame and frame.parameters
     local first = (type(params) == 'table') and params[1] or nil
     if err or first == nil or JSON.isNull(first) then
-      if fireEvents then
+      if opts.recheck then
+        Dbg('Partition ' .. partitionId .. ': arm re-check got no answer (' ..
+          tostring(err or 'no data') .. ')')
+        settle(nil)
+        ScheduleArmRecheck(partitionId)
+      elseif fireEvents then
         apply('Armed', 'mode query failed: ' .. tostring(err or 'no data'))
       else
         -- Say why loudly. A partition stuck on "Unknown" shows as Unknown /
@@ -3146,9 +3406,14 @@ function QueryPartitionArmState(partitionId, opts)
     local mode = SYSTEM_KEY_TO_MODE[code]
     local confirmedDisarmed = code ~= nil and SYSTEM_KEY_DISARMED[code]
     -- Always log the raw value: this is how an unmapped arm mode gets found.
-    LogInfo('Partition ' .. partitionId .. ' System Key Status = ' .. tostring(raw) ..
+    -- At Info when it differs from the last one seen for this partition; a
+    -- repeat (the retry timer asking again) goes to Debug.
+    local rawLine = 'Partition ' .. partitionId .. ' System Key Status = ' .. tostring(raw) ..
       (mode and (' -> Armed ' .. mode) or confirmedDisarmed and ' -> Disarmed (confirmed code)'
-        or ' -> no arm-mode mapping for this value'))
+        or ' -> no arm-mode mapping for this value')
+    local pst = PartitionStatusFor(partitionId)
+    if pst.lastRawLogged == tostring(raw) then Dbg(rawLine) else LogInfo(rawLine) end
+    pst.lastRawLogged = tostring(raw)
 
     -- Last Command Result for the success/confirmed paths -- the unconfirmed
     -- path below sets its own, more detailed message instead of this one.
@@ -3158,18 +3423,39 @@ function QueryPartitionArmState(partitionId, opts)
         (mode and (' = Armed ' .. mode) or ' = Disarmed'))
     end
 
+    local st = PartitionStatusFor(partitionId)
     if code == SYSTEM_KEY_NOT_EXIST then
       -- Appendix C: 1 means this partition is not configured on the panel.
       -- Not an arm state, and not an unknown code either -- say so plainly
       -- and leave the partition alone. Reporting it as an unrecognised value
       -- (as v26 and earlier did) put an error in the log every sync for a
       -- partition the installer simply has not created on the panel.
-      LogWarn('Partition ' .. partitionId .. ' does not exist on the panel ' ..
+      local msg = 'Partition ' .. partitionId .. ' does not exist on the panel ' ..
         '(system key 1). Remove it from Partitions Config, or create it on the ' ..
-        'panel, so the app is not showing a partition the panel has never heard of.')
+        'panel, so the app is not showing a partition the panel has never heard of.'
+      -- Said once; the retry below would otherwise repeat it every 5 minutes.
+      if st.notExistWarned then Dbg(msg) else LogWarn(msg) end
+      st.notExistWarned = true
       SetProp('Last Command Result', 'Partition ' .. partitionId ..
         ' does not exist on the panel')
       settle(nil)
+      -- v48: keep asking, as for a failed query. Reached from the end of an
+      -- exit delay this left the partition Unknown (Offline, which blocks
+      -- arming) with nothing scheduled to ever correct it.
+      if not fireEvents then ScheduleUnknownResync() end
+    elseif opts.recheck and not mode then
+      -- Still Disarmed, or a value with no arm mapping: keep waiting, within
+      -- the limit, rather than asserting an arm the panel has not confirmed.
+      settle(nil)
+      ScheduleArmRecheck(partitionId)
+    elseif fireEvents and confirmedDisarmed and not mode then
+      -- The panel just reported an ARM event but still reads Disarmed. It
+      -- reports the arm at the START of its exit delay, so this is expected,
+      -- not a disarm. Until v48 this applied Disarmed, cancelled the
+      -- countdown and fired "Partition N Disarmed" off an arm event. Leave the
+      -- state alone and ask again once the delay should be over.
+      settle(nil)
+      ScheduleArmRecheck(partitionId)
     elseif confirmedDisarmed and not mode then
       apply('Disarmed', 'system key ' .. tostring(raw) .. ' is a confirmed disarmed code')
     elseif mode then
@@ -3195,9 +3481,13 @@ function QueryPartitionArmState(partitionId, opts)
         'disarmed code. Leaving the partition state unchanged rather than guessing. ' ..
         'If the panel was actually Disarmed just now, report this system key value ' ..
         'so it can be added as a confirmed mapping.'
-      LogError(msg)
+      if st.unmappedLogged == tostring(raw) then Dbg(msg) else LogError(msg) end
+      st.unmappedLogged = tostring(raw)
       SetProp('Last Command Result', msg)
       settle(nil)
+      -- v48: retried like a failed query (see ScheduleUnknownResync), so a
+      -- partition left Unknown by an unrecognised answer is not stuck.
+      ScheduleUnknownResync()
     end
   end)
 end
@@ -3205,6 +3495,80 @@ end
 -- Kept as the post-arm entry point so existing call sites read clearly.
 function QueryArmModeAndFire(partitionId)
   QueryPartitionArmState(partitionId, { fireEvents = true })
+end
+
+--[[---------------------------------------------------------------------------
+    Re-checking an arm the panel reported while still reading Disarmed (v48).
+
+    The panel sends its arm event when the exit delay STARTS, while the system
+    key still reads 2 (Disarmed). The follow-up query then cannot name a mode.
+    It asks again after the exit delay (remaining time + 5 s, or the panel's
+    exit time + 5 s for a keypad arm), then every 30 s, at most
+    ARM_RECHECK_MAX times. An armed answer fires the arm event then. If the
+    panel never reads armed, the arm did not complete (cancelled during the
+    delay); the driver shows what the panel says and fires nothing, since
+    there was no arm and no disarm to report.
+-----------------------------------------------------------------------------]]
+ARM_RECHECK_MAX = 3
+ArmRecheck = {}             -- [partition] = { attempts = n, timerId = id }
+
+function CancelArmRecheck(partitionId)
+  local r = ArmRecheck[partitionId]
+  if not r then return end
+  if r.timerId then pcall(function() C4:KillTimer(r.timerId) end) end
+  ArmRecheck[partitionId] = nil
+end
+
+function CancelAllArmRechecks()
+  for pid in pairs(ArmRecheck) do CancelArmRecheck(pid) end
+end
+
+function ScheduleArmRecheck(partitionId)
+  if not (ConnHandle and PanelVerified) then
+    CancelArmRecheck(partitionId)
+    return
+  end
+  local r = ArmRecheck[partitionId] or { attempts = 0 }
+  if r.timerId then pcall(function() C4:KillTimer(r.timerId) end) end
+  r.timerId = nil
+  r.attempts = r.attempts + 1
+  if r.attempts > ARM_RECHECK_MAX then
+    ArmRecheck[partitionId] = nil
+    LogWarn('Partition ' .. partitionId .. ': the panel reported an arm but still reads ' ..
+      'Disarmed after ' .. ARM_RECHECK_MAX .. ' checks, so the arm did not complete ' ..
+      '(cancelled during the exit delay?). Showing what the panel reports.')
+    return
+  end
+  local delay
+  local e = PartitionStatusFor(partitionId).exit
+  if e and not e.elapsed then
+    local _, remaining = ExitDelayTimes(partitionId)
+    delay = remaining + 5
+  elseif r.attempts == 1 then
+    delay = (ExitTimeSec or 30) + 5
+  else
+    delay = 30
+  end
+  if delay < 5 then delay = 5 end
+  if delay > EXIT_DELAY_MAX_S + 5 then delay = EXIT_DELAY_MAX_S + 5 end
+  r.timerId = C4:AddTimer(delay, 'SECONDS')
+  ArmRecheck[partitionId] = r
+  LogInfo('Partition ' .. partitionId .. ': the panel reported an arm but still reads ' ..
+    'Disarmed (normal during its exit delay); checking again in ' .. delay .. ' s')
+end
+
+function RunArmRecheck(partitionId)
+  local r = ArmRecheck[partitionId]
+  if not r then return end
+  r.timerId = nil
+  if not (ConnHandle and PanelVerified) then
+    ArmRecheck[partitionId] = nil
+    return
+  end
+  -- `recheck`: the panel last read Disarmed, so a failed or unrecognised
+  -- answer here is NOT evidence of an arm (unlike right after the arm
+  -- event). Only a recognised arm mode applies a state and fires an event.
+  QueryPartitionArmState(partitionId, { fireEvents = true, recheck = true })
 end
 
 --[[---------------------------------------------------------------------------
@@ -3262,8 +3626,11 @@ function RunUnknownResync()
     return
   end
   PartitionResyncAttempt = PartitionResyncAttempt + 1
-  LogInfo('Partition state still unknown for ' .. table.concat(unknown, ', ') ..
-    '; asking the panel again (attempt ' .. PartitionResyncAttempt .. ')')
+  -- Info for the first few attempts; after that the 5-minute retries are
+  -- only Debug, so a partition that stays unknown does not fill the log.
+  local line = 'Partition state still unknown for ' .. table.concat(unknown, ', ') ..
+    '; asking the panel again (attempt ' .. PartitionResyncAttempt .. ')'
+  if PartitionResyncAttempt <= #PARTITION_RESYNC_DELAYS_S then LogInfo(line) else Dbg(line) end
   for _, pid in ipairs(unknown) do
     QueryPartitionArmState(pid, { fireEvents = false })
   end
@@ -3342,14 +3709,26 @@ end
 -- the documented way to seed state without it reading as a live change. Used
 -- for the cold sync on connect, so reloading the driver on an armed house
 -- does not look like a fresh arming to anything watching the proxy.
-function PublishPartitionState(partitionId, isInit)
+-- `force` re-sends to the proxy even when nothing changed (the proxy asked).
+function PublishPartitionState(partitionId, isInit, force)
   local friendly, alarmType = EffectivePartitionState(partitionId)
   local propName = 'Partition ' .. partitionId .. ' State'
   if Properties[propName] ~= nil then
     SetProp(propName, friendly)
   end
-  NotifyProxyPartitionState(partitionId, friendly, alarmType, isInit)
+  NotifyProxyPartitionState(partitionId, friendly, alarmType, isInit, force)
   RefreshPartitionsDocument(partitionId, friendly)
+  -- The programming variables are derived here, with everything else, so an
+  -- alarm, a restore or the end of an exit delay updates them too. Until v48
+  -- only SetPartitionState wrote them: they read "Armed" through an alarm,
+  -- and stayed at "Exit Delay" when the end-of-delay check went unanswered.
+  -- ARMED follows what the panel says about arming, not the overlay: a house
+  -- in alarm is still armed.
+  if partitionId >= 1 and partitionId <= MAX_DECLARED_PARTITIONS then
+    local base = tostring(PartitionStatusFor(partitionId).base)
+    SetDriverVariable('PARTITION_' .. partitionId .. '_STATE', tostring(friendly))
+    SetDriverVariable('PARTITION_' .. partitionId .. '_ARMED', base:find('^Armed') ~= nil)
+  end
 end
 
 -- The ALL_PARTITIONS_INFO document carries a <state> per partition, and the
@@ -3383,7 +3762,8 @@ end
 -- Unknown). Never used for alarms -- an alarm must not overwrite the arm
 -- state, or we lose what to go back to when it clears.
 function SetPartitionState(partitionId, state, isInit)
-  PartitionStatusFor(partitionId).base = state
+  local st = PartitionStatusFor(partitionId)
+  st.base = state
   -- The panel saying "not armed" (disarmed, unknown, offline) ends any
   -- countdown we are showing: someone pressed Cancel, disarmed at a keypad,
   -- or we lost the link. Saying "armed" does NOT end it -- the panel may
@@ -3392,17 +3772,21 @@ function SetPartitionState(partitionId, state, isInit)
   if not tostring(state):find('^Armed') then
     CancelExitDelay(partitionId)
   end
-  PublishPartitionState(partitionId, isInit)
-  -- Mirror into driver variables so Composer programming can test partition
-  -- state directly, instead of the installer maintaining a Variables-agent
-  -- boolean by hand off the arm/disarm events (which drifts if one is ever
-  -- missed).
-  if partitionId >= 1 and partitionId <= MAX_DECLARED_PARTITIONS then
-    local effective = tostring(EffectivePartitionState(partitionId))
-    SetDriverVariable('PARTITION_' .. partitionId .. '_STATE', effective)
-    SetDriverVariable('PARTITION_' .. partitionId .. '_ARMED',
-      effective:find('Armed') ~= nil)
+  if state == 'Disarmed' then
+    -- A confirmed disarm silences an intrusion alarm at the panel. Until v48
+    -- the burglary alarm stayed on the shield unless the panel also sent a
+    -- burglary restore, and entering the code in the app only disarmed
+    -- again: the alarm could not be cleared from Control4 at all. Fire,
+    -- medical, panic and duress are left for their own restores -- a duress
+    -- code disarms by design, and must not clear the duress it raises.
+    if st.alarms.Burglary then
+      st.alarms.Burglary = nil
+      LogInfo('Partition ' .. partitionId .. ': burglary alarm cleared by the disarm')
+    end
+    CancelArmRecheck(partitionId)
   end
+  -- Variables are mirrored inside PublishPartitionState (v48).
+  PublishPartitionState(partitionId, isInit)
 end
 
 -- Raises or clears one alarm type on a partition. Multiple alarm types can
@@ -3599,6 +3983,14 @@ function EndExitDelay(partitionId)
   QueryPartitionArmState(partitionId, {
     fireEvents = false,
     onSettle = function(state)
+      -- The user may have re-armed while this was being asked. That started a
+      -- new countdown, and this answer belongs to the old one: acting on it
+      -- cancelled the new countdown and sent ARM_FAILED for an arm still in
+      -- its exit delay (v48).
+      if PartitionStatusFor(partitionId).exit ~= e then
+        Dbg('Partition ' .. partitionId .. ': ignoring the answer for an earlier exit delay')
+        return false
+      end
       CancelExitDelay(partitionId)
       -- Pick up an exit time changed at the panel, for the NEXT arm. Done
       -- here, once the countdown is over, rather than at arm time: a request
@@ -3670,6 +4062,11 @@ end
 -- otherwise pin the partition in ALARM forever -- there is no other way out
 -- of an alarm than the matching restore.
 function ResetPartitionStatus()
+  -- Kill the exit-delay timers first. Until v48 the table was simply
+  -- replaced, and a repeating refresh timer from a countdown in progress
+  -- kept firing (about 1,800 times an hour) until the driver reloaded.
+  for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end
+  CancelAllArmRechecks()
   PartitionStatus = {}
   LastPublishedPartitionState = {}
 end
@@ -3713,7 +4110,13 @@ function proxyStateForFriendly(friendly)
   return nil, nil
 end
 
-function NotifyProxyPartitionState(partitionId, friendlyState, alarmType, isInit)
+-- What each partition proxy was last told, so an unchanged state is not
+-- re-sent (v48). An arm event arriving after the state is already known cost
+-- 20 Director calls and two Info lines for no visible change. A plain
+-- assignment: a reload must re-send everything once.
+LastProxyState = {}
+
+function NotifyProxyPartitionState(partitionId, friendlyState, alarmType, isInit, force)
   local bindingId = PartitionProxyBindingID(partitionId)
   if not bindingId then return end
   local state, armType = proxyStateForFriendly(friendlyState)
@@ -3724,13 +4127,20 @@ function NotifyProxyPartitionState(partitionId, friendlyState, alarmType, isInit
   end
   -- An alarm carries which KIND of alarm in TYPE (Fire/Burglary/...).
   if state == 'ALARM' and alarmType then armType = alarmType end
-  LogInfo('Partition ' .. tostring(partitionId) .. ' -> binding ' .. bindingId ..
-    ': STATE=' .. state .. ' TYPE="' .. tostring(armType) .. '"' ..
-    (isInit and ' (seed + live)' or ''))
   local delayTotal, delayRemaining = 0, 0
   if state == 'EXIT_DELAY' then
     delayTotal, delayRemaining = ExitDelayTimes(partitionId)
   end
+  -- The remaining time is part of the key, so the exit-delay refresh still
+  -- goes out on every tick.
+  local key = state .. '|' .. tostring(armType) .. '|' .. delayTotal .. '|' .. delayRemaining
+  if not isInit and not force and LastProxyState[bindingId] == key then
+    return
+  end
+  LastProxyState[bindingId] = key
+  LogInfo('Partition ' .. tostring(partitionId) .. ' -> binding ' .. bindingId ..
+    ': STATE=' .. state .. ' TYPE="' .. tostring(armType) .. '"' ..
+    (isInit and ' (seed + live)' or ''))
   local stateParams = {
     STATE = state,
     TYPE = armType,
@@ -3782,7 +4192,20 @@ end
 -- arms or disarms while the alarm is running.
 function NotifyProxyEmergency(partitionId, emergencyType, isNew)
   local panelWide = not (partitionId and partitionId > 0)
-  for _, pid in ipairs(PartitionTargets(partitionId)) do
+  local targets = PartitionTargets(partitionId)
+  if panelWide then
+    -- A life-safety alarm with no partition is shown on EVERY configured
+    -- partition (v48). Until then it fired its events but never reached the
+    -- shield, which kept showing Armed or Disarmed through a fire. This is
+    -- the opposite of the arm/disarm rule in PartitionTargets on purpose:
+    -- showing an alarm too widely is visible and harmless, while a fan-out
+    -- of "Disarmed" changes security state. Raised with scope 'panel', so
+    -- ClearPartitionAlarm clears it everywhere on any restore.
+    targets = {}
+    for pid in pairs(Partitions) do targets[#targets + 1] = pid end
+    table.sort(targets)
+  end
+  for _, pid in ipairs(targets) do
     local bindingId = PartitionProxyBindingID(pid)
     if isNew then
       if bindingId then
@@ -3889,6 +4312,7 @@ function NotifyProxyPartitionsInit()
           -- know the state. Seed OFFLINE rather than an optimistic
           -- DISARMED_READY that would show a green "disarmed" shield for an
           -- armed house.
+          LastProxyState[bindingId] = nil
           C4:SendToProxy(bindingId, 'PARTITION_STATE_INIT', {
             STATE = 'OFFLINE',
             TYPE = '',
@@ -5328,10 +5752,17 @@ function VariableValueString(value)
   return tostring(value)
 end
 
+-- Last value written per variable. SetVariable is a Director round trip, and
+-- since v48 the partition variables are re-derived on every publish, so an
+-- unchanged value is skipped. Plain assignment: reset on every load.
+VariableShadow = {}
+
 function SetDriverVariable(name, value)
   value = VariableValueString(value)
+  if VariableShadow[name] == value then return end
   local ok, err = pcall(function() C4:SetVariable(name, value) end)
   if ok then
+    VariableShadow[name] = value
     VariableWriteFailed[name] = nil
     return
   end
@@ -5574,7 +6005,7 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     if partitionId then
       -- Re-derive rather than reading a property: a live alarm must survive
       -- a routine state query, not be cancelled by it.
-      PublishPartitionState(partitionId)
+      PublishPartitionState(partitionId, false, true)
     end
     return
   end
@@ -5661,6 +6092,17 @@ function FirePartitionEvent(partitionId, suffix)
     SetProp('Last Event Summary', 'Partition ' .. partitionId .. ' ' .. suffix)
     FireDriverEvent('Unmapped Panel Event')
   end
+end
+
+-- "Burglary alarm -- Front Door", or the partition when no zone is named.
+function BurglaryAlertText(zone, partition)
+  if zone and zone > 0 then
+    return 'Burglary alarm -- ' .. (Zones[zone] and Zones[zone].name or ('zone ' .. zone))
+  end
+  if partition and partition > 0 then
+    return 'Burglary alarm -- partition ' .. partition
+  end
+  return 'Burglary alarm'
 end
 
 -- CID types that are normal panel housekeeping rather than anything to act
@@ -5757,6 +6199,10 @@ function DispatchEvent(frame)
       SetProp('Last Event Summary',
         (isNew and 'Burglary alarm' or 'Burglary alarm restored') .. ' (no partition reported)')
       FireDriverEvent('Unmapped Panel Event')
+      -- An intrusion is the alarm a notification exists for. Until v48 this
+      -- path, like the one below, never fired Any Alarm, so a setup built on
+      -- the documented "two scripts cover every notification" sent nothing.
+      if isNew then FireAlert('Burglary', BurglaryAlertText(zone, nil)) end
       return
     end
     -- Alarms are the events you will most want to find in a log after the
@@ -5775,6 +6221,7 @@ function DispatchEvent(frame)
       end
       FirePartitionEvent(pid, isNew and 'Alarm' or 'Alarm Restored')
     end
+    if isNew then FireAlert('Burglary', BurglaryAlertText(zone, partition)) end
     return
   end
 
@@ -6285,6 +6732,11 @@ function OnDriverDestroyed()
   if PersistVerifyTimerId then pcall(function() C4:KillTimer(PersistVerifyTimerId) end) end
   PersistVerifyTimerId = nil
   for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end
+  CancelAllArmRechecks()
+  if RecentActivityFlushTimerId then
+    pcall(function() C4:KillTimer(RecentActivityFlushTimerId) end)
+    RecentActivityFlushTimerId = nil
+  end
   CancelZonePublish()
   CancelEventMuteTimer()
   StopServer()
@@ -6341,10 +6793,15 @@ function OnPropertyChanged(strProperty)
     StartServer()
   elseif strProperty == 'Partitions Config' then
     Partitions = parsePartitions(Properties['Partitions Config'])
-    PartitionStatus = {}
+    -- ResetPartitionStatus, not a bare `PartitionStatus = {}`: it also kills
+    -- a running exit-delay refresh timer, which leaked here until v48.
+    ResetPartitionStatus()
     for pid, _ in pairs(Partitions) do
       SetPartitionState(pid, 'Unknown')
     end
+    -- And ask the panel straight away, rather than leaving every partition
+    -- Offline until the next connection.
+    if ConnHandle and PanelVerified then SyncPartitionStates(true) end
     -- Re-seed enable/disable across ALL declared bindings, so a partition
     -- that was just removed from the config is explicitly disabled rather
     -- than left showing its last state forever.

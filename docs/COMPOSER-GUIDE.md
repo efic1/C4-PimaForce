@@ -154,6 +154,9 @@ Home4 and Shabbat when they're set at the keypad.
   updates the app from the answer.
 - **A failed arm or disarm is shown as failed.** The previous state isn't
   left on screen.
+- **Disarming clears a burglary alarm,** even if the panel never sends a
+  restore. Fire, medical, panic and duress alarms stay until the panel
+  restores them.
 
 ### Exit delay
 
@@ -166,6 +169,10 @@ asks the panel what happened:
 - **Still disarmed:** usually a zone was open at the end of the delay. The
   app is told the arm **failed**.
 - **No answer:** the app shows Unknown. The driver never assumes Disarmed.
+
+The panel may report the arm as soon as the delay starts, while it still
+reads Disarmed. That isn't treated as a disarm: the driver checks again once
+the delay should be over, and fires the arm event when the panel reads armed.
 
 Pressing Cancel, disarming at a keypad, losing the connection, or an alarm
 ends the countdown. A keypad arm has no countdown, because the driver didn't

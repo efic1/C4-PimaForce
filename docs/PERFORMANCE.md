@@ -38,6 +38,40 @@ use it to compare versions, not as absolute time.
   at Info, structurally. At Debug every frame logs about four lines, which is
   what Debug is for.
 
+## Found and fixed in v48
+
+Measured with the v47 review's profiler (35 zones, 11 motion, one partition).
+
+| Scenario | v47 | v48 |
+| --- | --- | --- |
+| Full arm/disarm cycle | 85 calls, 14 log lines | **69 calls, 11 lines** |
+| Panel arm event when the state is already known | 20 | **14** |
+| Panel disarm event | 11 | **6** |
+| Disconnect | 24 | **14** |
+| Reconnect | 59 | **49** |
+| 20 reconnects during an exit delay (refresh 2 s), then idle | 21 live timers | **1** |
+
+**1. The exit-delay refresh timer leaked.** A reconnect or a Partitions Config
+edit during an exit delay replaced the partition state without cancelling the
+countdown, so its repeating refresh timer (Exit Delay Refresh Seconds above 0)
+kept firing about 1,800 times an hour until the driver reloaded. Resetting
+partition state now cancels every countdown first.
+
+**2. Recent Activity was rewritten on every Info line.** That was most of the
+property writes in an arm/disarm cycle. It is now written once per burst, on a
+2-second timer.
+
+**3. An unchanged state was re-sent.** The partition proxy is now told only
+when what it would show changes (the exit-delay remaining time counts as a
+change, so the refresh still works). A proxy GET_CURRENT_STATE is always
+answered. Driver variables are written only when their value changes, and a
+repeated "System Key Status" or retry line goes to Debug.
+
+Still open from the review, and cheap enough to leave for now: the first
+connection after a load re-publishes the zone list once (75 calls); a rename
+re-publishes the whole list rather than one zone; the watchdog wakes every
+15 s (no Director work).
+
 ## Found and fixed in v42
 
 **1. Hidden diagnostic properties were written on every zone event.**
