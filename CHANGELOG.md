@@ -10,6 +10,23 @@ changes hot-reload.
 
 ---
 
+## v49 — phone line and network faults are reported
+
+- **Fixed: a dead phone line was invisible to Control4.** The keypad showed
+  "Telephone line voltage" while the driver reported nothing. The panel reports
+  this as CID 351 (PSTN line / GSM module / network / SIM fault), which the
+  driver did not handle at all. It now raises `Phone Line Trouble` /
+  `Phone Line Restored` (new events) plus `Any Trouble`, and a proxy trouble.
+  GSM and network faults raise `Any Trouble` and a proxy trouble.
+- **Fixed: a fault already present at connect was never reported.** Events only
+  arrive when something changes. The driver now reads the panel's fault list
+  (parameter 2250) after every verified connect and on *Refresh Troubles*, and
+  raises or clears the phone line, GSM and network troubles to match.
+- CID 350 (CMS path) now names the failed channel (PSTN, GPRS, GSM voice,
+  network) in `ALERT_TEXT`.
+
+---
+
 ## v48 — fixes from the v47 code review
 
 **Alarms and arming**

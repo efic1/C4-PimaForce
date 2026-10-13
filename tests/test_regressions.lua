@@ -4757,6 +4757,44 @@ test('a trouble fires Any Trouble with a readable description (v30)', function()
     'got ' .. tostring(Variables['ALERT_TEXT']))
 end)
 
+test('a PSTN line fault (CID 351) is reported, once, and restore clears it (v49)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  local ev = '{"frame_type":"event","counter":%d,"account":"1234","type":351,"qualifier":%d,"zone":0,"partition":0}'
+  OnServerDataIn(h, string.format(ev, 70, 1), '10.0.0.50', 5555)
+  local fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = (fired[e] or 0) + 1 end
+  assert(fired['Phone Line Trouble'] == 1 and fired['Any Trouble'] == 1,
+    'a phone line fault must fire Phone Line Trouble and Any Trouble')
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'Phone line', 'got ' .. tostring(Variables['LAST_TROUBLE_TYPE']))
+  -- Same fault again (a different counter): not raised twice.
+  OnServerDataIn(h, string.format(ev, 71, 1), '10.0.0.50', 5555)
+  fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = (fired[e] or 0) + 1 end
+  assert(fired['Phone Line Trouble'] == 1, 'an active fault must not be raised again')
+  OnServerDataIn(h, string.format(ev, 72, 3), '10.0.0.50', 5555)
+  fired = {}
+  for _, e in ipairs(calls.FireEvent) do fired[e] = true end
+  assert(fired['Phone Line Restored'], 'the restore must fire')
+  assert(not LineTroubleActive.phone, 'restore must clear the active flag')
+end)
+
+test('a phone line fault already present at connect is picked up from the fault list (v49)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  calls.FireEvent = {}
+  -- Fault 6 = PSTN Fault DC, fault 7 = dial tone; 0x1 = AC loss is not a line fault.
+  ReconcileLineTroubles({ '6', '7', '1' })
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == 'Phone Line Trouble' then n = n + 1 end end
+  assert(n == 1, 'two PSTN fault IDs are one phone line trouble, got ' .. n)
+  ReconcileLineTroubles({})
+  local restored = false
+  for _, e in ipairs(calls.FireEvent) do if e == 'Phone Line Restored' then restored = true end end
+  assert(restored, 'a fault list without the fault must clear it')
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()

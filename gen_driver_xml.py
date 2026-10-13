@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 48
+DRIVER_VERSION = 49
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's
@@ -258,6 +258,8 @@ generic_events = [
     ('Low Battery Restored', 'Low battery restored.'),
     ('Communication Trouble', 'CMS communication path trouble.'),
     ('Communication Restored', 'CMS communication path restored.'),
+    ('Phone Line Trouble', 'Panel telephone (PSTN) line fault: no line voltage or dial tone.'),
+    ('Phone Line Restored', 'Panel telephone (PSTN) line restored.'),
     ('Output Activated', 'A panel output (e.g. siren) activated. See Last Output Number.'),
     ('Output Deactivated', 'A panel output deactivated.'),
     ('Unmapped Panel Event', 'A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.'),
