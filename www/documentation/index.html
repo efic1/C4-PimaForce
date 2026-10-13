@@ -31,7 +31,7 @@ blockquote p { margin: 4px 0; }
 <body>
 <main>
 <h1 id="pima-force-alarm-panel">PIMA FORCE Alarm Panel</h1>
-<p class="version">Driver version 49</p>
+<p class="version">Driver version 50</p>
 <p>A Control4 driver for <strong>PIMA FORCE</strong> alarm panels. It talks directly to the
 panel over the panel's own local JSON interface. There's no cloud service,
 bridge or extra hardware.</p>
@@ -489,6 +489,21 @@ User codes are always masked, so a debug log is safe to share.</p>
 <tr><td><b>Communication Restored</b></td><td>CMS communication path restored.</td></tr>
 <tr><td><b>Phone Line Trouble</b></td><td>Panel telephone (PSTN) line fault: no line voltage or dial tone.</td></tr>
 <tr><td><b>Phone Line Restored</b></td><td>Panel telephone (PSTN) line restored.</td></tr>
+<tr><td><b>Power Trouble</b></td><td>Expander/zone-expander/keypad power fault: low battery, AC loss or voltage fault.</td></tr>
+<tr><td><b>Power Restored</b></td><td>Expander/keypad power fault restored.</td></tr>
+<tr><td><b>Device Trouble</b></td><td>Expander, keypad or wireless receiver fault or tamper.</td></tr>
+<tr><td><b>Device Restored</b></td><td>Expander, keypad or wireless receiver fault restored.</td></tr>
+<tr><td><b>Zone Wiring Trouble</b></td><td>A zone is cut or shorted, or has a tamper/anti-mask fault.</td></tr>
+<tr><td><b>Zone Wiring Restored</b></td><td>Zone wiring fault restored.</td></tr>
+<tr><td><b>Siren Trouble</b></td><td>Internal or external siren fault, low battery, tamper or supervision loss.</td></tr>
+<tr><td><b>Siren Restored</b></td><td>Siren fault restored.</td></tr>
+<tr><td><b>Wireless Trouble</b></td><td>Wireless detector or accessory trouble, supervision loss or low battery.</td></tr>
+<tr><td><b>Wireless Restored</b></td><td>Wireless detector or accessory trouble restored.</td></tr>
+<tr><td><b>Jamming Detected</b></td><td>Wireless jamming detected.</td></tr>
+<tr><td><b>Jamming Cleared</b></td><td>Wireless jamming cleared.</td></tr>
+<tr><td><b>Pre-Alarm</b></td><td>A zone reported a pre-alarm.</td></tr>
+<tr><td><b>Access Denied</b></td><td>A code was refused: invalid code or outside its time window.</td></tr>
+<tr><td><b>System Inactivity</b></td><td>The panel reports no arm/disarm activity for its inactivity period.</td></tr>
 <tr><td><b>Output Activated</b></td><td>A panel output (e.g. siren) activated. See Last Output Number.</td></tr>
 <tr><td><b>Output Deactivated</b></td><td>A panel output deactivated.</td></tr>
 <tr><td><b>Unmapped Panel Event</b></td><td>A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.</td></tr>

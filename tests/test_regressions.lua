@@ -4813,6 +4813,155 @@ test('a failed report to the monitoring station is raised once, from either sour
   assert(restored, 'clearing the fault must fire Communication Restored')
 end)
 
+-- v50: the remaining trouble CIDs and the fault list ------------------------
+
+local function sendCid(h, counter, cid, qualifier, zone)
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"event","counter":%d,"account":"1234","type":%d,"qualifier":%d,"zone":%d,"partition":0}',
+    counter, cid, qualifier, zone), '10.0.0.50', 5555)
+end
+
+local function firedCounts()
+  local n = {}
+  for _, e in ipairs(calls.FireEvent) do n[e] = (n[e] or 0) + 1 end
+  return n
+end
+
+local TROUBLE_CIDS = {
+  { 143, 'Device Trouble', 'Device Restored' },
+  { 145, 'Device Trouble', 'Device Restored' },
+  { 144, 'Zone Wiring Trouble', 'Zone Wiring Restored' },
+  { 312, 'Power Trouble', 'Power Restored' },
+  { 338, 'Power Trouble', 'Power Restored' },
+  { 342, 'Power Trouble', 'Power Restored' },
+  { 321, 'Siren Trouble', 'Siren Restored' },
+  { 322, 'Siren Trouble', 'Siren Restored' },
+  { 344, 'Jamming Detected', 'Jamming Cleared' },
+  { 373, 'Wireless Trouble', 'Wireless Restored' },
+  { 381, 'Wireless Trouble', 'Wireless Restored' },
+  { 384, 'Wireless Trouble', 'Wireless Restored' },
+}
+for idx, row in ipairs(TROUBLE_CIDS) do
+  test('CID ' .. row[1] .. ' raises ' .. row[2] .. ' and clears it (v50)', function()
+    freshDriver()
+    local h = connectPanel()
+    calls.FireEvent = {}
+    sendCid(h, 900 + idx * 2, row[1], 1, 3)
+    local n = firedCounts()
+    assert(n[row[2]] == 1 and n['Any Trouble'] == 1, 'raise: ' .. JSON.encode(n))
+    assert(n['Unmapped Panel Event'] == nil, 'must no longer be unmapped')
+    sendCid(h, 901 + idx * 2, row[1], 3, 3)
+    n = firedCounts()
+    assert(n[row[3]] == 1, 'restore: ' .. JSON.encode(n))
+  end)
+end
+
+test('a second device is not hidden behind the first, and the proxy clears last (v50)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  sendCid(h, 1000, 143, 1, 2)   -- expander 2
+  sendCid(h, 1001, 143, 1, 5)   -- expander 5
+  sendCid(h, 1002, 143, 1, 5)   -- repeat of 5: not raised again
+  assert(firedCounts()['Device Trouble'] == 2, 'two devices, two raises: ' .. JSON.encode(firedCounts()))
+  assert(Variables['ALERT_TEXT']:find('#5', 1, true), 'text names the device: ' .. tostring(Variables['ALERT_TEXT']))
+  calls.SendToProxy = calls.SendToProxy or {}
+  local before = #calls.SendToProxy
+  sendCid(h, 1003, 143, 3, 2)
+  local cleared = false
+  for i = before + 1, #calls.SendToProxy do
+    if calls.SendToProxy[i][2] == 'TROUBLE_CLEAR' then cleared = true end
+  end
+  assert(not cleared, 'expander 5 is still faulty, so the app trouble must stay')
+  assert(LineTroubleActive.device and LineTroubleActive.device[5], 'device 5 still tracked')
+  sendCid(h, 1004, 143, 3, 5)
+  assert(LineTroubleActive.device == nil, 'all cleared')
+end)
+
+test('a wireless/zone trouble names the zone (v50)', function()
+  freshDriver({ ['Zones Config'] = '4,Garage Door,contact' })
+  local h = connectPanel()
+  calls.FireEvent = {}
+  sendCid(h, 1100, 381, 1, 4)
+  assert(Variables['ALERT_TEXT']:find('Garage Door', 1, true),
+    'got ' .. tostring(Variables['ALERT_TEXT']))
+end)
+
+test('pre-alarm, access denied and inactivity each fire their own event (v50)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  sendCid(h, 1200, 138, 1, 2)
+  sendCid(h, 1201, 421, 1, 0)
+  sendCid(h, 1202, 454, 1, 0)
+  local n = firedCounts()
+  assert(n['Pre-Alarm'] == 1 and n['Access Denied'] == 1 and n['System Inactivity'] == 1,
+    JSON.encode(n))
+  assert(n['Unmapped Panel Event'] == nil)
+  sendCid(h, 1203, 138, 3, 2)   -- restore: nothing to say
+  assert(firedCounts()['Pre-Alarm'] == 1, 'a pre-alarm restore must not fire again')
+end)
+
+test('AC loss and low battery keep their events and texts through the shared path (v50)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  sendCid(h, 1300, 301, 1, 0)
+  assert(Variables['ALERT_TEXT'] == 'Mains power lost' and firedCounts()['AC Power Lost'] == 1)
+  sendCid(h, 1301, 302, 1, 0)
+  assert(Variables['ALERT_TEXT'] == 'Panel battery low' and firedCounts()['Low Battery'] == 1)
+  sendCid(h, 1302, 301, 3, 0)
+  sendCid(h, 1303, 302, 3, 0)
+  local n = firedCounts()
+  assert(n['AC Power Restored'] == 1 and n['Low Battery Restored'] == 1, JSON.encode(n))
+end)
+
+test('the fault list maps each Appendix E ID to a kind (v50)', function()
+  local expect = {
+    [1] = 'ac', [2] = 'battery', [6] = 'phone', [7] = 'phone', [5] = 'power', [21] = 'power',
+    [9] = 'device', [24] = 'device', [30] = 'comm', [38] = 'comm', [39] = 'gsm', [56] = 'gsm',
+    [57] = 'network', [59] = 'jamming', [60] = 'zone', [61] = 'zone', [62] = 'wireless',
+    [88] = 'wireless', [67] = 'siren', [79] = 'siren',
+  }
+  freshDriver()
+  for id, kind in pairs(expect) do
+    assert(LineFaultKind(id) == kind, 'fault ' .. id .. ' -> ' .. tostring(LineFaultKind(id)))
+  end
+  for _, id in ipairs({ 3, 4, 34, 37, 66, 69, 94 }) do
+    assert(LineFaultKind(id) == nil, 'fault ' .. id .. ' is deliberately not a standing trouble')
+  end
+end)
+
+test('faults already present at connect are raised once per device from the list (v50)', function()
+  freshDriver()
+  connectPanel()
+  calls.FireEvent = {}
+  -- AC loss (0x1), zone expander fault #3 (0x309), siren fault (0x43), zone 27 tamper fault (0x1B3C)
+  ReconcileTroubles({ '1', '309', '43', '1B3C' })
+  local n = firedCounts()
+  assert(n['AC Power Lost'] == 1 and n['Device Trouble'] == 1 and n['Siren Trouble'] == 1
+    and n['Zone Wiring Trouble'] == 1, JSON.encode(n))
+  -- Reading the list again changes nothing.
+  calls.FireEvent = {}
+  ReconcileTroubles({ '1', '309', '43', '1B3C' })
+  assert(next(firedCounts()) == nil, 'an unchanged list must be silent: ' .. JSON.encode(firedCounts()))
+end)
+
+test('the fault list clears what is gone, including event-raised troubles (v50)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 1400, 342, 1, 2)             -- raised by an event
+  ReconcileTroubles({ '309' })            -- list: no power fault, one device fault
+  assert(LineTroubleActive.power == nil, 'a kind missing from the list is cleared')
+  assert(LineTroubleActive.device and LineTroubleActive.device[3], 'device #3 raised from the list')
+  calls.FireEvent = {}
+  ReconcileTroubles({ '40A' })            -- device 4 now (id 10), device 3 gone
+  local set = LineTroubleActive.device
+  assert(set and set[4] and set[3] == nil, 'device 3 cleared and device 4 raised')
+  local n = firedCounts()
+  assert(n['Device Trouble'] == 1 and n['Device Restored'] == 1, JSON.encode(n))
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()

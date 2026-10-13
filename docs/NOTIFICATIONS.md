@@ -107,12 +107,12 @@ No driver changes needed. In Composer Pro:
 2. In **Programming**, select the driver's event under Device Events.
 3. Drag the agent's *Send Notification* action into the script.
 
-The events worth notifying on, from the 44 the driver exposes:
+The events worth notifying on, from the 65 the driver exposes:
 
 | Priority | Events |
 | --- | --- |
 | **Alarms** | `Partition N Alarm`, `Partition N Alarm Restored`, `Fire Alarm`, `Medical Alarm`, `Panic Alarm`, `Duress Alarm`, `Tamper Alarm` (+ their Restored pairs) |
-| **Faults** | `AC Power Lost` / `Restored`, `Low Battery` / `Restored`, `Communication Trouble` / `Restored` |
+| **Faults** | `AC Power Lost` / `Restored`, `Low Battery` / `Restored`, `Communication Trouble` / `Restored`, `Phone Line Trouble` / `Restored`, `Device`, `Power`, `Siren`, `Wireless` and `Zone Wiring Trouble` / `Restored`, `Jamming Detected` / `Cleared`. `Any Trouble` covers all of them |
 | **Arming** | `Partition N Armed` / `Disarmed`, or the specific mode events |
 | **Avoid** | `Zone Opened` / `Zone Closed` — far too frequent |
 

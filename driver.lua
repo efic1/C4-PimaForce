@@ -70,6 +70,9 @@ local EV_DURESS      = 121
 local EV_PANIC_SIL   = 122
 local EV_BURGLARY    = 130
 local EV_TAMPER      = 137
+local EV_PRE_ALARM   = 138
+local EV_ACCESS_DENIED = 421
+local EV_INACTIVITY  = 454
 local EV_AC_LOSS     = 301
 local EV_LOW_BATTERY = 302
 local EV_COMM_TROUBLE= 350
@@ -98,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 49
+local DRIVER_VERSION = 50
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -5524,7 +5527,7 @@ function ExecutePartitionFunction(partitionId, name)
         return
       end
       local faults = frame and frame.parameters or {}
-      ReconcileLineTroubles(faults)
+      ReconcileTroubles(faults)
       local decoded = DecodeFaults(faults)
       LogInfo('Refresh Troubles: panel reports ' .. #faults .. ' active fault(s): ' .. decoded)
       SetProp('Last Command Result', 'Troubles (' .. #faults .. '): ' .. decoded)
@@ -6131,14 +6134,39 @@ ROUTINE_EVENT_NAMES = {
     at all, so the panel's fault list (parameter 2250) is also read after
     every verified connect and on Refresh Troubles, and reconciled here.
 ===============================================================================]]
+-- One entry per kind of standing trouble. `perOrder` kinds track each device
+-- (expander, zone, siren...) separately, so a second failure is not hidden
+-- behind the first; the others are tracked once, because the panel's event and
+-- its fault-list entry do not number the thing the same way.
 LINE_TROUBLE_KINDS = {
+  ac      = { label = 'AC power', proxy = 'AC power lost', trouble = 'AC Power Lost', restored = 'AC Power Restored',
+              newText = 'Panel AC power lost', restoredText = 'Panel AC power restored',
+              alertKind = 'AC Power', alertText = 'Mains power lost' },
+  battery = { label = 'Battery', proxy = 'Low battery', trouble = 'Low Battery', restored = 'Low Battery Restored',
+              newText = 'Panel low battery', restoredText = 'Panel battery restored',
+              alertKind = 'Battery', alertText = 'Panel battery low' },
   phone   = { label = 'Phone line', proxy = 'Phone line fault',
               trouble = 'Phone Line Trouble', restored = 'Phone Line Restored' },
   gsm     = { label = 'GSM', proxy = 'GSM fault' },
   network = { label = 'Network', proxy = 'Network fault' },
   -- Reports to the monitoring station / contacts failing (CID 350, faults 30-38).
   comm    = { label = 'Communication', proxy = 'Communication trouble',
-              trouble = 'Communication Trouble', restored = 'Communication Restored' },
+              trouble = 'Communication Trouble', restored = 'Communication Restored',
+              newText = 'Panel communication trouble', restoredText = 'Panel communication restored',
+              alertKind = 'Communication' },
+  -- v50
+  power   = { label = 'Power supply', proxy = 'Power supply fault', perOrder = true,
+              trouble = 'Power Trouble', restored = 'Power Restored' },
+  device  = { label = 'Expander/keypad', proxy = 'Expander or keypad fault', perOrder = true,
+              trouble = 'Device Trouble', restored = 'Device Restored' },
+  zone    = { label = 'Zone wiring', proxy = 'Zone wiring fault', perOrder = true, zoneNamed = true,
+              trouble = 'Zone Wiring Trouble', restored = 'Zone Wiring Restored' },
+  siren   = { label = 'Siren', proxy = 'Siren fault', perOrder = true,
+              trouble = 'Siren Trouble', restored = 'Siren Restored' },
+  wireless = { label = 'Wireless device', proxy = 'Wireless device fault', perOrder = true, zoneNamed = true,
+              trouble = 'Wireless Trouble', restored = 'Wireless Restored' },
+  jamming = { label = 'Wireless jamming', proxy = 'Wireless jamming', perOrder = true,
+              trouble = 'Jamming Detected', restored = 'Jamming Cleared' },
 }
 
 -- CID 351 "order" -> kind (Appendix A).
@@ -6147,53 +6175,107 @@ LINE_TROUBLE_BY_ORDER = { [0] = 'phone', [1] = 'gsm', [2] = 'network', [3] = 'gs
 -- Station comms channel named by the order of CID 350 (Appendix A).
 STATION_CHANNEL_BY_ORDER = { [1] = 'PSTN', [2] = 'GPRS', [3] = 'GSM voice', [4] = 'network' }
 
--- Appendix E fault ID -> kind.
+-- CID types (Appendix A) that are a standing trouble of one kind. The order
+-- is the device number, or the zone number for zone/wireless kinds.
+TROUBLE_KIND_BY_CID = {
+  [143] = 'device', [145] = 'device',
+  [144] = 'zone',
+  [312] = 'power', [338] = 'power', [342] = 'power',
+  [321] = 'siren', [322] = 'siren',
+  [344] = 'jamming',
+  [373] = 'wireless', [381] = 'wireless', [384] = 'wireless',
+}
+
+-- Appendix E fault ID -> kind. Not mapped on purpose: 3/4 (panel tamper,
+-- handled as an alarm), 66 invalid code alarm, 69 time not set, and the
+-- reserved IDs 34, 37, 94.
+FAULT_KIND_BY_ID = {}
+local function mapFaults(kind, ids) for _, id in ipairs(ids) do FAULT_KIND_BY_ID[id] = kind end end
+mapFaults('ac', { 1 })
+mapFaults('battery', { 2 })
+mapFaults('phone', { 6, 7 })
+mapFaults('power', { 5, 8, 11, 12, 13, 14, 16, 17, 20, 21, 22, 23, 26, 29 })
+mapFaults('device', { 9, 10, 15, 18, 19, 24, 25, 27, 28, 89, 90, 91, 92, 93, 95, 97, 98 })
+mapFaults('comm', { 30, 31, 32, 33, 35, 36, 38 })
+for id = 39, 56 do FAULT_KIND_BY_ID[id] = 'gsm' end
+mapFaults('network', { 57, 58 })
+mapFaults('jamming', { 59, 83 })
+mapFaults('zone', { 60, 61 })
+mapFaults('wireless', { 62, 63, 64, 65, 70, 71, 72, 73, 74, 75, 76, 80, 81, 82, 84, 85, 86, 87, 88, 96 })
+mapFaults('siren', { 67, 68, 77, 78, 79 })
+
 function LineFaultKind(faultId)
-  if faultId == 6 or faultId == 7 then return 'phone' end
-  if faultId >= 39 and faultId <= 56 then return 'gsm' end
-  if faultId == 57 or faultId == 58 then return 'network' end
-  if faultId >= 30 and faultId <= 38 and faultId ~= 34 and faultId ~= 37 then return 'comm' end
-  return nil
+  return FAULT_KIND_BY_ID[faultId]
 end
 
+-- LineTroubleActive[kind] = { [order] = 'event' | 'list' }; nil when none.
 LineTroubleActive = {}
 
-function SetLineTrouble(kind, isNew, detail)
+local function troubleWho(k, order, detail)
+  if detail then return detail end
+  if not (k.perOrder and order > 0) then return nil end
+  if k.zoneNamed and Zones[order] and Zones[order].name then return Zones[order].name end
+  return '#' .. order
+end
+
+function SetLineTrouble(kind, isNew, order, detail, source)
   local k = LINE_TROUBLE_KINDS[kind]
   if not k then return end
-  if isNew and LineTroubleActive[kind] then
-    Dbg(k.label .. ' trouble already active; not raising it again')
-    return
+  order = k.perOrder and (tonumber(order) or 0) or 0
+  local set = LineTroubleActive[kind]
+  if isNew then
+    if set and set[order] then
+      Dbg(k.label .. ' trouble already active; not raising it again')
+      return
+    end
+    set = set or {}
+    set[order] = source or 'event'
+    LineTroubleActive[kind] = set
+  elseif set then
+    set[order] = nil
+    if next(set) == nil then LineTroubleActive[kind] = nil end
   end
-  LineTroubleActive[kind] = isNew and true or nil
-  local text = k.label .. (isNew and ' fault' or ' restored') .. (detail and (' (' .. detail .. ')') or '')
+  local who = troubleWho(k, order, detail)
+  local suffix = who and (' (' .. who .. ')') or ''
+  local text = (isNew and (k.newText or (k.label .. ' fault')) or (k.restoredText or (k.label .. ' restored'))) .. suffix
   LogInfo((isNew and 'TROUBLE: ' or 'Trouble cleared: ') .. text)
   SetProp('Last Event Summary', text)
   local ev = isNew and k.trouble or k.restored
   if ev then FireDriverEvent(ev) end
-  if isNew then FireTrouble(k.label, text) end
-  NotifyProxyTrouble(k.proxy, isNew)
+  if isNew then FireTrouble(k.alertKind or k.label, (k.alertText or text) .. ((k.alertText and suffix) or '')) end
+  -- One proxy trouble per kind: clear it only when the last device is fixed.
+  if isNew or LineTroubleActive[kind] == nil then NotifyProxyTrouble(k.proxy, isNew) end
 end
 
--- params: the 2250 parameters array. Raises what is newly present, clears
--- what is no longer.
-function ReconcileLineTroubles(params)
+-- params: the 2250 parameters array. Raises what is newly present and clears
+-- what is no longer. A kind absent from the list is cleared entirely; for a
+-- kind that is present, only entries this list raised are cleared.
+function ReconcileTroubles(params)
   local present = {}
   if type(params) == 'table' then
     for i = 1, #params do
       local v = tonumber(tostring(JSON.scalar(params[i])), 16)
       local kind = v and LineFaultKind(v % 0x100)
-      if kind then present[kind] = true end
+      if kind then
+        local k = LINE_TROUBLE_KINDS[kind]
+        present[kind] = present[kind] or {}
+        present[kind][k.perOrder and (math.floor(v / 0x100) % 0x100) or 0] = true
+      end
     end
   end
   for kind in pairs(LINE_TROUBLE_KINDS) do
-    if present[kind] then
-      SetLineTrouble(kind, true, 'from panel fault list')
-    elseif LineTroubleActive[kind] then
-      SetLineTrouble(kind, false, 'from panel fault list')
+    local p = present[kind]
+    if p then
+      for order in pairs(p) do SetLineTrouble(kind, true, order, nil, 'list') end
     end
+    local stale = {}
+    for order, src in pairs(LineTroubleActive[kind] or {}) do
+      if (not p) or (src == 'list' and not p[order]) then stale[#stale + 1] = order end
+    end
+    for _, order in ipairs(stale) do SetLineTrouble(kind, false, order) end
   end
 end
+ReconcileLineTroubles = ReconcileTroubles  -- v49 name
 
 function SyncFaults()
   local pw = nil
@@ -6206,7 +6288,7 @@ function SyncFaults()
       LogWarn('Could not read the panel fault list: ' .. tostring(err))
       return
     end
-    ReconcileLineTroubles(frame and frame.parameters)
+    ReconcileTroubles(frame and frame.parameters)
   end)
 end
 
@@ -6360,26 +6442,18 @@ function DispatchEvent(frame)
 
   -- System troubles
   if etype == EV_AC_LOSS then
-    local isNew = (qualifier == QUALIFIER_NEW)
-    LogInfo(isNew and 'Panel AC power lost' or 'Panel AC power restored')
-    FireDriverEvent(isNew and 'AC Power Lost' or 'AC Power Restored')
-    if isNew then FireTrouble('AC Power', 'Mains power lost') end
-    NotifyProxyTrouble('AC power lost', isNew)
+    SetLineTrouble('ac', qualifier == QUALIFIER_NEW)
     return
   end
   if etype == EV_LOW_BATTERY then
-    local isNew = (qualifier == QUALIFIER_NEW)
-    LogInfo(isNew and 'Panel low battery' or 'Panel battery restored')
-    FireDriverEvent(isNew and 'Low Battery' or 'Low Battery Restored')
-    if isNew then FireTrouble('Battery', 'Panel battery low') end
-    NotifyProxyTrouble('Low battery', isNew)
+    SetLineTrouble('battery', qualifier == QUALIFIER_NEW)
     return
   end
   if etype == EV_COMM_TROUBLE then
     local isNew = (qualifier == QUALIFIER_NEW)
     -- Shared with the fault-list sync (v49), so a failure seen both ways is
     -- raised once.
-    SetLineTrouble('comm', isNew, STATION_CHANNEL_BY_ORDER[zone])
+    SetLineTrouble('comm', isNew, zone, STATION_CHANNEL_BY_ORDER[zone])
     -- The panel just said its link is back: exactly the moment a state query
     -- may have been missed. Ask now rather than wait for the retry timer.
     if not isNew then
@@ -6392,7 +6466,39 @@ function DispatchEvent(frame)
 
   if etype == EV_LINE_TROUBLE then
     local kind = LINE_TROUBLE_BY_ORDER[zone] or 'phone'
-    SetLineTrouble(kind, qualifier == QUALIFIER_NEW, 'CID 351 order ' .. zone)
+    SetLineTrouble(kind, qualifier == QUALIFIER_NEW, zone)
+    return
+  end
+
+  -- Device, zone-wiring, siren, wireless, power-supply faults and jamming (v50).
+  local troubleKind = TROUBLE_KIND_BY_CID[etype]
+  if troubleKind then
+    SetLineTrouble(troubleKind, qualifier == QUALIFIER_NEW, zone)
+    return
+  end
+
+  -- Pre-alarm, refused code and long inactivity (v50): worth a programming
+  -- event each, none of them a standing trouble.
+  if etype == EV_PRE_ALARM then
+    if qualifier == QUALIFIER_NEW then
+      LogInfo('Pre-alarm' .. (zone > 0 and (', zone ' .. zone) or ''))
+      SetProp('Last Event Summary', 'Pre-alarm' .. (zone > 0 and (', zone ' .. zone) or ''))
+      FireDriverEvent('Pre-Alarm')
+    end
+    return
+  end
+  if etype == EV_ACCESS_DENIED then
+    LogWarn('Access denied (invalid code or outside time window)')
+    SetProp('Last Event Summary', 'Access denied')
+    FireDriverEvent('Access Denied')
+    return
+  end
+  if etype == EV_INACTIVITY then
+    if qualifier == QUALIFIER_NEW then
+      LogInfo('Panel reports system inactivity')
+      SetProp('Last Event Summary', 'System inactivity')
+      FireDriverEvent('System Inactivity')
+    end
     return
   end
 
