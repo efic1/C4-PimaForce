@@ -5081,6 +5081,21 @@ test('the fault list cannot clear a zone cut/short raised by its event (v51)', f
   assert(LineTroubleActive.zone == nil)
 end)
 
+test('a trouble clear names the trouble, so the history says which one (v52)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3000, 351, 1, 0)
+  calls.SendToProxy = {}
+  sendCid(h, 3001, 351, 3, 0)
+  local cleared
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[2] == 'TROUBLE_CLEAR' then cleared = c[3] end
+  end
+  assert(cleared, 'a clear must be sent')
+  assert(cleared.TROUBLE_TEXT == 'Phone line fault', 'got ' .. tostring(cleared.TROUBLE_TEXT))
+  assert(cleared.IDENTIFIER == TroubleIdentifier('Phone line fault'), 'same identifier as the start')
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()

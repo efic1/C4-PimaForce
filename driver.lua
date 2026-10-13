@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 51
+local DRIVER_VERSION = 52
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -4276,8 +4276,12 @@ function NotifyProxyTrouble(troubleText, isNew)
       IDENTIFIER = id,
     }, 'NOTIFY')
   else
+    -- TROUBLE_TEXT is not in the reference driver's clear. Without it the
+    -- app's history reads just "Trouble cleared", which does not say which
+    -- trouble (v52). Same text as the start, so the two lines pair up.
     C4:SendToProxy(PANEL_PROXY_BINDINGID, 'TROUBLE_CLEAR', {
       IDENTIFIER = id,
+      TROUBLE_TEXT = troubleText,
     }, 'NOTIFY')
   end
 end

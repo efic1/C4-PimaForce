@@ -10,6 +10,17 @@ changes hot-reload.
 
 ---
 
+## v52 — the trouble clear names the trouble
+
+- **Changed: `TROUBLE_CLEAR` now carries `TROUBLE_TEXT`**, the same text as the
+  matching `TROUBLE_START` (for example "Phone line fault"), so the history can
+  say which trouble was cleared instead of just "Trouble cleared". This is an
+  extra parameter beyond the reference driver's. If your Control4 history still
+  shows a bare "Trouble cleared", the proxy ignores it and this change has no
+  effect; nothing else depends on it.
+
+---
+
 ## v51 — troubles that clear without a restore event
 
 - **Fixed: a phone line fault could stay raised after the line came back.**
