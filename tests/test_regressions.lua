@@ -4996,6 +4996,37 @@ test('a trouble clear names the trouble, so the history says which one (v51)', f
   assert(cleared.IDENTIFIER == TroubleIdentifier('Phone line fault'), 'same identifier as the start')
 end)
 
+test('a clear sets LAST_CLEARED_* before the clear goes out, and names the right trouble (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3100, 351, 1, 0)    -- phone line
+  sendCid(h, 3101, 301, 1, 0)    -- AC loss, raised later
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power')
+  -- Capture what the variables hold at the moment the proxy is told.
+  local atClear
+  local realSend = C4.SendToProxy
+  C4.SendToProxy = function(self, id, cmd, params, mode)
+    if cmd == 'TROUBLE_CLEAR' then
+      atClear = { type = Variables['LAST_CLEARED_TYPE'], text = Variables['LAST_CLEARED_TEXT'] }
+    end
+    return realSend(self, id, cmd, params, mode)
+  end
+  sendCid(h, 3102, 351, 3, 0)    -- the PHONE line clears, not the AC loss
+  C4.SendToProxy = realSend
+  assert(atClear, 'a clear must be sent')
+  assert(atClear.type == 'Phone line' and atClear.text == 'Phone line restored',
+    'got ' .. tostring(atClear.type) .. ' / ' .. tostring(atClear.text))
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power', 'LAST_TROUBLE_* is untouched by a clear')
+end)
+
+test('a tamper restore sets LAST_CLEARED_* (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3200, 137, 1, 1)
+  sendCid(h, 3201, 137, 3, 1)
+  assert(Variables['LAST_CLEARED_TYPE'] == 'Tamper' and Variables['LAST_CLEARED_TEXT'] == 'Tamper restored')
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()

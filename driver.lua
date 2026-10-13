@@ -4262,6 +4262,11 @@ function TroubleIdentifier(troubleText)
   return TroubleIdAssigned[troubleText]
 end
 
+function RecordTroubleCleared(kind, text)
+  SetDriverVariable('LAST_CLEARED_TYPE', kind)
+  SetDriverVariable('LAST_CLEARED_TEXT', text)
+end
+
 function NotifyProxyTrouble(troubleText, isNew)
   local id = TroubleIdentifier(troubleText)
   if isNew then
@@ -5677,6 +5682,13 @@ function DeclareDriverVariables()
   -- which survives a later alarm.
   add('LAST_TROUBLE_TEXT', '', 'STRING')
   add('LAST_TROUBLE_TYPE', '', 'STRING')
+  -- Set on every trouble CLEAR (v51), before the clear is sent, so a
+  -- notification on the app's trouble-clear event can say which one cleared.
+  -- LAST_TROUBLE_* only changes when a trouble is raised, so on a clear it
+  -- still names whichever trouble was raised last, which is wrong as soon as
+  -- two are standing.
+  add('LAST_CLEARED_TYPE', '', 'STRING')
+  add('LAST_CLEARED_TEXT', '', 'STRING')
   add('PANEL_CONNECTED', false, 'BOOL')
   add('EVENTS_ENABLED', true, 'BOOL')
   -- Only for partitions that are actually configured. Declaring all
@@ -6244,6 +6256,7 @@ function SetLineTrouble(kind, isNew, order, detail, source)
   local text = (isNew and (k.newText or (k.label .. ' fault')) or (k.restoredText or (k.label .. ' restored'))) .. suffix
   LogInfo((isNew and 'TROUBLE: ' or 'Trouble cleared: ') .. text)
   SetProp('Last Event Summary', text)
+  if not isNew then RecordTroubleCleared(k.alertKind or k.label, text) end
   local ev = isNew and k.trouble or k.restored
   if ev then FireDriverEvent(ev) end
   if isNew then FireTrouble(k.alertKind or k.label, (k.alertText or text) .. ((k.alertText and suffix) or '')) end
@@ -6445,6 +6458,7 @@ function DispatchEvent(frame)
   if etype == EV_TAMPER then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'TAMPER alarm' or 'Tamper restored')
+    if not isNew then RecordTroubleCleared('Tamper', 'Tamper restored') end
     FireDriverEvent(isNew and 'Tamper Alarm' or 'Tamper Restored')
     if isNew then FireAlert('Tamper', 'Tamper alarm') end
     NotifyProxyTrouble('Tamper', isNew)

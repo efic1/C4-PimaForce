@@ -303,6 +303,10 @@ message text.</p>
 <td>The last trouble. It isn't overwritten by a later alarm.</td>
 </tr>
 <tr>
+<td><code>LAST_CLEARED_TYPE</code>, <code>LAST_CLEARED_TEXT</code></td>
+<td>The trouble that just cleared, e.g. <code>Phone line</code> / <code>Phone line restored</code>. Use these, not <code>LAST_TROUBLE_*</code>, in a notification on a trouble clear: <code>LAST_TROUBLE_*</code> only changes when a trouble is raised.</td>
+</tr>
+<tr>
 <td><code>PARTITION_n_STATE</code></td>
 <td>For example <code>Armed Away (Full Arm)</code>.</td>
 </tr>
