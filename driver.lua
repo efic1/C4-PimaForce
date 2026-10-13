@@ -73,6 +73,7 @@ local EV_TAMPER      = 137
 local EV_AC_LOSS     = 301
 local EV_LOW_BATTERY = 302
 local EV_COMM_TROUBLE= 350
+local EV_LINE_TROUBLE= 351   -- PSTN line / GSM module / network / SIM fault (v49)
 -- Appendix A distinguishes the master code (400) from user/remote codes
 -- (401). Only 401 was handled, so arming or disarming the panel with the
 -- MASTER code reported nothing at all: the widget kept its previous state
@@ -97,7 +98,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 48
+local DRIVER_VERSION = 49
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2374,6 +2375,7 @@ function HandleInboundFrame(handle, frame)
     -- partition would sit at OFFLINE on a working system.
     SyncPartitionStates(true)
     SyncZoneStates()
+    SyncFaults()
     RefreshExitTime()
     -- Once per driver load: learn any zone added at the panel since last
     -- time. Queued after the state sync, so it never delays what the app
@@ -5522,6 +5524,7 @@ function ExecutePartitionFunction(partitionId, name)
         return
       end
       local faults = frame and frame.parameters or {}
+      ReconcileLineTroubles(faults)
       local decoded = DecodeFaults(faults)
       LogInfo('Refresh Troubles: panel reports ' .. #faults .. ' active fault(s): ' .. decoded)
       SetProp('Last Command Result', 'Troubles (' .. #faults .. '): ' .. decoded)
@@ -6116,6 +6119,97 @@ ROUTINE_EVENT_NAMES = {
   [625] = 'time/date changed',
 }
 
+--[[=============================================================================
+    Phone line / GSM / network faults (v49).
+
+    Until v49 the driver handled CID 350 (a CMS reporting path failed) but not
+    CID 351, which is how the panel reports the fault itself: "PSTN line Fault
+    (DC, dial tone)", GSM module, network, SIM. A dead phone line therefore
+    showed on the keypad ("Telephone line voltage") and nowhere in Control4.
+
+    A fault that was already present when the driver connected raises no event
+    at all, so the panel's fault list (parameter 2250) is also read after
+    every verified connect and on Refresh Troubles, and reconciled here.
+===============================================================================]]
+LINE_TROUBLE_KINDS = {
+  phone   = { label = 'Phone line', proxy = 'Phone line fault',
+              trouble = 'Phone Line Trouble', restored = 'Phone Line Restored' },
+  gsm     = { label = 'GSM', proxy = 'GSM fault' },
+  network = { label = 'Network', proxy = 'Network fault' },
+  -- Reports to the monitoring station / contacts failing (CID 350, faults 30-38).
+  comm    = { label = 'Communication', proxy = 'Communication trouble',
+              trouble = 'Communication Trouble', restored = 'Communication Restored' },
+}
+
+-- CID 351 "order" -> kind (Appendix A).
+LINE_TROUBLE_BY_ORDER = { [0] = 'phone', [1] = 'gsm', [2] = 'network', [3] = 'gsm', [4] = 'gsm' }
+
+-- Station comms channel named by the order of CID 350 (Appendix A).
+STATION_CHANNEL_BY_ORDER = { [1] = 'PSTN', [2] = 'GPRS', [3] = 'GSM voice', [4] = 'network' }
+
+-- Appendix E fault ID -> kind.
+function LineFaultKind(faultId)
+  if faultId == 6 or faultId == 7 then return 'phone' end
+  if faultId >= 39 and faultId <= 56 then return 'gsm' end
+  if faultId == 57 or faultId == 58 then return 'network' end
+  if faultId >= 30 and faultId <= 38 and faultId ~= 34 and faultId ~= 37 then return 'comm' end
+  return nil
+end
+
+LineTroubleActive = {}
+
+function SetLineTrouble(kind, isNew, detail)
+  local k = LINE_TROUBLE_KINDS[kind]
+  if not k then return end
+  if isNew and LineTroubleActive[kind] then
+    Dbg(k.label .. ' trouble already active; not raising it again')
+    return
+  end
+  LineTroubleActive[kind] = isNew and true or nil
+  local text = k.label .. (isNew and ' fault' or ' restored') .. (detail and (' (' .. detail .. ')') or '')
+  LogInfo((isNew and 'TROUBLE: ' or 'Trouble cleared: ') .. text)
+  SetProp('Last Event Summary', text)
+  local ev = isNew and k.trouble or k.restored
+  if ev then FireDriverEvent(ev) end
+  if isNew then FireTrouble(k.label, text) end
+  NotifyProxyTrouble(k.proxy, isNew)
+end
+
+-- params: the 2250 parameters array. Raises what is newly present, clears
+-- what is no longer.
+function ReconcileLineTroubles(params)
+  local present = {}
+  if type(params) == 'table' then
+    for i = 1, #params do
+      local v = tonumber(tostring(JSON.scalar(params[i])), 16)
+      local kind = v and LineFaultKind(v % 0x100)
+      if kind then present[kind] = true end
+    end
+  end
+  for kind in pairs(LINE_TROUBLE_KINDS) do
+    if present[kind] then
+      SetLineTrouble(kind, true, 'from panel fault list')
+    elseif LineTroubleActive[kind] then
+      SetLineTrouble(kind, false, 'from panel fault list')
+    end
+  end
+end
+
+function SyncFaults()
+  local pw = nil
+  for _, p in pairs(Partitions) do
+    if p.userCode ~= '' then pw = p.userCode break end
+  end
+  if not pw then return end
+  RequestData(PARAM_FAULTS, 1, nil, pw, function(frame, err)
+    if err then
+      LogWarn('Could not read the panel fault list: ' .. tostring(err))
+      return
+    end
+    ReconcileLineTroubles(frame and frame.parameters)
+  end)
+end
+
 function DispatchEvent(frame)
   local etype = tonumber(frame.type) or 0
   local qualifier = tonumber(frame.qualifier) or 0
@@ -6283,10 +6377,9 @@ function DispatchEvent(frame)
   end
   if etype == EV_COMM_TROUBLE then
     local isNew = (qualifier == QUALIFIER_NEW)
-    LogInfo(isNew and 'Panel communication trouble' or 'Panel communication restored')
-    FireDriverEvent(isNew and 'Communication Trouble' or 'Communication Restored')
-    if isNew then FireTrouble('Communication', 'Panel communication trouble') end
-    NotifyProxyTrouble('Communication trouble', isNew)
+    -- Shared with the fault-list sync (v49), so a failure seen both ways is
+    -- raised once.
+    SetLineTrouble('comm', isNew, STATION_CHANNEL_BY_ORDER[zone])
     -- The panel just said its link is back: exactly the moment a state query
     -- may have been missed. Ask now rather than wait for the retry timer.
     if not isNew then
@@ -6294,6 +6387,12 @@ function DispatchEvent(frame)
         QueryPartitionArmState(pid, { fireEvents = false })
       end
     end
+    return
+  end
+
+  if etype == EV_LINE_TROUBLE then
+    local kind = LINE_TROUBLE_BY_ORDER[zone] or 'phone'
+    SetLineTrouble(kind, qualifier == QUALIFIER_NEW, 'CID 351 order ' .. zone)
     return
   end
 

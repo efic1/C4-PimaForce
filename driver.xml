@@ -5,8 +5,8 @@
 	<model>FORCE Series</model>
 	<creator>Community</creator>
 	<created>09/04/2026 00:00</created>
-	<modified>10/08/2026 13:03</modified>
-	<version>48</version>
+	<modified>10/13/2026 15:55</modified>
+	<version>49</version>
 	<small>devices_sm/c4.gif</small>
 	<large>devices_lg/c4.gif</large>
 	<control>lua_gen</control>
@@ -50,7 +50,7 @@
 	</capabilities>
 	<config>
 		<script file="driver.lua"></script>
-		<documentation file="www/documentation/index.html"><![CDATA[PIMA FORCE Alarm Panel driver v48. Full documentation: www/documentation/index.html inside the driver package.]]></documentation>
+		<documentation file="www/documentation/index.html"><![CDATA[PIMA FORCE Alarm Panel driver v49. Full documentation: www/documentation/index.html inside the driver package.]]></documentation>
 		<properties>
 			<property>
 				<name>Listen Port</name>
@@ -837,16 +837,26 @@
 		</event>
 		<event>
 			<id>46</id>
+			<name>Phone Line Trouble</name>
+			<description>Panel telephone (PSTN) line fault: no line voltage or dial tone.</description>
+		</event>
+		<event>
+			<id>47</id>
+			<name>Phone Line Restored</name>
+			<description>Panel telephone (PSTN) line restored.</description>
+		</event>
+		<event>
+			<id>48</id>
 			<name>Output Activated</name>
 			<description>A panel output (e.g. siren) activated. See Last Output Number.</description>
 		</event>
 		<event>
-			<id>47</id>
+			<id>49</id>
 			<name>Output Deactivated</name>
 			<description>A panel output deactivated.</description>
 		</event>
 		<event>
-			<id>48</id>
+			<id>50</id>
 			<name>Unmapped Panel Event</name>
 			<description>A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.</description>
 		</event>
