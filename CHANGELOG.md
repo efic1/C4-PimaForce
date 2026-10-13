@@ -10,6 +10,50 @@ changes hot-reload.
 
 ---
 
+## v50 — the rest of the panel's trouble reports
+
+Before this, most panel troubles raised only `Unmapped Panel Event` with a log
+warning, and none were read from the panel's fault list at connect except the
+phone line and monitoring-station ones from v49.
+
+**New events** (each with a Restored pair, and each also fires `Any Trouble`
+and shows a trouble in the app)
+
+- `Device Trouble` — expander, keypad, wireless receiver fault or tamper
+  (CID 143/145).
+- `Zone Wiring Trouble` — zone cut/short, tamper or anti-mask (CID 144).
+- `Power Trouble` — expander AC loss, low battery, voltage or auxiliary
+  voltage fault (CID 312/338/342).
+- `Siren Trouble` — internal or external siren (CID 321/322).
+- `Wireless Trouble` — wireless detector trouble, supervision loss, low
+  battery (CID 373/381/384).
+- `Jamming Detected` / `Jamming Cleared` — wireless jamming (CID 344).
+- `Pre-Alarm` (CID 138), `Access Denied` (CID 421) and `System Inactivity`
+  (CID 454), which are single events with no restore.
+
+**Fault list** — the panel's fault list (parameter 2250) now drives AC loss,
+low battery and every kind above, so a fault present when the driver connects
+is reported. A kind missing from the list is cleared; for a kind still present,
+only entries the list raised are cleared.
+
+**Behaviour**
+
+- Each expander, zone, siren and wireless device is tracked separately, so a
+  second failure is not hidden behind the first. The app trouble clears when
+  the last one is fixed. The text names the device, or the zone name for
+  zone and wireless troubles.
+- AC loss and low battery now share this code. Their events, alert texts and
+  app troubles are unchanged; a repeated report of a fault that is already
+  active is no longer raised twice.
+- Not mapped on purpose: panel tamper (faults 3/4, already an alarm), invalid
+  code (66), time not set (69) and the reserved IDs.
+- Monitoring-station, phone, GSM and network faults are tracked once per kind,
+  because the panel's event and its fault-list entry do not number the
+  channel the same way. A second channel failing while the first is active
+  does not raise a second event.
+
+---
+
 ## v49 — phone line and network faults are reported
 
 - **Fixed: a dead phone line was invisible to Control4.** The keypad showed

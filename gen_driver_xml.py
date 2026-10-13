@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 49
+DRIVER_VERSION = 50
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's
@@ -260,6 +260,21 @@ generic_events = [
     ('Communication Restored', 'CMS communication path restored.'),
     ('Phone Line Trouble', 'Panel telephone (PSTN) line fault: no line voltage or dial tone.'),
     ('Phone Line Restored', 'Panel telephone (PSTN) line restored.'),
+    ('Power Trouble', 'Expander/zone-expander/keypad power fault: low battery, AC loss or voltage fault.'),
+    ('Power Restored', 'Expander/keypad power fault restored.'),
+    ('Device Trouble', 'Expander, keypad or wireless receiver fault or tamper.'),
+    ('Device Restored', 'Expander, keypad or wireless receiver fault restored.'),
+    ('Zone Wiring Trouble', 'A zone is cut or shorted, or has a tamper/anti-mask fault.'),
+    ('Zone Wiring Restored', 'Zone wiring fault restored.'),
+    ('Siren Trouble', 'Internal or external siren fault, low battery, tamper or supervision loss.'),
+    ('Siren Restored', 'Siren fault restored.'),
+    ('Wireless Trouble', 'Wireless detector or accessory trouble, supervision loss or low battery.'),
+    ('Wireless Restored', 'Wireless detector or accessory trouble restored.'),
+    ('Jamming Detected', 'Wireless jamming detected.'),
+    ('Jamming Cleared', 'Wireless jamming cleared.'),
+    ('Pre-Alarm', 'A zone reported a pre-alarm.'),
+    ('Access Denied', 'A code was refused: invalid code or outside its time window.'),
+    ('System Inactivity', 'The panel reports no arm/disarm activity for its inactivity period.'),
     ('Output Activated', 'A panel output (e.g. siren) activated. See Last Output Number.'),
     ('Output Deactivated', 'A panel output deactivated.'),
     ('Unmapped Panel Event', 'A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.'),
