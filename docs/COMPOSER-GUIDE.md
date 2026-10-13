@@ -215,6 +215,7 @@ message text.
 | --- | --- |
 | `ALERT_TYPE`, `ALERT_TEXT` | What just happened, e.g. `Fire` / `Fire alarm -- Kitchen Smoke`. |
 | `LAST_TROUBLE_TYPE`, `LAST_TROUBLE_TEXT` | The last trouble. It isn't overwritten by a later alarm. |
+| `LAST_CLEARED_TYPE`, `LAST_CLEARED_TEXT` | The trouble that just cleared, e.g. `Phone line` / `Phone line restored`. Use these, not `LAST_TROUBLE_*`, in a notification on a trouble clear: `LAST_TROUBLE_*` only changes when a trouble is raised. |
 | `PARTITION_n_STATE` | For example `Armed Away (Full Arm)`. |
 | `PARTITION_n_ARMED` | `true` / `false`. Use it in conditionals. |
 | `PANEL_CONNECTED` | `true` / `false`. |

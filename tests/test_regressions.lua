@@ -4962,6 +4962,71 @@ test('the fault list clears what is gone, including event-raised troubles (v50)'
   assert(n['Device Trouble'] == 1 and n['Device Restored'] == 1, JSON.encode(n))
 end)
 
+-- v51: the zone cut/short exception and the text on a clear ------------------
+
+test('the fault list cannot clear a zone cut/short raised by its event (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 2500, 144, 1, 3)
+  assert(LineTroubleActive.zone and LineTroubleActive.zone[3])
+  ReconcileTroubles({})          -- Appendix E has no fault for cut/short
+  assert(LineTroubleActive.zone and LineTroubleActive.zone[3], 'the list must not clear it')
+  calls.FireEvent = {}
+  sendCid(h, 2501, 144, 3, 3)
+  assert(firedCounts()['Zone Wiring Restored'] == 1 and LineTroubleActive.zone == nil)
+  -- But a zone fault the list itself raised (fault 60, zone 3) does clear from it.
+  ReconcileTroubles({ '33C' })
+  assert(LineTroubleActive.zone and LineTroubleActive.zone[3])
+  ReconcileTroubles({})
+  assert(LineTroubleActive.zone == nil)
+end)
+
+test('a trouble clear names the trouble, so the history says which one (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3000, 351, 1, 0)
+  calls.SendToProxy = {}
+  sendCid(h, 3001, 351, 3, 0)
+  local cleared
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[2] == 'TROUBLE_CLEAR' then cleared = c[3] end
+  end
+  assert(cleared, 'a clear must be sent')
+  assert(cleared.TROUBLE_TEXT == 'Phone line fault', 'got ' .. tostring(cleared.TROUBLE_TEXT))
+  assert(cleared.IDENTIFIER == TroubleIdentifier('Phone line fault'), 'same identifier as the start')
+end)
+
+test('a clear sets LAST_CLEARED_* before the clear goes out, and names the right trouble (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3100, 351, 1, 0)    -- phone line
+  sendCid(h, 3101, 301, 1, 0)    -- AC loss, raised later
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power')
+  -- Capture what the variables hold at the moment the proxy is told.
+  local atClear
+  local realSend = C4.SendToProxy
+  C4.SendToProxy = function(self, id, cmd, params, mode)
+    if cmd == 'TROUBLE_CLEAR' then
+      atClear = { type = Variables['LAST_CLEARED_TYPE'], text = Variables['LAST_CLEARED_TEXT'] }
+    end
+    return realSend(self, id, cmd, params, mode)
+  end
+  sendCid(h, 3102, 351, 3, 0)    -- the PHONE line clears, not the AC loss
+  C4.SendToProxy = realSend
+  assert(atClear, 'a clear must be sent')
+  assert(atClear.type == 'Phone line' and atClear.text == 'Phone line restored',
+    'got ' .. tostring(atClear.type) .. ' / ' .. tostring(atClear.text))
+  assert(Variables['LAST_TROUBLE_TYPE'] == 'AC Power', 'LAST_TROUBLE_* is untouched by a clear')
+end)
+
+test('a tamper restore sets LAST_CLEARED_* (v51)', function()
+  freshDriver()
+  local h = connectPanel()
+  sendCid(h, 3200, 137, 1, 1)
+  sendCid(h, 3201, 137, 3, 1)
+  assert(Variables['LAST_CLEARED_TYPE'] == 'Tamper' and Variables['LAST_CLEARED_TEXT'] == 'Tamper restored')
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()

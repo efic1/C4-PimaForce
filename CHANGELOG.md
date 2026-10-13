@@ -10,6 +10,24 @@ changes hot-reload.
 
 ---
 
+## v51 — the trouble clear names the trouble
+
+- **Changed: `TROUBLE_CLEAR` now carries `TROUBLE_TEXT`**, the same text as the
+  matching `TROUBLE_START` (for example "Phone line fault"), so the history can
+  say which trouble was cleared instead of just "Trouble cleared". This is an
+  extra parameter beyond the reference driver's. If your Control4 history still
+  shows a bare "Trouble cleared", the proxy ignores it and this change has no
+  effect; nothing else depends on it.
+- **Added: `LAST_CLEARED_TYPE` / `LAST_CLEARED_TEXT`**, set on every trouble
+  clear before the clear is sent. `LAST_TROUBLE_*` only changes when a trouble
+  is raised, so a notification on the clear used to name whichever trouble was
+  raised last, which is wrong with two troubles standing.
+- **Fixed: Refresh Troubles could clear a zone cut/short.** The fault list has
+  no entry for it (CID 144), so a list read treated it as gone. It is now
+  cleared only by its own restore event, unless the list raised it.
+
+---
+
 ## v50 — the rest of the panel's trouble reports
 
 Before this, most panel troubles raised only `Unmapped Panel Event` with a log

@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 50
+local DRIVER_VERSION = 51
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -4262,6 +4262,11 @@ function TroubleIdentifier(troubleText)
   return TroubleIdAssigned[troubleText]
 end
 
+function RecordTroubleCleared(kind, text)
+  SetDriverVariable('LAST_CLEARED_TYPE', kind)
+  SetDriverVariable('LAST_CLEARED_TEXT', text)
+end
+
 function NotifyProxyTrouble(troubleText, isNew)
   local id = TroubleIdentifier(troubleText)
   if isNew then
@@ -4270,8 +4275,12 @@ function NotifyProxyTrouble(troubleText, isNew)
       IDENTIFIER = id,
     }, 'NOTIFY')
   else
+    -- TROUBLE_TEXT is not in the reference driver's clear. Without it the
+    -- app's history reads just "Trouble cleared", which does not say which
+    -- trouble (v51). Same text as the start, so the two lines pair up.
     C4:SendToProxy(PANEL_PROXY_BINDINGID, 'TROUBLE_CLEAR', {
       IDENTIFIER = id,
+      TROUBLE_TEXT = troubleText,
     }, 'NOTIFY')
   end
 end
@@ -5673,6 +5682,13 @@ function DeclareDriverVariables()
   -- which survives a later alarm.
   add('LAST_TROUBLE_TEXT', '', 'STRING')
   add('LAST_TROUBLE_TYPE', '', 'STRING')
+  -- Set on every trouble CLEAR (v51), before the clear is sent, so a
+  -- notification on the app's trouble-clear event can say which one cleared.
+  -- LAST_TROUBLE_* only changes when a trouble is raised, so on a clear it
+  -- still names whichever trouble was raised last, which is wrong as soon as
+  -- two are standing.
+  add('LAST_CLEARED_TYPE', '', 'STRING')
+  add('LAST_CLEARED_TEXT', '', 'STRING')
   add('PANEL_CONNECTED', false, 'BOOL')
   add('EVENTS_ENABLED', true, 'BOOL')
   -- Only for partitions that are actually configured. Declaring all
@@ -6159,7 +6175,7 @@ LINE_TROUBLE_KINDS = {
               trouble = 'Power Trouble', restored = 'Power Restored' },
   device  = { label = 'Expander/keypad', proxy = 'Expander or keypad fault', perOrder = true,
               trouble = 'Device Trouble', restored = 'Device Restored' },
-  zone    = { label = 'Zone wiring', proxy = 'Zone wiring fault', perOrder = true, zoneNamed = true,
+  zone    = { label = 'Zone wiring', proxy = 'Zone wiring fault', perOrder = true, listAuthoritative = false, zoneNamed = true,
               trouble = 'Zone Wiring Trouble', restored = 'Zone Wiring Restored' },
   siren   = { label = 'Siren', proxy = 'Siren fault', perOrder = true,
               trouble = 'Siren Trouble', restored = 'Siren Restored' },
@@ -6240,6 +6256,7 @@ function SetLineTrouble(kind, isNew, order, detail, source)
   local text = (isNew and (k.newText or (k.label .. ' fault')) or (k.restoredText or (k.label .. ' restored'))) .. suffix
   LogInfo((isNew and 'TROUBLE: ' or 'Trouble cleared: ') .. text)
   SetProp('Last Event Summary', text)
+  if not isNew then RecordTroubleCleared(k.alertKind or k.label, text) end
   local ev = isNew and k.trouble or k.restored
   if ev then FireDriverEvent(ev) end
   if isNew then FireTrouble(k.alertKind or k.label, (k.alertText or text) .. ((k.alertText and suffix) or '')) end
@@ -6270,7 +6287,14 @@ function ReconcileTroubles(params)
     end
     local stale = {}
     for order, src in pairs(LineTroubleActive[kind] or {}) do
-      if (not p) or (src == 'list' and not p[order]) then stale[#stale + 1] = order end
+      local k = LINE_TROUBLE_KINDS[kind]
+      -- A kind the list cannot describe (zone cut/short, CID 144, has no
+      -- Appendix E fault) is only cleared by its own restore event, unless
+      -- the list is what raised it.
+      local authoritative = (k.listAuthoritative ~= false) or src == 'list'
+      if (not p and authoritative) or (src == 'list' and not p[order]) then
+        stale[#stale + 1] = order
+      end
     end
     for _, order in ipairs(stale) do SetLineTrouble(kind, false, order) end
   end
@@ -6434,6 +6458,7 @@ function DispatchEvent(frame)
   if etype == EV_TAMPER then
     local isNew = (qualifier == QUALIFIER_NEW)
     LogInfo(isNew and 'TAMPER alarm' or 'Tamper restored')
+    if not isNew then RecordTroubleCleared('Tamper', 'Tamper restored') end
     FireDriverEvent(isNew and 'Tamper Alarm' or 'Tamper Restored')
     if isNew then FireAlert('Tamper', 'Tamper alarm') end
     NotifyProxyTrouble('Tamper', isNew)
