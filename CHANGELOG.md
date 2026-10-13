@@ -10,7 +10,7 @@ changes hot-reload.
 
 ---
 
-## v52 — the trouble clear names the trouble
+## v51 — the trouble clear names the trouble
 
 - **Changed: `TROUBLE_CLEAR` now carries `TROUBLE_TEXT`**, the same text as the
   matching `TROUBLE_START` (for example "Phone line fault"), so the history can
@@ -18,21 +18,6 @@ changes hot-reload.
   extra parameter beyond the reference driver's. If your Control4 history still
   shows a bare "Trouble cleared", the proxy ignores it and this change has no
   effect; nothing else depends on it.
-
----
-
-## v51 — troubles that clear without a restore event
-
-- **Fixed: a phone line fault could stay raised after the line came back.**
-  `Phone Line Trouble` fired, but `Phone Line Restored` never did. The panel
-  does not always send a restore (the spec marks the PSTN and network restores
-  with a footnote), and the driver only ever ended a trouble on that event.
-  The driver now asks the panel's fault list again: about 5 seconds after any
-  CID 350/351 event of either kind, and every 2 minutes while any trouble is
-  standing. A trouble no longer in the list is cleared and its Restored event
-  fires. It stops when nothing is standing, and on disconnect. A failed read
-  keeps trying. A restore event that does arrive still clears at once, and the
-  follow-up read does not fire a second one.
 - **Fixed: Refresh Troubles could clear a zone cut/short.** The fault list has
   no entry for it (CID 144), so a list read treated it as gone. It is now
   cleared only by its own restore event, unless the list raised it.

@@ -4962,107 +4962,7 @@ test('the fault list clears what is gone, including event-raised troubles (v50)'
   assert(n['Device Trouble'] == 1 and n['Device Restored'] == 1, JSON.encode(n))
 end)
 
--- v51: troubles that clear without a restore event ---------------------------
-
-local FAULTS_CFG = { ['Partitions Config'] = '1,Main,1111,ASN' }
-
-local function answerFaults(h, paramsJson)
-  PostOperationGuardUntil = 0
-  local req
-  for _, sent in ipairs(calls.ServerSend) do
-    local f = JSON.decode(sent[2])
-    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2250 then req = f end
-  end
-  assert(req, 'no fault list request was sent')
-  calls.ServerSend = {}
-  OnServerDataIn(h, string.format(
-    '{"frame_type":"DATA","account":1234,"counter":%d,"id":2250,"start_order":1,"parameters":%s}',
-    req.counter, paramsJson), '10.0.0.50', 5555)
-end
-
-local function lastTimer()
-  local t = calls.AddTimer[#calls.AddTimer]
-  return t and t[2], t and t[3]
-end
-
-test('a phone line fault whose restore never arrives is cleared by the fault list (v51)', function()
-  freshDriver(FAULTS_CFG)
-  local h = connectPanel()
-  calls.FireEvent = {}
-  calls.AddTimer = {}
-  sendCid(h, 2000, 351, 1, 0)
-  assert(firedCounts()['Phone Line Trouble'] == 1)
-  local v, unit = lastTimer()
-  assert(v == 5 and unit == 'SECONDS', 'a re-read must be scheduled soon after the event, got ' .. tostring(v))
-  assert(FaultRecheckTimerId, 'timer id recorded')
-
-  -- Panel still lists the fault: nothing is restored, and it keeps asking.
-  PostOperationGuardUntil = 0
-  OnTimerExpired(FaultRecheckTimerId)
-  answerFaults(h, '["6"]')
-  assert(firedCounts()['Phone Line Restored'] == nil, 'still faulty: no restore')
-  assert(LineTroubleActive.phone, 'still tracked')
-  v = lastTimer()
-  assert(v == 120 and FaultRecheckTimerId, 'it must keep checking while a trouble stands, got ' .. tostring(v))
-
-  -- The line is back and the panel never said so: the list is empty.
-  PostOperationGuardUntil = 0
-  OnTimerExpired(FaultRecheckTimerId)
-  answerFaults(h, '[]')
-  assert(firedCounts()['Phone Line Restored'] == 1, 'cleared from the list: ' .. JSON.encode(firedCounts()))
-  assert(LineTroubleActive.phone == nil)
-  assert(FaultRecheckTimerId == nil, 'nothing standing: polling must stop')
-end)
-
-test('a restore event still clears at once, and the follow-up read stays silent (v51)', function()
-  freshDriver(FAULTS_CFG)
-  local h = connectPanel()
-  sendCid(h, 2100, 351, 1, 0)
-  calls.FireEvent = {}
-  sendCid(h, 2101, 351, 3, 0)
-  assert(firedCounts()['Phone Line Restored'] == 1)
-  PostOperationGuardUntil = 0
-  OnTimerExpired(FaultRecheckTimerId)
-  answerFaults(h, '[]')
-  assert(firedCounts()['Phone Line Restored'] == 1, 'must not fire a second restore')
-end)
-
-test('a 350/351 event of either kind schedules a fault list read (v51)', function()
-  freshDriver(FAULTS_CFG)
-  local h = connectPanel()
-  calls.AddTimer = {}
-  sendCid(h, 2200, 351, 3, 0)    -- a restore with nothing standing
-  local v = lastTimer()
-  assert(v == 5, 'got ' .. tostring(v))
-  calls.AddTimer = {}
-  sendCid(h, 2201, 350, 1, 1)    -- station report failure
-  assert(#calls.AddTimer == 0 or lastTimer() == 5, 'an existing sooner timer is kept')
-  assert(FaultRecheckTimerId, 'timer pending')
-end)
-
-test('no polling when nothing is standing, and it stops on disconnect (v51)', function()
-  freshDriver(FAULTS_CFG)
-  local h = connectPanel()
-  calls.AddTimer = {}
-  ReconcileTroubles({})
-  assert(FaultRecheckTimerId == nil and #calls.AddTimer == 0, 'quiet panel, no timer')
-  sendCid(h, 2300, 351, 1, 0)
-  assert(FaultRecheckTimerId, 'a standing trouble starts the recheck')
-  OnServerConnectionStatusChanged(h, 7780, 'OFFLINE')
-  assert(FaultRecheckTimerId == nil, 'no panel, nothing to ask')
-end)
-
-test('a failed fault list read keeps checking rather than leaving a trouble stuck (v51)', function()
-  freshDriver(FAULTS_CFG)
-  local h = connectPanel()
-  sendCid(h, 2400, 351, 1, 0)
-  PostOperationGuardUntil = 0
-  OnTimerExpired(FaultRecheckTimerId)
-  calls.AddTimer = {}
-  timeOutInFlight()
-  assert(LineTroubleActive.phone, 'an unanswered read must not clear anything')
-  assert(FaultRecheckTimerId and lastTimer() == 120, 'and it must try again')
-end)
+-- v51: the zone cut/short exception and the text on a clear ------------------
 
 test('the fault list cannot clear a zone cut/short raised by its event (v51)', function()
   freshDriver()
@@ -5081,7 +4981,7 @@ test('the fault list cannot clear a zone cut/short raised by its event (v51)', f
   assert(LineTroubleActive.zone == nil)
 end)
 
-test('a trouble clear names the trouble, so the history says which one (v52)', function()
+test('a trouble clear names the trouble, so the history says which one (v51)', function()
   freshDriver()
   local h = connectPanel()
   sendCid(h, 3000, 351, 1, 0)

@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 52
+local DRIVER_VERSION = 51
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -1816,7 +1816,6 @@ PanelWasConnected = false
 function NotePanelDisconnected(reason)
   -- Nothing to re-ask without a panel; the next connection starts afresh.
   CancelUnknownResync()
-  CancelFaultRecheck()
   if not PanelWasConnected then return end
   PanelWasConnected = false
   SetDriverVariable('PANEL_CONNECTED', false)
@@ -1877,7 +1876,6 @@ function AdoptSession(nHandle)
   -- from "we don't know" rather than from whatever we last believed.
   ResetPartitionStatus()
   CancelUnknownResync()
-  CancelFaultRecheck()
   -- Fail (not silently discard) anything still queued from the previous
   -- session: callers -- including the native widget waiting on an arm --
   -- must be told, or a command just evaporates with no error anywhere.
@@ -2691,10 +2689,6 @@ function OnTimerExpired(idTimer)
   if QueueGuardTimerId and idTimer == QueueGuardTimerId then
     QueueGuardTimerId = nil
     ProcessQueue()
-    return
-  end
-  if FaultRecheckTimerId and idTimer == FaultRecheckTimerId then
-    RunFaultRecheck()
     return
   end
   if PartitionResyncTimerId and idTimer == PartitionResyncTimerId then
@@ -4278,7 +4272,7 @@ function NotifyProxyTrouble(troubleText, isNew)
   else
     -- TROUBLE_TEXT is not in the reference driver's clear. Without it the
     -- app's history reads just "Trouble cleared", which does not say which
-    -- trouble (v52). Same text as the start, so the two lines pair up.
+    -- trouble (v51). Same text as the start, so the two lines pair up.
     C4:SendToProxy(PANEL_PROXY_BINDINGID, 'TROUBLE_CLEAR', {
       IDENTIFIER = id,
       TROUBLE_TEXT = troubleText,
@@ -6253,7 +6247,6 @@ function SetLineTrouble(kind, isNew, order, detail, source)
   local ev = isNew and k.trouble or k.restored
   if ev then FireDriverEvent(ev) end
   if isNew then FireTrouble(k.alertKind or k.label, (k.alertText or text) .. ((k.alertText and suffix) or '')) end
-  if isNew then ScheduleFaultRecheck(FAULT_RECHECK_SECONDS) end
   -- One proxy trouble per kind: clear it only when the last device is fixed.
   if isNew or LineTroubleActive[kind] == nil then NotifyProxyTrouble(k.proxy, isNew) end
 end
@@ -6295,58 +6288,6 @@ function ReconcileTroubles(params)
 end
 ReconcileLineTroubles = ReconcileTroubles  -- v49 name
 
---[[---------------------------------------------------------------------------
-    Re-checking troubles (v51).
-
-    The panel does not always send a restore: the spec marks the PSTN and
-    network restores with a footnote, and a phone line that came back
-    produced "Phone Line Trouble" with no "Phone Line Restored" ever
-    following. So an event is not the only way a trouble ends. The panel's
-    own fault list is the authority, and is asked again:
-
-      * a few seconds after any CID 350/351 event of either kind, because the
-        restore may be missing but the list will have changed; and
-      * every FAULT_RECHECK_SECONDS while any trouble is standing, so one
-        that clears silently is still cleared.
-
-    It stops when nothing is standing, and on disconnect.
----------------------------------------------------------------------------]]
-FAULT_RECHECK_SECONDS = 120
-FAULT_RECHECK_AFTER_EVENT_S = 5
-FaultRecheckTimerId = nil
-FaultRecheckDueIn = nil
-
-function CancelFaultRecheck()
-  if FaultRecheckTimerId then
-    pcall(function() C4:KillTimer(FaultRecheckTimerId) end)
-  end
-  FaultRecheckTimerId = nil
-  FaultRecheckDueIn = nil
-end
-
-function AnyTroubleStanding()
-  return next(LineTroubleActive) ~= nil
-end
-
--- `delay` in seconds. A sooner request replaces a later one; a later one never
--- replaces a sooner one.
-function ScheduleFaultRecheck(delay)
-  if not (ConnHandle and PanelVerified) then return end
-  if FaultRecheckTimerId then
-    if (FaultRecheckDueIn or math.huge) <= delay then return end
-    CancelFaultRecheck()
-  end
-  FaultRecheckDueIn = delay
-  FaultRecheckTimerId = C4:AddTimer(delay, 'SECONDS')
-end
-
-function RunFaultRecheck()
-  FaultRecheckTimerId = nil
-  FaultRecheckDueIn = nil
-  if not (ConnHandle and PanelVerified) then return end
-  SyncFaults()
-end
-
 function SyncFaults()
   local pw = nil
   for _, p in pairs(Partitions) do
@@ -6356,12 +6297,9 @@ function SyncFaults()
   RequestData(PARAM_FAULTS, 1, nil, pw, function(frame, err)
     if err then
       LogWarn('Could not read the panel fault list: ' .. tostring(err))
-    else
-      ReconcileTroubles(frame and frame.parameters)
+      return
     end
-    -- Keep asking for as long as something is standing, including after a
-    -- failed read, so one missed answer does not leave a trouble stuck.
-    if AnyTroubleStanding() then ScheduleFaultRecheck(FAULT_RECHECK_SECONDS) end
+    ReconcileTroubles(frame and frame.parameters)
   end)
 end
 
@@ -6527,7 +6465,6 @@ function DispatchEvent(frame)
     -- Shared with the fault-list sync (v49), so a failure seen both ways is
     -- raised once.
     SetLineTrouble('comm', isNew, zone, STATION_CHANNEL_BY_ORDER[zone])
-    ScheduleFaultRecheck(FAULT_RECHECK_AFTER_EVENT_S)
     -- The panel just said its link is back: exactly the moment a state query
     -- may have been missed. Ask now rather than wait for the retry timer.
     if not isNew then
@@ -6541,7 +6478,6 @@ function DispatchEvent(frame)
   if etype == EV_LINE_TROUBLE then
     local kind = LINE_TROUBLE_BY_ORDER[zone] or 'phone'
     SetLineTrouble(kind, qualifier == QUALIFIER_NEW, zone)
-    ScheduleFaultRecheck(FAULT_RECHECK_AFTER_EVENT_S)
     return
   end
 
@@ -7009,7 +6945,6 @@ end
 function OnDriverDestroyed()
   StopLinkWatchdog()
   CancelUnknownResync()
-  CancelFaultRecheck()
   if PersistVerifyTimerId then pcall(function() C4:KillTimer(PersistVerifyTimerId) end) end
   PersistVerifyTimerId = nil
   for pid in pairs(PartitionStatus) do CancelExitDelay(pid) end
