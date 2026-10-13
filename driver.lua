@@ -6136,6 +6136,9 @@ LINE_TROUBLE_KINDS = {
               trouble = 'Phone Line Trouble', restored = 'Phone Line Restored' },
   gsm     = { label = 'GSM', proxy = 'GSM fault' },
   network = { label = 'Network', proxy = 'Network fault' },
+  -- Reports to the monitoring station / contacts failing (CID 350, faults 30-38).
+  comm    = { label = 'Communication', proxy = 'Communication trouble',
+              trouble = 'Communication Trouble', restored = 'Communication Restored' },
 }
 
 -- CID 351 "order" -> kind (Appendix A).
@@ -6149,6 +6152,7 @@ function LineFaultKind(faultId)
   if faultId == 6 or faultId == 7 then return 'phone' end
   if faultId >= 39 and faultId <= 56 then return 'gsm' end
   if faultId == 57 or faultId == 58 then return 'network' end
+  if faultId >= 30 and faultId <= 38 and faultId ~= 34 and faultId ~= 37 then return 'comm' end
   return nil
 end
 
@@ -6373,13 +6377,9 @@ function DispatchEvent(frame)
   end
   if etype == EV_COMM_TROUBLE then
     local isNew = (qualifier == QUALIFIER_NEW)
-    LogInfo(isNew and 'Panel communication trouble' or 'Panel communication restored')
-    FireDriverEvent(isNew and 'Communication Trouble' or 'Communication Restored')
-    local channel = STATION_CHANNEL_BY_ORDER[zone]
-    if isNew then
-      FireTrouble('Communication', 'Panel communication trouble' .. (channel and (' (' .. channel .. ')') or ''))
-    end
-    NotifyProxyTrouble('Communication trouble', isNew)
+    -- Shared with the fault-list sync (v49), so a failure seen both ways is
+    -- raised once.
+    SetLineTrouble('comm', isNew, STATION_CHANNEL_BY_ORDER[zone])
     -- The panel just said its link is back: exactly the moment a state query
     -- may have been missed. Ask now rather than wait for the retry timer.
     if not isNew then

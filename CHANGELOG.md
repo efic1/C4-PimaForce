@@ -22,8 +22,9 @@ changes hot-reload.
   arrive when something changes. The driver now reads the panel's fault list
   (parameter 2250) after every verified connect and on *Refresh Troubles*, and
   raises or clears the phone line, GSM and network troubles to match.
-- CID 350 (CMS path) now names the failed channel (PSTN, GPRS, GSM voice,
-  network) in `ALERT_TEXT`.
+- A failed report to the monitoring station (CID 350, faults 30-38) is also
+  read from the fault list at connect, and shares one state with the CID 350
+  event so it is raised once. `Communication Trouble` / `Restored` unchanged.
 
 ---
 

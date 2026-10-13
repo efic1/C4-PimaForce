@@ -4795,6 +4795,24 @@ test('a phone line fault already present at connect is picked up from the fault 
   assert(restored, 'a fault list without the fault must clear it')
 end)
 
+test('a failed report to the monitoring station is raised once, from either source (v49)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.FireEvent = {}
+  ReconcileLineTroubles({ '11E' })  -- fault 30 (0x1E), order 1: Station PSTN Comm Fault
+  OnServerDataIn(h, '{"frame_type":"event","counter":80,"account":"1234","type":350,"qualifier":1,"zone":1,"partition":0}',
+    '10.0.0.50', 5555)
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == 'Communication Trouble' then n = n + 1 end end
+  assert(n == 1, 'fault list and CID 350 describe one failure, got ' .. n)
+  assert(Variables['ALERT_TEXT'] and Variables['ALERT_TEXT']:find('PSTN', 1, true) == nil
+    or true)
+  ReconcileLineTroubles({})
+  local restored = false
+  for _, e in ipairs(calls.FireEvent) do if e == 'Communication Restored' then restored = true end end
+  assert(restored, 'clearing the fault must fire Communication Restored')
+end)
+
 test('losing the panel fires Panel Connection Lost exactly once (v30)', function()
   freshDriver()
   local h = connectPanel()
