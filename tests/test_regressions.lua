@@ -2611,6 +2611,38 @@ test('heartbeats add nothing to the Debug trace, and Last Raw Frame In is writte
   assert(writes <= 1, 'Last Raw Frame In written ' .. writes .. ' times in one burst')
 end)
 
+test('a flood of Debug trace lines is capped per second and long lines are cut (v54)', function()
+  freshDriver({ ['Log Level'] = 'Debug' })
+  local now = 1000000
+  C4.GetTime = function() return now end
+  local lines = withCapturedLogs(function()
+    for i = 1, 200 do Dbg('line ' .. i) end
+    Dbg(string.rep('x', 5000))
+    now = now + 1500
+    Dbg('after the window')
+  end)
+  local text = table.concat(lines, '\n')
+  assert(not text:find('line 100', 1, true), 'lines past the cap must not be written')
+  assert(text:find('line 40', 1, true), 'lines up to the cap are written')
+  assert(text:find('debug trace lines skipped', 1, true), 'the skipped lines are counted in one line')
+  assert(text:find('after the window', 1, true), 'tracing resumes in the next second')
+  for _, l in ipairs(lines) do assert(#l < 600, 'a trace line was not cut: ' .. #l) end
+end)
+
+test('Info lines and a password cut by the line limit are never leaked or limited (v54)', function()
+  freshDriver({ ['Log Level'] = 'Debug' })
+  C4.GetTime = function() return 5000000 end
+  local lines = withCapturedLogs(function()
+    for i = 1, 100 do Dbg('noise ' .. i) end
+    LogInfo('important')
+    Dbg(string.rep('y', 385) .. '"password":"123456"')
+  end)
+  local text = table.concat(lines, '\n')
+  assert(text:find('important', 1, true), 'Info is never limited')
+  assert(not text:find('123456', 1, true), 'password leaked')
+  assert(not text:find('"password":"1', 1, true), 'password fragment leaked')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

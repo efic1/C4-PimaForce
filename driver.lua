@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 53
+local DRIVER_VERSION = 54
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -741,8 +741,46 @@ end
 
 local LOG_PREFIX = { [LOG_ERROR] = 'ERROR: ', [LOG_WARN] = 'WARNING: ', [LOG_INFO] = '', [LOG_DEBUG] = '' }
 
+-- Debug-trace limits (v54). Composer's Lua tab and Director's log are both
+-- written for every trace line, and a start-up sync on a house with dozens of
+-- zones produces hundreds of them, some of them whole zone pages, in under a
+-- second. Composer has been seen to stall under that. So a trace line is cut
+-- to DBG_MAX_LINE characters and at most DBG_MAX_PER_SECOND lines are written
+-- in any one second; the rest are counted and reported in a single line.
+-- Info and above are never limited.
+DBG_MAX_LINE = 400
+DBG_MAX_PER_SECOND = 60
+local dbgWindowStart, dbgWindowCount, dbgSuppressed = nil, 0, 0
+
+local function dbgAllowed()
+  local now = nowMs()
+  if not dbgWindowStart or now - dbgWindowStart >= 1000 or now < dbgWindowStart then
+    local skipped = dbgSuppressed
+    dbgWindowStart, dbgWindowCount, dbgSuppressed = now, 0, 0
+    if skipped > 0 then
+      local line = '[PimaForce] (' .. skipped .. ' debug trace lines skipped: more than ' ..
+        DBG_MAX_PER_SECOND .. ' in one second)'
+      print(line)
+      if C4 and C4.DebugLog then pcall(function() C4:DebugLog(line) end) end
+    end
+  end
+  dbgWindowCount = dbgWindowCount + 1
+  if dbgWindowCount > DBG_MAX_PER_SECOND then
+    dbgSuppressed = dbgSuppressed + 1
+    return false
+  end
+  return true
+end
+
 function LogAt(level, msg)
   if level > (LogLevel or LOG_INFO) then return end
+  if level >= LOG_DEBUG then
+    if not dbgAllowed() then return end
+    -- Redact BEFORE cutting: a cut through the middle of a password field
+    -- would leave a fragment the redaction pattern no longer matches.
+    msg = Redact(tostring(msg))
+    if #msg > DBG_MAX_LINE then msg = msg:sub(1, DBG_MAX_LINE) .. '... (+' .. (#msg - DBG_MAX_LINE) .. ' bytes)' end
+  end
   local line = '[PimaForce] ' .. (LOG_PREFIX[level] or '') .. Redact(tostring(msg))
   print(line)
   -- Also to Director's log, so the trace outlives the Lua Output window.

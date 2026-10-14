@@ -10,6 +10,21 @@ changes hot-reload.
 
 ---
 
+## v54 — Debug trace is capped
+
+- **Changed: the Debug trace is limited so Composer is not flooded.** v53 did
+  not stop Composer hanging right after the panel connects, which is when the
+  start-up sync produces its largest burst of trace lines (dozens of zones,
+  some lines carrying whole zone pages). Each line goes to the Lua tab and to
+  Director's log. A trace line is now cut at 400 characters (redaction runs
+  first, so a PIN is never left half-masked) and at most 60 are written per
+  second; a single line says how many were skipped. Info, Warning and Error
+  lines are never limited. Cause not confirmed on a live Composer. If the
+  hang remains the trace is not the cause, and the next step is turning the
+  Debug-only diagnostic properties off.
+
+---
+
 ## v53 — lighter Debug logging
 
 - **Fixed (probable): Composer hanging at Log Level = Debug.** At Debug the
