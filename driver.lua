@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 52
+local DRIVER_VERSION = 56
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -544,6 +544,16 @@ function DetectDC09(text)
   if not token then return nil end
   local account = text:match('#(%w+)')
   return token, account
+end
+
+LAST_RAW_FRAME_MAX = 300
+
+-- One printable-ASCII line of at most `max` characters: every other byte
+-- (NUL padding, Hebrew, newlines) becomes '?', then it is cut.
+function SafeShort(text, max)
+  text = tostring(text):gsub('[^\32-\126]', '?')
+  if #text > max then text = text:sub(1, max) .. '...' end
+  return text
 end
 
 function PrintableBytes(s, limit)
@@ -2309,7 +2319,12 @@ function HandleInboundFrame(handle, frame)
     -- Redacted even though inbound frames should not carry a password:
     -- this property is read and shared by people diagnosing a problem, and
     -- "should not" is not a guarantee about someone else's firmware.
-    SetProp('Last Raw Frame In', Redact(JSON.encode(RedactFrame(frame))))
+    -- Capped and made printable: this property is displayed in Composer's
+    -- property grid only at Debug, and the first answers after a connect are
+    -- whole zone-name pages and fault lists -- several KB each, Hebrew names
+    -- included. Rendering that in one grid cell froze Composer for good (v56).
+    -- Redaction runs first so the cut can never split a password field.
+    SetProp('Last Raw Frame In', SafeShort(Redact(JSON.encode(RedactFrame(frame))), LAST_RAW_FRAME_MAX))
   end
 
   if not isHeartbeat then
