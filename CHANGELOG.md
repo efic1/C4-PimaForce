@@ -10,6 +10,23 @@ changes hot-reload.
 
 ---
 
+## v58 — zone names are made valid XML before Director sees them
+
+- **Fixed (probable): Composer freezing for good right after the panel
+  connects (Log Level Info).** The v57 step markers showed the freeze starts
+  at sending the zone-info document to Control4 (`ALL_ZONES_INFO`). That
+  document carries every zone name, and the escaping only handled `& < > " '`.
+  A control character (NUL padding) or a byte sequence that is not valid UTF-8
+  (Hebrew in an older code page, a name cut mid-character) makes it invalid
+  XML. Names now keep only characters XML allows: control characters are
+  dropped and invalid UTF-8 becomes `?`. Valid Hebrew is untouched.
+- Still printed (temporary): the `step:` lines from v57, and the start of the
+  zone document (first 600 bytes, non-printable bytes shown as `\xNN`) before
+  it is sent. If Composer still freezes, that line shows exactly what was sent.
+  Not confirmed on a live Composer.
+
+---
+
 ## v57 — diagnostic: step markers after the panel connects (temporary)
 
 - **Diagnostic only.** Composer freezes for good right after

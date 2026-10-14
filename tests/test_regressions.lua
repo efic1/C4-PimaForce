@@ -2603,6 +2603,25 @@ test('Last Raw Frame In is short and printable, whatever the panel sends (v56)',
   assert(not seen:find('654321', 1, true), 'password leaked into the property')
 end)
 
+test('zone names reach the zone-info document as valid XML text (v58)', function()
+  freshDriver({ ['Zones Config'] = '1,Front,contact,1' })
+  local function doc(name) Zones[1].name = name; return AllZonesInfoXML() end
+  local d = doc('A' .. string.char(0, 0, 1, 8, 11, 12, 27) .. 'B')
+  assert(d:find('<name>AB</name>', 1, true), 'control characters were not removed: ' .. d)
+  d = doc('X' .. string.char(0xE9, 0xF9) .. 'Y')           -- Hebrew in ISO-8859-8, not UTF-8
+  assert(d:find('<name>X??Y</name>', 1, true), 'invalid UTF-8 was not replaced: ' .. d)
+  local hebrew = string.char(0xD7, 0xA1, 0xD7, 0x9C, 0xD7, 0x95, 0xD7, 0x9F)
+  d = doc(hebrew)
+  assert(d:find('<name>' .. hebrew .. '</name>', 1, true), 'valid Hebrew was altered')
+  d = doc('T' .. string.char(0xD7))                          -- cut in the middle of a character
+  assert(d:find('<name>T?</name>', 1, true), 'a truncated character was not replaced')
+  d = doc('S' .. string.char(0xED, 0xA0, 0x80) .. 'E')       -- lone surrogate
+  assert(not d:find(string.char(0xED), 1, true), 'a surrogate got through')
+  d = doc('tab\there & <b>')
+  assert(d:find('tab\there &amp; &lt;b&gt;', 1, true), 'tab or escaping lost')
+  assert(not d:find('[%z\1-\8\11\12\14-\31]'), 'invalid XML character in the document')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

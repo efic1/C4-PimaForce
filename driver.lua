@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 57
+local DRIVER_VERSION = 58
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -4647,8 +4647,59 @@ end
 -- XML escaping for the panel-proxy info documents below. Zone names come
 -- from the panel (and may be Hebrew, or contain & or <), so they must be
 -- escaped or the whole document fails to parse and the zone list stays empty.
-local function xmlEscape(s)
+-- Returns `s` with only characters XML 1.0 allows: control characters other
+-- than tab/LF/CR are dropped (NUL padding from the panel is the usual one),
+-- and any byte sequence that is not valid UTF-8 (a Hebrew name in an older
+-- code page, a name cut mid-character) becomes '?'. Director's XML parser
+-- does not reject such a document politely -- Composer froze for good on the
+-- zone-info document (v58).
+function ValidXmlText(s)
   s = tostring(s or '')
+  if not s:find('[^\32-\126]') then return s end
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    local len = 0
+    if b < 0x80 then
+      if b >= 32 or b == 9 or b == 10 or b == 13 then out[#out+1] = string.char(b) end
+      i = i + 1
+    else
+      local b2 = s:byte(i + 1)
+      if b >= 0xC2 and b <= 0xDF then len = 2
+      elseif b == 0xE0 then len = (b2 and b2 >= 0xA0 and b2 <= 0xBF) and 3 or 0
+      elseif b == 0xED then len = (b2 and b2 >= 0x80 and b2 <= 0x9F) and 3 or 0
+      elseif b >= 0xE1 and b <= 0xEF then len = 3
+      elseif b == 0xF0 then len = (b2 and b2 >= 0x90 and b2 <= 0xBF) and 4 or 0
+      elseif b >= 0xF1 and b <= 0xF3 then len = 4
+      elseif b == 0xF4 then len = (b2 and b2 >= 0x80 and b2 <= 0x8F) and 4 or 0
+      end
+      local ok = len > 0 and i + len - 1 <= n
+      if ok then
+        for k = i + 1, i + len - 1 do
+          local c = s:byte(k)
+          if c < 0x80 or c > 0xBF then ok = false break end
+        end
+      end
+      if ok then
+        local chunk = s:sub(i, i + len - 1)
+        -- U+FFFE / U+FFFF are not XML characters either.
+        if chunk == '\239\191\190' or chunk == '\239\191\191' then
+          out[#out+1] = '?'
+        else
+          out[#out+1] = chunk
+        end
+        i = i + len
+      else
+        out[#out+1] = '?'
+        i = i + 1
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+local function xmlEscape(s)
+  s = ValidXmlText(s)
   s = s:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
   s = s:gsub('"', '&quot;'):gsub("'", '&apos;')
   return s
@@ -4928,8 +4979,9 @@ function SendPanelInfo(force)
       LastPublishedPartitionState[pid] = st and (st .. '/' .. tostring(at or '')) or nil
     end
   end
-  Step('SendToProxy ALL_ZONES_INFO')
-  C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_ZONES_INFO', AllZonesInfoXML(), 'NOTIFY')
+  local zonesDoc = AllZonesInfoXML()
+  Step('SendToProxy ALL_ZONES_INFO (' .. #zonesDoc .. ' bytes) ' .. PrintableBytes(zonesDoc, 600))
+  C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_ZONES_INFO', zonesDoc, 'NOTIFY')
   Step('PublishZoneInventory')
   -- Sends PANEL_INITIALIZED itself once the queue has drained.
   PublishZoneInventory()
