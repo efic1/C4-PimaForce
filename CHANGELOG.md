@@ -10,6 +10,22 @@ changes hot-reload.
 
 ---
 
+## v52 — the arm-mode question is asked again
+
+- **Fixed: every arm from the app logged "mode query failed: timeout".** Right
+  after the panel reports an arm, the driver asks which mode it armed in. In
+  the field the panel did not answer that question during the exit delay; only
+  the question asked after the delay was answered. The driver took the silence
+  as "armed, mode unknown", showed a bare `Armed` and fired the `Partition N
+  Armed` event seconds into an exit delay that can still be cancelled. It now
+  asks again, up to three times in all (about 5 s apart), before settling for
+  that. A real answer is used as soon as it arrives, so the event carries the
+  right mode. Only a timeout is retried: a refusal (wrong code) or a dropped
+  link falls back at once, as before. Worst case the fallback is about 10 s
+  later than it was.
+
+---
+
 ## v51 — the trouble clear names the trouble
 
 - **Changed: `TROUBLE_CLEAR` now carries `TROUBLE_TEXT`**, the same text as the

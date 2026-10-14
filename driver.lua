@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 51
+local DRIVER_VERSION = 52
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2672,6 +2672,8 @@ function ProcessQueue()
   SendRaw(ConnHandle, JSON.encode(request.frame))
 end
 
+REQUEST_TIMEOUT_ERR = 'timeout waiting for panel response'
+
 function OnTimerExpired(idTimer)
   if RecentActivityFlushTimerId and idTimer == RecentActivityFlushTimerId then
     FlushRecentActivity()
@@ -2704,7 +2706,7 @@ function OnTimerExpired(idTimer)
   if InFlight and InFlight.timerId == idTimer then
     local cb = InFlight.onResult
     ClearInFlight()
-    RunCallback(cb, nil, 'timeout waiting for panel response')
+    RunCallback(cb, nil, REQUEST_TIMEOUT_ERR)
     ProcessQueue()
     return
   end
@@ -3319,6 +3321,10 @@ SYSTEM_KEY_DISARMED = { [2] = true }
 -- of security, whereas claiming "Disarmed" is visible and self-correcting the
 -- moment the panel reports a real arm. Every value is logged, so an unmapped
 -- one can be identified and added rather than silently guessed at forever.
+-- How many times the mode question after an arm event is asked before the
+-- driver settles for a bare "Armed" (v52).
+POST_ARM_QUERY_ATTEMPTS = 3
+
 function QueryPartitionArmState(partitionId, opts)
   opts = opts or {}
   local fireEvents = opts.fireEvents ~= false
@@ -3384,6 +3390,24 @@ function QueryPartitionArmState(partitionId, opts)
         settle(nil)
         ScheduleArmRecheck(partitionId)
       elseif fireEvents then
+        -- Right after an arm the panel often does not answer this query
+        -- (v52): in the field every arm from the app logged "mode query
+        -- failed: timeout" and only the question asked after the exit delay
+        -- was answered. An unanswered question is not an answer, so ask
+        -- again before settling for a bare "Armed" -- which also fires the
+        -- Armed event, seconds into an exit delay that can still be cancelled.
+        -- Only a TIMEOUT is retried: a NAK (wrong code) or a dropped link
+        -- will not be fixed by asking again.
+        local attempt = opts.attempt or 1
+        if err == REQUEST_TIMEOUT_ERR and attempt < POST_ARM_QUERY_ATTEMPTS then
+          LogInfo('Partition ' .. partitionId .. ': the panel did not answer the arm-mode ' ..
+            'question (attempt ' .. attempt .. ' of ' .. POST_ARM_QUERY_ATTEMPTS .. '); asking again')
+          local again = {}
+          for k, v in pairs(opts) do again[k] = v end
+          again.attempt = attempt + 1
+          QueryPartitionArmState(partitionId, again)
+          return
+        end
         apply('Armed', 'mode query failed: ' .. tostring(err or 'no data'))
       else
         -- Say why loudly. A partition stuck on "Unknown" shows as Unknown /
