@@ -2585,6 +2585,32 @@ test('a refused mode question is not asked again (v52)', function()
   assert(Properties['Partition 1 State'] == 'Armed', 'falls back at once, got ' .. tostring(Properties['Partition 1 State']))
 end)
 
+test('heartbeats add nothing to the Debug trace, and Last Raw Frame In is written at most once a second (v53)', function()
+  freshDriver({ ['Log Level'] = 'Debug' })
+  connectPanel()
+  local lines = withCapturedLogs(function()
+    for i = 1, 10 do
+      OnServerDataIn(1, string.format('{"frame_type":"null","account":"1234","counter":%d}', 100 + i), '10.0.0.50', 5555)
+    end
+  end)
+  assert(#lines == 0, 'heartbeats should not be traced, got ' .. #lines .. ' lines: ' .. tostring(lines[1]))
+  local writes = 0
+  local realUpdate = C4.UpdateProperty
+  C4.UpdateProperty = function(self, name, value)
+    if name == 'Last Raw Frame In' then writes = writes + 1 end
+    return realUpdate(self, name, value)
+  end
+  withCapturedLogs(function()
+    for i = 1, 5 do
+      OnServerDataIn(1, string.format(
+        '{"frame_type":"event","counter":%d,"account":"1234","type":130,"qualifier":1,"zone":%d,"partition":1}',
+        200 + i, i), '10.0.0.50', 5555)
+    end
+  end)
+  C4.UpdateProperty = realUpdate
+  assert(writes <= 1, 'Last Raw Frame In written ' .. writes .. ' times in one burst')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

@@ -10,6 +10,19 @@ changes hot-reload.
 
 ---
 
+## v53 — lighter Debug logging
+
+- **Fixed (probable): Composer hanging at Log Level = Debug.** At Debug the
+  driver logged every heartbeat the panel sends (the incoming frame, the raw
+  bytes and our ACK, each written to the Lua tab and to Director's log) and
+  rewrote the visible `Last Raw Frame In` property on every frame. Heartbeats
+  are no longer traced, and `Last Raw Frame In` is written at most once a
+  second. Real frames, their ACKs and every command are traced as before.
+  Not confirmed on a live Composer: if it still hangs, the next suspect is
+  the volume of the start-up sync trace.
+
+---
+
 ## v52 — the arm-mode question is asked again
 
 - **Fixed: every arm from the app logged "mode query failed: timeout".** Right

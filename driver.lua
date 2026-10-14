@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 52
+local DRIVER_VERSION = 53
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2159,7 +2159,10 @@ function HandleServerData(nHandle, strData)
   end
   -- Log the raw bytes BEFORE any parsing. This is the only record of what
   -- the panel actually sent when it turns out not to be the JSON protocol.
-  if DEBUG_ON then
+  -- Not for heartbeats: the panel sends one every few seconds, and each used
+  -- to cost four log writes (two of them to Director) plus a property write,
+  -- all of it landing in the Composer window the person is trying to read.
+  if DEBUG_ON and not IsHeartbeatText(strData) then
     Dbg(string.format('RAW IN (%d bytes): %s', #(strData or ''), PrintableBytes(strData)))
   end
 
@@ -2243,9 +2246,15 @@ end
 -- install looks like. So try the handle-based form first (consistent with
 -- the connection callback's observed layout), fall back to the
 -- server-object form, and remember whichever worked.
-function SendRaw(handle, text)
+-- A heartbeat or its ACK is a lone frame whose type is `null` / `ACK` with no
+-- DATA. Matching the text keeps this off the JSON decoder.
+function IsHeartbeatText(text)
+  return type(text) == 'string' and #text < 120 and text:find('"frame_type"%s*:%s*"null"') ~= nil
+end
+
+function SendRaw(handle, text, quiet)
   -- Dbg() redacts, so the user code in this frame never reaches the log.
-  Dbg('>>> ' .. text)
+  if not quiet then Dbg('>>> ' .. text) end
 
   local attempts = {
     { name = 'ServerSend(handle, data)',
@@ -2305,7 +2314,11 @@ function HandleInboundFrame(handle, frame)
   -- Only mirror real frames into the diagnostic property, and only while
   -- debugging: heartbeats arrive every few seconds forever, and each write
   -- is a Director property update.
-  if not isHeartbeat and DEBUG_ON then
+  -- At most once a second: a burst of frames (the start-up sync is dozens)
+  -- would otherwise rewrite a property Composer is displaying that many times.
+  local rawNow = nowMs()
+  if not isHeartbeat and DEBUG_ON and (rawNow - (LastRawFrameWriteMs or -1e12)) >= 1000 then
+    LastRawFrameWriteMs = rawNow
     -- Redacted even though inbound frames should not carry a password:
     -- this property is read and shared by people diagnosing a problem, and
     -- "should not" is not a guarantee about someone else's firmware.
@@ -2327,7 +2340,7 @@ function HandleInboundFrame(handle, frame)
   -- An ACK discloses nothing, so sending it before verification is safe;
   -- verification below still gates everything that actually matters.
   if shouldAck(frame) then
-    SendRaw(handle, JSON.encode(buildAck(frame)))
+    SendRaw(handle, JSON.encode(buildAck(frame)), isHeartbeat)
   end
 
   -- Verify the connecting client is our configured panel account on the
