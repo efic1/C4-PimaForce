@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 58
+local DRIVER_VERSION = 59
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -1497,6 +1497,47 @@ function MinimalOverrides(parsed, store)
   return out
 end
 
+-- The panel names every unused zone slot "Zone N" ("אזור N" on a Hebrew
+-- panel), so a walk of its name list returns up to 144 entries on a house
+-- with 35 real zones. Those placeholders must never become zones in the app:
+-- on a 35-zone house the driver ended up holding 144, and the zone-info
+-- document it sends Director was three times the size it should be, which
+-- froze Composer right after every connect (v59).
+local PLACEHOLDER_WORDS = {
+  'zone',
+  string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8),   -- אזור
+  string.char(0xD7, 0xA8, 0xD7, 0x95, 0xD7, 0x96, 0xD7, 0x90),   -- the same word reversed
+}
+
+function IsPlaceholderZoneName(zone, name)
+  local bare = tostring(name or ''):gsub('%s+', ''):lower()
+  for _, word in ipairs(PLACEHOLDER_WORDS) do
+    if bare == word .. tostring(zone) or bare == tostring(zone) .. word then return true end
+  end
+  return false
+end
+
+-- Drops zones that were added from the panel under a placeholder name, so a
+-- store written by an earlier version is cleaned on the next load. Never
+-- touches a zone you named, imported, renamed in the app or mentioned in
+-- Zones Config.
+function PrunePlaceholderZones(configText)
+  local mentioned = parseZones(configText or '')
+  local dropped = 0
+  for z, e in pairs(ZoneStore) do
+    if e.from == 'panel' and not mentioned[z] and IsPlaceholderZoneName(z, e.name) then
+      ZoneStore[z] = nil
+      dropped = dropped + 1
+    end
+  end
+  if dropped > 0 then
+    LogInfo('Zones: removed ' .. dropped .. ' unused zone(s) the panel lists under a ' ..
+      'placeholder name ("Zone N"). Name a zone on the panel and it is added automatically.')
+    SaveZoneStore()
+  end
+  return dropped
+end
+
 function InitZoneStore()
   ZoneStore = {}
   ZonePersistence = (C4 and C4.PersistGetValue and C4.PersistSetValue) and true or false
@@ -1572,6 +1613,7 @@ function InitZoneStore()
   else
     SaveZoneStore()
   end
+  PrunePlaceholderZones(configText)
   if ZoneMigrationMode == nil then
     -- A fresh install: nothing to migrate, and nothing to migrate later.
     PersistSet(ZONE_MIGRATION_KEY, 'done')
@@ -6799,7 +6841,7 @@ function FinishZoneDiscovery(acc, complete, opts)
     -- Adds only. A zone already in the store keeps its name: it may be one
     -- the installer corrected by hand (reversed Hebrew, a clearer label),
     -- and the panel re-reporting its own text must never undo that.
-    if not ZoneStore[r.zone] then
+    if not ZoneStore[r.zone] and not IsPlaceholderZoneName(r.zone, r.name) then
       ZoneStore[r.zone] = { name = r.name, from = 'panel' }
       added[#added + 1] = r.zone
     end

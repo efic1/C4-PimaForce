@@ -2622,6 +2622,47 @@ test('zone names reach the zone-info document as valid XML text (v58)', function
   assert(not d:find('[%z\1-\8\11\12\14-\31]'), 'invalid XML character in the document')
 end)
 
+test('placeholder zone names are recognised in English, Hebrew and reversed (v59)', function()
+  freshDriver({})
+  local heb = string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8)
+  assert(IsPlaceholderZoneName(36, 'Zone 36') and IsPlaceholderZoneName(36, 'zone36'))
+  assert(IsPlaceholderZoneName(36, heb .. '36') and IsPlaceholderZoneName(36, heb .. ' 36 '))
+  assert(not IsPlaceholderZoneName(36, 'Zone 37'), 'another zone number is a real name')
+  assert(not IsPlaceholderZoneName(5, 'Garage'))
+  assert(not IsPlaceholderZoneName(5, ''))
+end)
+
+test('zones the panel lists under a placeholder name are not added, and old ones are removed on load (v59)', function()
+  local heb = string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8)
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '5,,motion;40,,hidden'
+  mockC4()
+  local store = {
+    [1] = { name = 'Front', from = 'config' },
+    [5] = { name = 'Kitchen', from = 'panel' },
+    [13] = { name = heb .. '13', from = 'config' },     -- imported placeholder: yours, kept
+    [36] = { name = heb .. '36', from = 'panel' },
+    [37] = { name = 'Zone 37', from = 'panel' },
+    [38] = { name = 'Zone 38', from = 'app' },          -- renamed in the app to its own number: kept
+    [39] = { name = 'Real Name', from = 'panel' },
+  }
+  Persisted[ZONE_STORE_KEY] = EncodeZoneStore(store)
+  Persisted[ZONE_MIGRATION_KEY] = 'PIMATEXT1:done'
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  local logs = withCapturedLogs(function() OnDriverInit(); OnDriverLateInit() end)
+  assert(Zones[1] and Zones[5] and Zones[13] and Zones[38] and Zones[39], 'real and imported zones are kept')
+  assert(not Zones[36] and not Zones[37], 'placeholder zones from the panel are removed')
+  assert(table.concat(logs, '\n'):find('removed 2 unused zone', 1, true), 'the clean-up is logged')
+  -- And the next refresh does not bring them back.
+  FinishZoneDiscovery({ { zone = 36, name = heb .. '36' }, { zone = 41, name = 'Zone 41' },
+    { zone = 42, name = 'Garage Door' } }, true, { auto = true })
+  assert(not ZoneStore[36] and not ZoneStore[41], 'placeholders are not re-added')
+  assert(ZoneStore[42] and ZoneStore[42].name == 'Garage Door', 'a zone named on the panel is added')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

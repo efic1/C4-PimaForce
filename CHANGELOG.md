@@ -10,6 +10,29 @@ changes hot-reload.
 
 ---
 
+## v59 — unused zone slots are no longer added as zones
+
+- **Fixed: Composer freezing for good right after the panel connects.** The
+  panel names every unused zone slot "Zone N" ("אזור N"), so reading its name
+  list returns up to 144 entries on a house with 35 real zones. The driver
+  added all of them as `contact` zones: a "List Zones" showed 144 zones, 109
+  of them placeholders (36 to 144), and the zone-info document sent to
+  Control4 right after verification was about 21 KB instead of about 7 KB.
+  Composer froze while Director handled it (the v57 step markers showed the
+  freeze at that call).
+  - A name that is just the placeholder for its own number ("Zone 36",
+    "אזור36", spaces and reversed text included) is never added from the panel.
+  - On load, zones an earlier version added from the panel under such a name
+    are removed from the zone store (logged once). Zones you named, imported,
+    renamed in the app or mention in Zones Config are never touched, including
+    an imported placeholder such as zone 13.
+  - A zone you name on the panel later is added automatically.
+- Still printed (temporary): the v57 `step:` lines and the zone document
+  start. v58's valid-XML clean-up is kept (harmless; the names were already
+  valid).
+
+---
+
 ## v58 — zone names are made valid XML before Director sees them
 
 - **Fixed (probable): Composer freezing for good right after the panel
