@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 52
+local DRIVER_VERSION = 60
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -546,6 +546,16 @@ function DetectDC09(text)
   return token, account
 end
 
+LAST_RAW_FRAME_MAX = 300
+
+-- One printable-ASCII line of at most `max` characters: every other byte
+-- (NUL padding, Hebrew, newlines) becomes '?', then it is cut.
+function SafeShort(text, max)
+  text = tostring(text):gsub('[^\32-\126]', '?')
+  if #text > max then text = text:sub(1, max) .. '...' end
+  return text
+end
+
 function PrintableBytes(s, limit)
   if type(s) ~= 'string' then return '<not a string>' end
   limit = limit or 240
@@ -767,6 +777,10 @@ function LogBlock(lines)
     if C4 and C4.DebugLog then pcall(function() C4:DebugLog(line) end) end
   end
 end
+
+-- Diagnostic marker (v57): printed BEFORE a step so that if Composer freezes
+-- inside it, the last line left on screen names the step.
+function Step(msg) LogBlock({ 'step: ' .. msg }) end
 
 function LogError(msg) LogAt(LOG_ERROR, msg) end
 function LogWarn(msg)  LogAt(LOG_WARN, msg) end
@@ -1483,6 +1497,47 @@ function MinimalOverrides(parsed, store)
   return out
 end
 
+-- The panel names every unused zone slot "Zone N" ("אזור N" on a Hebrew
+-- panel), so a walk of its name list returns up to 144 entries on a house
+-- with 35 real zones. Those placeholders must never become zones in the app:
+-- on a 35-zone house the driver ended up holding 144, and the zone-info
+-- document it sends Director was three times the size it should be, which
+-- froze Composer right after every connect (v59).
+local PLACEHOLDER_WORDS = {
+  'zone',
+  string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8),   -- אזור
+  string.char(0xD7, 0xA8, 0xD7, 0x95, 0xD7, 0x96, 0xD7, 0x90),   -- the same word reversed
+}
+
+function IsPlaceholderZoneName(zone, name)
+  local bare = tostring(name or ''):gsub('%s+', ''):lower()
+  for _, word in ipairs(PLACEHOLDER_WORDS) do
+    if bare == word .. tostring(zone) or bare == tostring(zone) .. word then return true end
+  end
+  return false
+end
+
+-- Drops zones that were added from the panel under a placeholder name, so a
+-- store written by an earlier version is cleaned on the next load. Never
+-- touches a zone you named, imported, renamed in the app or mentioned in
+-- Zones Config.
+function PrunePlaceholderZones(configText)
+  local mentioned = parseZones(configText or '')
+  local dropped = 0
+  for z, e in pairs(ZoneStore) do
+    if e.from == 'panel' and not mentioned[z] and IsPlaceholderZoneName(z, e.name) then
+      ZoneStore[z] = nil
+      dropped = dropped + 1
+    end
+  end
+  if dropped > 0 then
+    LogInfo('Zones: removed ' .. dropped .. ' unused zone(s) the panel lists under a ' ..
+      'placeholder name ("Zone N"). Name a zone on the panel and it is added automatically.')
+    SaveZoneStore()
+  end
+  return dropped
+end
+
 function InitZoneStore()
   ZoneStore = {}
   ZonePersistence = (C4 and C4.PersistGetValue and C4.PersistSetValue) and true or false
@@ -1558,6 +1613,7 @@ function InitZoneStore()
   else
     SaveZoneStore()
   end
+  PrunePlaceholderZones(configText)
   if ZoneMigrationMode == nil then
     -- A fresh install: nothing to migrate, and nothing to migrate later.
     PersistSet(ZONE_MIGRATION_KEY, 'done')
@@ -2309,7 +2365,12 @@ function HandleInboundFrame(handle, frame)
     -- Redacted even though inbound frames should not carry a password:
     -- this property is read and shared by people diagnosing a problem, and
     -- "should not" is not a guarantee about someone else's firmware.
-    SetProp('Last Raw Frame In', Redact(JSON.encode(RedactFrame(frame))))
+    -- Capped and made printable: this property is displayed in Composer's
+    -- property grid only at Debug, and the first answers after a connect are
+    -- whole zone-name pages and fault lists -- several KB each, Hebrew names
+    -- included. Rendering that in one grid cell froze Composer for good (v56).
+    -- Redaction runs first so the cut can never split a password field.
+    SetProp('Last Raw Frame In', SafeShort(Redact(JSON.encode(RedactFrame(frame))), LAST_RAW_FRAME_MAX))
   end
 
   if not isHeartbeat then
@@ -2376,17 +2437,23 @@ function HandleInboundFrame(handle, frame)
     -- Ask the panel what state everything is actually in. Without this the
     -- driver knows nothing until the next arm/disarm event, so every
     -- partition would sit at OFFLINE on a working system.
+    Step('SyncPartitionStates')
     SyncPartitionStates(true)
+    Step('SyncZoneStates')
     SyncZoneStates()
+    Step('SyncFaults')
     SyncFaults()
+    Step('RefreshExitTime')
     RefreshExitTime()
     -- Once per driver load: learn any zone added at the panel since last
     -- time. Queued after the state sync, so it never delays what the app
     -- shows. Adds only; never renames or removes (see FinishZoneDiscovery).
     if not ZonesAutoRefreshed and ZoneMigrationMode ~= 'off' then
       ZonesAutoRefreshed = true
+      Step('DiscoverZoneNames')
       DiscoverZoneNames({ auto = true })
     end
+    Step('SendPanelInfo')
     -- Re-publish the zone inventory once per session as insurance against
     -- LateInit having run before Director was ready to receive it. Later
     -- reconnects skip it: the inventory does not depend on the panel, and
@@ -4622,8 +4689,59 @@ end
 -- XML escaping for the panel-proxy info documents below. Zone names come
 -- from the panel (and may be Hebrew, or contain & or <), so they must be
 -- escaped or the whole document fails to parse and the zone list stays empty.
-local function xmlEscape(s)
+-- Returns `s` with only characters XML 1.0 allows: control characters other
+-- than tab/LF/CR are dropped (NUL padding from the panel is the usual one),
+-- and any byte sequence that is not valid UTF-8 (a Hebrew name in an older
+-- code page, a name cut mid-character) becomes '?'. Director's XML parser
+-- does not reject such a document politely -- Composer froze for good on the
+-- zone-info document (v58).
+function ValidXmlText(s)
   s = tostring(s or '')
+  if not s:find('[^\32-\126]') then return s end
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    local len = 0
+    if b < 0x80 then
+      if b >= 32 or b == 9 or b == 10 or b == 13 then out[#out+1] = string.char(b) end
+      i = i + 1
+    else
+      local b2 = s:byte(i + 1)
+      if b >= 0xC2 and b <= 0xDF then len = 2
+      elseif b == 0xE0 then len = (b2 and b2 >= 0xA0 and b2 <= 0xBF) and 3 or 0
+      elseif b == 0xED then len = (b2 and b2 >= 0x80 and b2 <= 0x9F) and 3 or 0
+      elseif b >= 0xE1 and b <= 0xEF then len = 3
+      elseif b == 0xF0 then len = (b2 and b2 >= 0x90 and b2 <= 0xBF) and 4 or 0
+      elseif b >= 0xF1 and b <= 0xF3 then len = 4
+      elseif b == 0xF4 then len = (b2 and b2 >= 0x80 and b2 <= 0x8F) and 4 or 0
+      end
+      local ok = len > 0 and i + len - 1 <= n
+      if ok then
+        for k = i + 1, i + len - 1 do
+          local c = s:byte(k)
+          if c < 0x80 or c > 0xBF then ok = false break end
+        end
+      end
+      if ok then
+        local chunk = s:sub(i, i + len - 1)
+        -- U+FFFE / U+FFFF are not XML characters either.
+        if chunk == '\239\191\190' or chunk == '\239\191\191' then
+          out[#out+1] = '?'
+        else
+          out[#out+1] = chunk
+        end
+        i = i + len
+      else
+        out[#out+1] = '?'
+        i = i + 1
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+local function xmlEscape(s)
+  s = ValidXmlText(s)
   s = s:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
   s = s:gsub('"', '&quot;'):gsub("'", '&apos;')
   return s
@@ -4893,6 +5011,7 @@ function SendPanelInfo(force)
   end
   LastInventoryFingerprint = fingerprint
 
+  Step('SendToProxy ALL_PARTITIONS_INFO')
   C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_PARTITIONS_INFO', AllPartitionsInfoXML(), 'NOTIFY')
   -- Record what that document says, so the state-change refresh above does
   -- not immediately send an identical second copy.
@@ -4902,7 +5021,10 @@ function SendPanelInfo(force)
       LastPublishedPartitionState[pid] = st and (st .. '/' .. tostring(at or '')) or nil
     end
   end
-  C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_ZONES_INFO', AllZonesInfoXML(), 'NOTIFY')
+  local zonesDoc = AllZonesInfoXML()
+  Step('SendToProxy ALL_ZONES_INFO (' .. #zonesDoc .. ' bytes) ' .. PrintableBytes(zonesDoc, 600))
+  C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_ZONES_INFO', zonesDoc, 'NOTIFY')
+  Step('PublishZoneInventory')
   -- Sends PANEL_INITIALIZED itself once the queue has drained.
   PublishZoneInventory()
 end
@@ -4965,6 +5087,7 @@ function PublishZoneInventory()
   for pid = 1, MAX_DECLARED_PARTITIONS do
     local binding = PartitionProxyBindingID(pid)
     if binding and Partitions[pid] then
+      Step('CLEAR_ZONE_LIST partition ' .. pid)
       C4:SendToProxy(binding, 'CLEAR_ZONE_LIST', {}, 'NOTIFY')
     end
   end
@@ -5914,12 +6037,11 @@ function SetEventsEnabled(enabled, reason)
 
   if enabled then
     SetProp('Event Notifications', 'Enabled')
-    -- v31-v36 indicated the mute by raising a standing trouble. That is gone,
-    -- but the clear is still sent: a driver updated from one of those
-    -- versions while muted would otherwise leave a phantom "Event
-    -- notifications disabled" trouble in the app with nothing left to clear
-    -- it. Harmless once no such trouble exists.
-    NotifyProxyTrouble('Event notifications disabled', false)
+    -- v31-v36 indicated the mute by raising a standing trouble, and this
+    -- used to send a clear for it on every enable and every driver load.
+    -- That trouble has not existed for many versions, and since v51 the clear
+    -- carries its text, so each reload fired Control4's "Trouble clear" event
+    -- (and a push notification) for a trouble that was never raised (v60).
     if changed then
       LogInfo('Event notifications ENABLED' .. (reason and (' (' .. reason .. ')') or '') ..
         ' -- programming events and notifications resume')
@@ -6718,7 +6840,7 @@ function FinishZoneDiscovery(acc, complete, opts)
     -- Adds only. A zone already in the store keeps its name: it may be one
     -- the installer corrected by hand (reversed Hebrew, a clearer label),
     -- and the panel re-reporting its own text must never undo that.
-    if not ZoneStore[r.zone] then
+    if not ZoneStore[r.zone] and not IsPlaceholderZoneName(r.zone, r.name) then
       ZoneStore[r.zone] = { name = r.name, from = 'panel' }
       added[#added + 1] = r.zone
     end

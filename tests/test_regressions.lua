@@ -2585,6 +2585,97 @@ test('a refused mode question is not asked again (v52)', function()
   assert(Properties['Partition 1 State'] == 'Armed', 'falls back at once, got ' .. tostring(Properties['Partition 1 State']))
 end)
 
+test('Last Raw Frame In is short and printable, whatever the panel sends (v56)', function()
+  freshDriver({ ['Log Level'] = 'Debug' })
+  connectPanel()
+  local seen
+  local realUpdate = C4.UpdateProperty
+  C4.UpdateProperty = function(self, name, value)
+    if name == 'Last Raw Frame In' then seen = value end
+    return realUpdate(self, name, value)
+  end
+  local big = string.rep(string.char(0xD7, 0xA1, 0xD7, 0x9C, 0xD7, 0x95, 0xD7, 0x9F), 400)   -- 1.6 KB of Hebrew
+  OnServerDataIn(1, '{"frame_type":"event","counter":900,"account":"1234","type":130,"qualifier":1,"zone":3,"partition":1,"note":"' .. big .. '","password":"654321"}', '10.0.0.50', 5555)
+  C4.UpdateProperty = realUpdate
+  assert(seen, 'Last Raw Frame In was not written')
+  assert(#seen < 400, 'Last Raw Frame In is ' .. #seen .. ' bytes')
+  assert(not seen:find('[^\32-\126]'), 'Last Raw Frame In holds non-printable bytes')
+  assert(not seen:find('654321', 1, true), 'password leaked into the property')
+end)
+
+test('zone names reach the zone-info document as valid XML text (v58)', function()
+  freshDriver({ ['Zones Config'] = '1,Front,contact,1' })
+  local function doc(name) Zones[1].name = name; return AllZonesInfoXML() end
+  local d = doc('A' .. string.char(0, 0, 1, 8, 11, 12, 27) .. 'B')
+  assert(d:find('<name>AB</name>', 1, true), 'control characters were not removed: ' .. d)
+  d = doc('X' .. string.char(0xE9, 0xF9) .. 'Y')           -- Hebrew in ISO-8859-8, not UTF-8
+  assert(d:find('<name>X??Y</name>', 1, true), 'invalid UTF-8 was not replaced: ' .. d)
+  local hebrew = string.char(0xD7, 0xA1, 0xD7, 0x9C, 0xD7, 0x95, 0xD7, 0x9F)
+  d = doc(hebrew)
+  assert(d:find('<name>' .. hebrew .. '</name>', 1, true), 'valid Hebrew was altered')
+  d = doc('T' .. string.char(0xD7))                          -- cut in the middle of a character
+  assert(d:find('<name>T?</name>', 1, true), 'a truncated character was not replaced')
+  d = doc('S' .. string.char(0xED, 0xA0, 0x80) .. 'E')       -- lone surrogate
+  assert(not d:find(string.char(0xED), 1, true), 'a surrogate got through')
+  d = doc('tab\there & <b>')
+  assert(d:find('tab\there &amp; &lt;b&gt;', 1, true), 'tab or escaping lost')
+  assert(not d:find('[%z\1-\8\11\12\14-\31]'), 'invalid XML character in the document')
+end)
+
+test('placeholder zone names are recognised in English, Hebrew and reversed (v59)', function()
+  freshDriver({})
+  local heb = string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8)
+  assert(IsPlaceholderZoneName(36, 'Zone 36') and IsPlaceholderZoneName(36, 'zone36'))
+  assert(IsPlaceholderZoneName(36, heb .. '36') and IsPlaceholderZoneName(36, heb .. ' 36 '))
+  assert(not IsPlaceholderZoneName(36, 'Zone 37'), 'another zone number is a real name')
+  assert(not IsPlaceholderZoneName(5, 'Garage'))
+  assert(not IsPlaceholderZoneName(5, ''))
+end)
+
+test('zones the panel lists under a placeholder name are not added, and old ones are removed on load (v59)', function()
+  local heb = string.char(0xD7, 0x90, 0xD7, 0x96, 0xD7, 0x95, 0xD7, 0xA8)
+  resetCalls()
+  Properties = {}
+  for k, v in pairs(DEFAULT_PROPS) do Properties[k] = v end
+  Properties['Zones Config'] = '5,,motion;40,,hidden'
+  mockC4()
+  local store = {
+    [1] = { name = 'Front', from = 'config' },
+    [5] = { name = 'Kitchen', from = 'panel' },
+    [13] = { name = heb .. '13', from = 'config' },     -- imported placeholder: yours, kept
+    [36] = { name = heb .. '36', from = 'panel' },
+    [37] = { name = 'Zone 37', from = 'panel' },
+    [38] = { name = 'Zone 38', from = 'app' },          -- renamed in the app to its own number: kept
+    [39] = { name = 'Real Name', from = 'panel' },
+  }
+  Persisted[ZONE_STORE_KEY] = EncodeZoneStore(store)
+  Persisted[ZONE_MIGRATION_KEY] = 'PIMATEXT1:done'
+  dofile('driver.lua')
+  Variables = {}; VariableTypes = {}
+  local logs = withCapturedLogs(function() OnDriverInit(); OnDriverLateInit() end)
+  assert(Zones[1] and Zones[5] and Zones[13] and Zones[38] and Zones[39], 'real and imported zones are kept')
+  assert(not Zones[36] and not Zones[37], 'placeholder zones from the panel are removed')
+  assert(table.concat(logs, '\n'):find('removed 2 unused zone', 1, true), 'the clean-up is logged')
+  -- And the next refresh does not bring them back.
+  FinishZoneDiscovery({ { zone = 36, name = heb .. '36' }, { zone = 41, name = 'Zone 41' },
+    { zone = 42, name = 'Garage Door' } }, true, { auto = true })
+  assert(not ZoneStore[36] and not ZoneStore[41], 'placeholders are not re-added')
+  assert(ZoneStore[42] and ZoneStore[42].name == 'Garage Door', 'a zone named on the panel is added')
+end)
+
+test('loading the driver sends no trouble clear for a trouble that was never raised (v60)', function()
+  freshDriver({})
+  local clears = 0
+  for _, c in ipairs(calls.SendToProxy) do
+    if c.command == 'TROUBLE_CLEAR' or (c[2] == 'TROUBLE_CLEAR') then clears = clears + 1 end
+  end
+  assert(clears == 0, 'a driver load sent ' .. clears .. ' TROUBLE_CLEAR')
+  SetEventsEnabled(true, 'test')
+  for _, c in ipairs(calls.SendToProxy) do
+    assert(c.command ~= 'TROUBLE_CLEAR' and c[2] ~= 'TROUBLE_CLEAR', 'enabling events sent TROUBLE_CLEAR')
+  end
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
@@ -4629,20 +4720,6 @@ test('muting shows on the partition status line, and clears (v37)', function()
   assert(#back > 0 and not tostring(back[#back][3]):find('Notifications OFF'),
     'the line must clear on re-enable, got: ' ..
     tostring(#back > 0 and back[#back][3] or '(nothing sent)'))
-end)
-
-test('re-enabling still clears a v31-v36 mute trouble left by an upgrade', function()
-  -- A driver updated from one of those versions while muted would otherwise
-  -- leave a phantom trouble in the app with nothing left to clear it.
-  freshDriver()
-  connectPanel()
-  calls.SendToProxy = {}
-  SetEventsEnabled(true, 'test')
-  local cleared = false
-  for _, c in ipairs(calls.SendToProxy) do
-    if c[2] == 'TROUBLE_CLEAR' then cleared = true end
-  end
-  assert(cleared, 'the legacy trouble clear must still be sent')
 end)
 
 test('bypassed zones are named on the partition status line (v37)', function()

@@ -10,6 +10,89 @@ changes hot-reload.
 
 ---
 
+## v60 — no "trouble cleared" on every driver load
+
+- **Fixed: a "Trouble cleared" event (and push notification) every time the
+  driver reloaded.** Whenever event notifications were enabled, which includes
+  every driver load, the driver sent Control4 a trouble clear for "Event
+  notifications disabled". That was a clean-up for a standing trouble that
+  versions v31-v36 used to raise and that no longer exists. Since v51 the
+  clear carries its text, so Control4 fired its native Trouble clear event for
+  a trouble that was never raised. The clear is no longer sent. Real trouble
+  clears (phone line, AC, battery, tamper, zone and the rest) are unchanged.
+
+---
+
+## v59 — unused zone slots are no longer added as zones
+
+- **Fixed: Composer freezing for good right after the panel connects.** The
+  panel names every unused zone slot "Zone N" ("אזור N"), so reading its name
+  list returns up to 144 entries on a house with 35 real zones. The driver
+  added all of them as `contact` zones: a "List Zones" showed 144 zones, 109
+  of them placeholders (36 to 144), and the zone-info document sent to
+  Control4 right after verification was about 21 KB instead of about 7 KB.
+  Composer froze while Director handled it (the v57 step markers showed the
+  freeze at that call).
+  - A name that is just the placeholder for its own number ("Zone 36",
+    "אזור36", spaces and reversed text included) is never added from the panel.
+  - On load, zones an earlier version added from the panel under such a name
+    are removed from the zone store (logged once). Zones you named, imported,
+    renamed in the app or mention in Zones Config are never touched, including
+    an imported placeholder such as zone 13.
+  - A zone you name on the panel later is added automatically.
+- Still printed (temporary): the v57 `step:` lines and the zone document
+  start. v58's valid-XML clean-up is kept (harmless; the names were already
+  valid).
+
+---
+
+## v58 — zone names are made valid XML before Director sees them
+
+- **Fixed (probable): Composer freezing for good right after the panel
+  connects (Log Level Info).** The v57 step markers showed the freeze starts
+  at sending the zone-info document to Control4 (`ALL_ZONES_INFO`). That
+  document carries every zone name, and the escaping only handled `& < > " '`.
+  A control character (NUL padding) or a byte sequence that is not valid UTF-8
+  (Hebrew in an older code page, a name cut mid-character) makes it invalid
+  XML. Names now keep only characters XML allows: control characters are
+  dropped and invalid UTF-8 becomes `?`. Valid Hebrew is untouched.
+- Still printed (temporary): the `step:` lines from v57, and the start of the
+  zone document (first 600 bytes, non-printable bytes shown as `\xNN`) before
+  it is sent. If Composer still freezes, that line shows exactly what was sent.
+  Not confirmed on a live Composer.
+
+---
+
+## v57 — diagnostic: step markers after the panel connects (temporary)
+
+- **Diagnostic only.** Composer freezes for good right after
+  `Panel verified`, at Log Level = Info. v53-v56 assumed Debug and were wrong.
+  This build prints one `step: ...` line before each step that runs right
+  after verification (state sync, zone sync, fault sync, exit time, zone
+  discovery, the partition and zone info documents sent to Control4, and
+  clearing each partition's zone list). If Composer freezes, the last `step:`
+  line on screen names the step that hung. Remove once the cause is known.
+
+---
+
+## v56 — Last Raw Frame In can no longer freeze Composer
+
+- **Fixed (probable): Composer freezing for good at Log Level = Debug, right
+  after the panel connects.** At Debug the read-only `Last Raw Frame In`
+  property becomes visible, and the driver wrote the whole text of every
+  frame into it. The first answers after a connect are whole zone-name pages
+  and fault lists, several KB each, with Hebrew names. Composer's property
+  grid has to draw that in a single cell; nothing shows this at Info because
+  the property is hidden there. The value is now one printable line of at most
+  300 characters (anything else becomes `?`), cut after redaction so a PIN is
+  never half-masked. The full frame is still in the Lua trace. Not confirmed
+  on a live Composer.
+- Builds v53, v54 and v55 (trace volume limits) were aimed at the wrong cause
+  and were never released; this version replaces them and has none of their
+  changes.
+
+---
+
 ## v52 — the arm-mode question is asked again
 
 - **Fixed: every arm from the app logged "mode query failed: timeout".** Right
