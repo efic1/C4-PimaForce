@@ -2663,6 +2663,19 @@ test('zones the panel lists under a placeholder name are not added, and old ones
   assert(ZoneStore[42] and ZoneStore[42].name == 'Garage Door', 'a zone named on the panel is added')
 end)
 
+test('loading the driver sends no trouble clear for a trouble that was never raised (v60)', function()
+  freshDriver({})
+  local clears = 0
+  for _, c in ipairs(calls.SendToProxy) do
+    if c.command == 'TROUBLE_CLEAR' or (c[2] == 'TROUBLE_CLEAR') then clears = clears + 1 end
+  end
+  assert(clears == 0, 'a driver load sent ' .. clears .. ' TROUBLE_CLEAR')
+  SetEventsEnabled(true, 'test')
+  for _, c in ipairs(calls.SendToProxy) do
+    assert(c.command ~= 'TROUBLE_CLEAR' and c[2] ~= 'TROUBLE_CLEAR', 'enabling events sent TROUBLE_CLEAR')
+  end
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
@@ -4707,20 +4720,6 @@ test('muting shows on the partition status line, and clears (v37)', function()
   assert(#back > 0 and not tostring(back[#back][3]):find('Notifications OFF'),
     'the line must clear on re-enable, got: ' ..
     tostring(#back > 0 and back[#back][3] or '(nothing sent)'))
-end)
-
-test('re-enabling still clears a v31-v36 mute trouble left by an upgrade', function()
-  -- A driver updated from one of those versions while muted would otherwise
-  -- leave a phantom trouble in the app with nothing left to clear it.
-  freshDriver()
-  connectPanel()
-  calls.SendToProxy = {}
-  SetEventsEnabled(true, 'test')
-  local cleared = false
-  for _, c in ipairs(calls.SendToProxy) do
-    if c[2] == 'TROUBLE_CLEAR' then cleared = true end
-  end
-  assert(cleared, 'the legacy trouble clear must still be sent')
 end)
 
 test('bypassed zones are named on the partition status line (v37)', function()

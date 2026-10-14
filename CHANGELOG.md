@@ -10,6 +10,19 @@ changes hot-reload.
 
 ---
 
+## v60 — no "trouble cleared" on every driver load
+
+- **Fixed: a "Trouble cleared" event (and push notification) every time the
+  driver reloaded.** Whenever event notifications were enabled, which includes
+  every driver load, the driver sent Control4 a trouble clear for "Event
+  notifications disabled". That was a clean-up for a standing trouble that
+  versions v31-v36 used to raise and that no longer exists. Since v51 the
+  clear carries its text, so Control4 fired its native Trouble clear event for
+  a trouble that was never raised. The clear is no longer sent. Real trouble
+  clears (phone line, AC, battery, tamper, zone and the rest) are unchanged.
+
+---
+
 ## v59 — unused zone slots are no longer added as zones
 
 - **Fixed: Composer freezing for good right after the panel connects.** The

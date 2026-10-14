@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 59
+local DRIVER_VERSION = 60
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -6037,12 +6037,11 @@ function SetEventsEnabled(enabled, reason)
 
   if enabled then
     SetProp('Event Notifications', 'Enabled')
-    -- v31-v36 indicated the mute by raising a standing trouble. That is gone,
-    -- but the clear is still sent: a driver updated from one of those
-    -- versions while muted would otherwise leave a phantom "Event
-    -- notifications disabled" trouble in the app with nothing left to clear
-    -- it. Harmless once no such trouble exists.
-    NotifyProxyTrouble('Event notifications disabled', false)
+    -- v31-v36 indicated the mute by raising a standing trouble, and this
+    -- used to send a clear for it on every enable and every driver load.
+    -- That trouble has not existed for many versions, and since v51 the clear
+    -- carries its text, so each reload fired Control4's "Trouble clear" event
+    -- (and a push notification) for a trouble that was never raised (v60).
     if changed then
       LogInfo('Event notifications ENABLED' .. (reason and (' (' .. reason .. ')') or '') ..
         ' -- programming events and notifications resume')
