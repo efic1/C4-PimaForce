@@ -10,6 +10,18 @@ changes hot-reload.
 
 ---
 
+## v57 — diagnostic: step markers after the panel connects (temporary)
+
+- **Diagnostic only.** Composer freezes for good right after
+  `Panel verified`, at Log Level = Info. v53-v56 assumed Debug and were wrong.
+  This build prints one `step: ...` line before each step that runs right
+  after verification (state sync, zone sync, fault sync, exit time, zone
+  discovery, the partition and zone info documents sent to Control4, and
+  clearing each partition's zone list). If Composer freezes, the last `step:`
+  line on screen names the step that hung. Remove once the cause is known.
+
+---
+
 ## v56 — Last Raw Frame In can no longer freeze Composer
 
 - **Fixed (probable): Composer freezing for good at Log Level = Debug, right

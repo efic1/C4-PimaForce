@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 56
+local DRIVER_VERSION = 57
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -777,6 +777,10 @@ function LogBlock(lines)
     if C4 and C4.DebugLog then pcall(function() C4:DebugLog(line) end) end
   end
 end
+
+-- Diagnostic marker (v57): printed BEFORE a step so that if Composer freezes
+-- inside it, the last line left on screen names the step.
+function Step(msg) LogBlock({ 'step: ' .. msg }) end
 
 function LogError(msg) LogAt(LOG_ERROR, msg) end
 function LogWarn(msg)  LogAt(LOG_WARN, msg) end
@@ -2391,17 +2395,23 @@ function HandleInboundFrame(handle, frame)
     -- Ask the panel what state everything is actually in. Without this the
     -- driver knows nothing until the next arm/disarm event, so every
     -- partition would sit at OFFLINE on a working system.
+    Step('SyncPartitionStates')
     SyncPartitionStates(true)
+    Step('SyncZoneStates')
     SyncZoneStates()
+    Step('SyncFaults')
     SyncFaults()
+    Step('RefreshExitTime')
     RefreshExitTime()
     -- Once per driver load: learn any zone added at the panel since last
     -- time. Queued after the state sync, so it never delays what the app
     -- shows. Adds only; never renames or removes (see FinishZoneDiscovery).
     if not ZonesAutoRefreshed and ZoneMigrationMode ~= 'off' then
       ZonesAutoRefreshed = true
+      Step('DiscoverZoneNames')
       DiscoverZoneNames({ auto = true })
     end
+    Step('SendPanelInfo')
     -- Re-publish the zone inventory once per session as insurance against
     -- LateInit having run before Director was ready to receive it. Later
     -- reconnects skip it: the inventory does not depend on the panel, and
@@ -4908,6 +4918,7 @@ function SendPanelInfo(force)
   end
   LastInventoryFingerprint = fingerprint
 
+  Step('SendToProxy ALL_PARTITIONS_INFO')
   C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_PARTITIONS_INFO', AllPartitionsInfoXML(), 'NOTIFY')
   -- Record what that document says, so the state-change refresh above does
   -- not immediately send an identical second copy.
@@ -4917,7 +4928,9 @@ function SendPanelInfo(force)
       LastPublishedPartitionState[pid] = st and (st .. '/' .. tostring(at or '')) or nil
     end
   end
+  Step('SendToProxy ALL_ZONES_INFO')
   C4:SendToProxy(PANEL_PROXY_BINDINGID, 'ALL_ZONES_INFO', AllZonesInfoXML(), 'NOTIFY')
+  Step('PublishZoneInventory')
   -- Sends PANEL_INITIALIZED itself once the queue has drained.
   PublishZoneInventory()
 end
@@ -4980,6 +4993,7 @@ function PublishZoneInventory()
   for pid = 1, MAX_DECLARED_PARTITIONS do
     local binding = PartitionProxyBindingID(pid)
     if binding and Partitions[pid] then
+      Step('CLEAR_ZONE_LIST partition ' .. pid)
       C4:SendToProxy(binding, 'CLEAR_ZONE_LIST', {}, 'NOTIFY')
     end
   end
