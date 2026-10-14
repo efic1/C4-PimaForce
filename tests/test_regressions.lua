@@ -2504,6 +2504,87 @@ test('a failed state sync explains why the partition reads Unknown', function()
     'and must connect it to what the app shows')
 end)
 
+-- v52: the mode question right after an arm -----------------------------------
+
+local function armEvent(h, counter)
+  ClearInFlight(); ResetQueueState(); calls.ServerSend = {}; calls.FireEvent = {}
+  PostOperationGuardUntil = 0
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"event","counter":%d,"account":"1234","type":401,"qualifier":3,"zone":1,"partition":1}', counter),
+    '10.0.0.50', 5555)
+end
+
+local function modeQueriesSent()
+  local n = 0
+  for _, s in ipairs(calls.ServerSend) do
+    local f = JSON.decode(s[2])
+    if f and f.frame_type == 'DATA-REQ' and tonumber(f.id) == 2310 then n = n + 1 end
+  end
+  return n
+end
+
+local function armedEvents()
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e:find('^Partition 1 Armed') then n = n + 1 end end
+  return n
+end
+
+test('an unanswered mode question after an arm is asked again before settling for Armed (v52)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  answerSyncQueries(h, 2)
+  armEvent(h, 3000)
+  assert(modeQueriesSent() == 1, 'the first question')
+  calls.ServerSend = {}
+  PostOperationGuardUntil = 0
+  OnTimerExpired(InFlight.timerId)                   -- the panel does not answer
+  PostOperationGuardUntil = 0
+  ProcessQueue()
+  assert(modeQueriesSent() == 1, 'it must ask again, got ' .. modeQueriesSent())
+  assert(armedEvents() == 0, 'and must not announce Armed on an unanswered question')
+  assert(Properties['Partition 1 State'] == 'Disarmed', 'state unchanged meanwhile, got ' .. tostring(Properties['Partition 1 State']))
+  answerSyncQueries(h, 4)                            -- the second answer: Home1
+  assert(Properties['Partition 1 State'] == 'Armed Stay (Home1)', 'got ' .. tostring(Properties['Partition 1 State']))
+  assert(armedEvents() == 1, 'the Armed event fires once, with the real mode')
+end)
+
+test('three unanswered mode questions fall back to Armed, once (v52)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  answerSyncQueries(h, 2)
+  armEvent(h, 3100)
+  for _ = 1, 3 do
+    PostOperationGuardUntil = 0
+    ProcessQueue()
+    assert(InFlight, 'a question must be outstanding')
+    OnTimerExpired(InFlight.timerId)
+  end
+  assert(Properties['Partition 1 State'] == 'Armed', 'got ' .. tostring(Properties['Partition 1 State']))
+  assert(armedEvents() == 1, 'the fallback fires exactly one Armed event, got ' .. armedEvents())
+  assert(InFlight == nil and #OutQueue == 0, 'and stops asking')
+end)
+
+test('a refused mode question is not asked again (v52)', function()
+  freshDriver({ ['Partitions Config'] = '1,Main,1111,ASN' })
+  local h = connectPanel(1, true)
+  answerSyncQueries(h, 2)
+  armEvent(h, 3200)
+  local req
+  for _, s in ipairs(calls.ServerSend) do
+    local f = JSON.decode(s[2])
+    if f and tonumber(f.id) == 2310 then req = f end
+  end
+  assert(req)
+  calls.ServerSend = {}
+  OnServerDataIn(h, string.format(
+    '{"frame_type":"NAK","account":1234,"counter":%d,"DATA":"Wrong User Code"}', req.counter),
+    '10.0.0.50', 5555)
+  PostOperationGuardUntil = 0
+  ProcessQueue()
+  assert(modeQueriesSent() == 0, 'asking again cannot fix a wrong code')
+  assert(Properties['Partition 1 State'] == 'Armed', 'falls back at once, got ' .. tostring(Properties['Partition 1 State']))
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
