@@ -10,6 +10,22 @@ changes hot-reload.
 
 ---
 
+## v55 — Last Raw Frame In can no longer freeze Composer
+
+- **Fixed (probable): Composer freezing for good at Log Level = Debug, right
+  after the panel connects.** At Debug the read-only `Last Raw Frame In`
+  property becomes visible, and the driver wrote the whole text of every
+  frame into it. The first answers after a connect are whole zone-name pages
+  and fault lists, several KB each, with Hebrew names. Composer's property
+  grid has to draw that in a single cell; nothing shows this at Info because
+  the property is hidden there. The value is now one printable line of at most
+  300 characters (anything else becomes `?`), cut after redaction so a PIN is
+  never half-masked. The full frame is still in the Lua trace. Not confirmed
+  on a live Composer. v53 and v54 (lighter trace) were aimed at the wrong
+  cause: nothing was printed after "Panel verified" when it froze.
+
+---
+
 ## v54 — Debug trace is capped
 
 - **Changed: the Debug trace is limited so Composer is not flooded.** v53 did

@@ -2643,6 +2643,25 @@ test('Info lines and a password cut by the line limit are never leaked or limite
   assert(not text:find('"password":"1', 1, true), 'password fragment leaked')
 end)
 
+test('Last Raw Frame In is short and printable, whatever the panel sends (v55)', function()
+  freshDriver({ ['Log Level'] = 'Debug' })
+  connectPanel()
+  local seen
+  local realUpdate = C4.UpdateProperty
+  C4.UpdateProperty = function(self, name, value)
+    if name == 'Last Raw Frame In' then seen = value end
+    return realUpdate(self, name, value)
+  end
+  LastRawFrameWriteMs = nil   -- the connect above already used this second's write
+  local big = string.rep(string.char(0xD7, 0xA1, 0xD7, 0x9C, 0xD7, 0x95, 0xD7, 0x9F), 400)   -- 1.6 KB of Hebrew
+  OnServerDataIn(1, '{"frame_type":"event","counter":900,"account":"1234","type":130,"qualifier":1,"zone":3,"partition":1,"note":"' .. big .. '","password":"654321"}', '10.0.0.50', 5555)
+  C4.UpdateProperty = realUpdate
+  assert(seen, 'Last Raw Frame In was not written')
+  assert(#seen < 400, 'Last Raw Frame In is ' .. #seen .. ' bytes')
+  assert(not seen:find('[^\32-\126]'), 'Last Raw Frame In holds non-printable bytes')
+  assert(not seen:find('654321', 1, true), 'password leaked into the property')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 54
+local DRIVER_VERSION = 55
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -546,6 +546,14 @@ function DetectDC09(text)
   return token, account
 end
 
+-- One printable-ASCII line of at most `max` characters: every other byte
+-- (NUL padding, Hebrew, newlines) becomes '?', then it is cut.
+function SafeShort(text, max)
+  text = tostring(text):gsub('[^\32-\126]', '?')
+  if #text > max then text = text:sub(1, max) .. '...' end
+  return text
+end
+
 function PrintableBytes(s, limit)
   if type(s) ~= 'string' then return '<not a string>' end
   limit = limit or 240
@@ -748,6 +756,7 @@ local LOG_PREFIX = { [LOG_ERROR] = 'ERROR: ', [LOG_WARN] = 'WARNING: ', [LOG_INF
 -- to DBG_MAX_LINE characters and at most DBG_MAX_PER_SECOND lines are written
 -- in any one second; the rest are counted and reported in a single line.
 -- Info and above are never limited.
+LAST_RAW_FRAME_MAX = 300
 DBG_MAX_LINE = 400
 DBG_MAX_PER_SECOND = 60
 local dbgWindowStart, dbgWindowCount, dbgSuppressed = nil, 0, 0
@@ -2355,12 +2364,17 @@ function HandleInboundFrame(handle, frame)
   -- At most once a second: a burst of frames (the start-up sync is dozens)
   -- would otherwise rewrite a property Composer is displaying that many times.
   local rawNow = nowMs()
-  if not isHeartbeat and DEBUG_ON and (rawNow - (LastRawFrameWriteMs or -1e12)) >= 1000 then
+  if not isHeartbeat and DEBUG_ON and ((rawNow - (LastRawFrameWriteMs or -1e12)) >= 1000 or rawNow < (LastRawFrameWriteMs or 0)) then
     LastRawFrameWriteMs = rawNow
     -- Redacted even though inbound frames should not carry a password:
     -- this property is read and shared by people diagnosing a problem, and
     -- "should not" is not a guarantee about someone else's firmware.
-    SetProp('Last Raw Frame In', Redact(JSON.encode(RedactFrame(frame))))
+    -- Capped and made printable: this property is displayed in Composer's
+    -- property grid only at Debug, and the first answers after a connect are
+    -- whole zone-name pages and fault lists -- several KB each, Hebrew names
+    -- included. Rendering that in one grid cell froze Composer for good (v55).
+    -- Redaction runs first so the cut can never split a password field.
+    SetProp('Last Raw Frame In', SafeShort(Redact(JSON.encode(RedactFrame(frame))), LAST_RAW_FRAME_MAX))
   end
 
   if not isHeartbeat then
