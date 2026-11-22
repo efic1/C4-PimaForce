@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 61
+local DRIVER_VERSION = 62
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2966,6 +2966,7 @@ function ArmModeAllowed(partitionId, mode)
 end
 
 function ArmPartition(partitionId, mode)
+  ClearArmFailed(partitionId)
   local optype = OPTYPE_ARM_AWAY
   if mode == 'stay' then optype = OPTYPE_ARM_HOME1
   elseif mode == 'night' then optype = OPTYPE_ARM_HOME2
@@ -2984,7 +2985,7 @@ function ArmPartition(partitionId, mode)
       -- A failed arm MUST be visible on the native widget. Silently logging
       -- it leaves the shield showing whatever it showed before, so someone
       -- can walk out of the house believing they armed it.
-      NotifyProxyArmFailed(partitionId)
+      ArmFailed(partitionId, 'panel refused the arm: ' .. tostring(err))
     else
       Dbg('Arm (' .. tostring(mode) .. ') partition ' .. partitionId .. ' ACKed')
       SetProp('Last Command Result', 'Arm ' .. tostring(mode) .. ' partition ' .. partitionId .. ' accepted by panel')
@@ -3035,6 +3036,7 @@ function VerifyDisarm(partitionId)
 end
 
 function DisarmPartition(partitionId)
+  ClearArmFailed(partitionId)
   SendOperation(partitionId, OPTYPE_DISARM, 0, nil, function(frame, err)
     if err then
       LogError('Disarm partition ' .. partitionId .. ' failed: ' .. tostring(err))
@@ -3057,7 +3059,7 @@ function ArmAllPartitions()
     if err then
       LogError('Arm All failed: ' .. tostring(err))
       SetProp('Last Command Result', 'Arm All FAILED: ' .. tostring(err))
-      for pid in pairs(Partitions) do NotifyProxyArmFailed(pid) end
+      for pid in pairs(Partitions) do ArmFailed(pid, 'panel refused the arm: ' .. tostring(err)) end
     else
       Dbg('Arm All ACKed')
       for pid in pairs(Partitions) do BeginExitDelay(pid, 'away') end
@@ -3917,6 +3919,7 @@ end
 function SetPartitionState(partitionId, state, isInit)
   local st = PartitionStatusFor(partitionId)
   st.base = state
+  if tostring(state):find('^Armed') then ClearArmFailed(partitionId) end
   -- The panel saying "not armed" (disarmed, unknown, offline) ends any
   -- countdown we are showing: someone pressed Cancel, disarmed at a keypad,
   -- or we lost the link. Saying "armed" does NOT end it -- the panel may
@@ -4166,7 +4169,7 @@ function EndExitDelay(partitionId)
           'at the end of the delay is the usual cause)')
         SetProp('Last Command Result', 'Arm partition ' .. partitionId ..
           ' did not complete after the exit delay')
-        NotifyProxyArmFailed(partitionId)
+        ArmFailed(partitionId, 'still disarmed when the exit delay ended')
       end
     end,
   })
@@ -4430,6 +4433,51 @@ function NotifyProxyTrouble(troubleText, isNew)
       IDENTIFIER = id,
       TROUBLE_TEXT = troubleText,
     }, 'NOTIFY')
+  end
+end
+
+-- Why the last arm of each partition failed, shown on its status line until
+-- the next arm or disarm command, or until the partition is armed (v62).
+ArmFailedText = {}
+
+function OpenZonesForPartition(partitionId)
+  local names = {}
+  for _, z in ipairs(SortedZoneNumbers()) do
+    local st = ZoneState[z]
+    if st and st.open and not st.bypassed and ZonePartition(z) == partitionId then
+      local zcfg = Zones[z]
+      local nm = zcfg and trim(tostring(zcfg.name or '')) or ''
+      names[#names + 1] = (nm ~= '') and nm or ('Zone ' .. z)
+    end
+  end
+  return names
+end
+
+-- An arm that was refused (NAK), went unanswered, or ended disarmed after
+-- the exit delay. Until v62 this only sent ARM_FAILED to the proxy, which
+-- adds a bare "Arm failed" line to History: the app said nothing at the time,
+-- nothing could send a push, and nobody was told the usual reason -- a zone
+-- that is open or in alarm (the panel's own keypad says "bypass first").
+function ArmFailed(partitionId, reason)
+  NotifyProxyArmFailed(partitionId)
+  local open = OpenZonesForPartition(partitionId)
+  local text = 'Arm failed'
+  if #open > 0 then
+    text = text .. ': open ' .. table.concat(open, ', ') .. ' -- bypass to arm'
+  end
+  local full = 'Partition ' .. partitionId .. ': ' .. text ..
+    (reason and reason ~= '' and (' (' .. tostring(reason) .. ')') or '')
+  LogWarn(full)
+  SetDriverVariable('ARM_FAILED_TEXT', full)
+  FireDriverEvent('Arm Failed')
+  ArmFailedText[partitionId] = text
+  NotifyPartitionDisplayText(partitionId)
+end
+
+function ClearArmFailed(partitionId)
+  if ArmFailedText[partitionId] then
+    ArmFailedText[partitionId] = nil
+    NotifyPartitionDisplayText(partitionId)
   end
 end
 
@@ -4941,6 +4989,10 @@ function PartitionStatusText(partitionId)
   -- knowing which door is bypassed.
   if not EventsEnabled then
     parts[#parts + 1] = 'Notifications OFF'
+  end
+
+  if ArmFailedText[partitionId] then
+    parts[#parts + 1] = ArmFailedText[partitionId]
   end
 
   local bypassed = BypassedZonesForPartition(partitionId)
@@ -5893,6 +5945,7 @@ function DeclareDriverVariables()
   -- two are standing.
   add('LAST_CLEARED_TYPE', '', 'STRING')
   add('LAST_CLEARED_TEXT', '', 'STRING')
+  add('ARM_FAILED_TEXT', '', 'STRING')
   add('PANEL_CONNECTED', false, 'BOOL')
   add('EVENTS_ENABLED', true, 'BOOL')
   -- Only for partitions that are actually configured. Declaring all
@@ -6245,7 +6298,7 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     if not mode then
       LogInfo('ReceivedFromProxy: PARTITION_ARM partition ' .. partitionId ..
         ' ArmType=' .. tostring(tParams.ArmType) .. ' is not a recognised arm state; ignoring')
-      NotifyProxyArmFailed(partitionId)
+      ArmFailed(partitionId, 'arm type ' .. tostring(tParams.ArmType) .. ' not supported')
       return
     end
     -- Honour the per-partition `modes` field from Partitions Config. A
@@ -6254,7 +6307,7 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     if not ArmModeAllowed(partitionId, mode) then
       LogWarn('ReceivedFromProxy: partition ' .. partitionId .. ' is not configured for ' ..
         tostring(tParams.ArmType) .. ' (Partitions Config modes); refusing')
-      NotifyProxyArmFailed(partitionId)
+      ArmFailed(partitionId, tostring(tParams.ArmType) .. ' is not enabled in Partitions Config')
       return
     end
     ArmPartition(partitionId, mode)
