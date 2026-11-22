@@ -10,6 +10,24 @@ changes hot-reload.
 
 ---
 
+## v64 — arm failures name the zone in alarm, and say why
+
+- **Fixed: the status line said only "Arm failed".** The driver named open
+  zones only, and a leak sensor in alarm is in alarm, not open, so nothing was
+  named; the panel's reason went to the log only.
+  - Zones in alarm (burglary, fire, panic, medical, duress events with a zone)
+    are now tracked until their restore and named like open zones:
+    `Arm failed: הצפה מזווה -- bypass to arm`.
+  - With no zone to name, the line says what happened: `refused by panel --
+    check zones`, `no reply from panel`, `not armed at end of exit delay --
+    check zones`, `panel not connected`, and so on.
+  - The status line may be up to 96 bytes (was 64) and is never cut through
+    a Hebrew letter.
+- The colour of the line is set by the Control4 app, not the driver: it
+  cannot be made red.
+
+---
+
 ## v63 — a missed state check is not an error
 
 - **Fixed: a misleading ERROR after v61.** When the panel did not answer a
