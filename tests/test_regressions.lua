@@ -2676,6 +2676,141 @@ test('loading the driver sends no trouble clear for a trouble that was never rai
   end
 end)
 
+--=============================================================================
+section('State check with the panel (v61)')
+--=============================================================================
+
+local function countFired(name)
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == name then n = n + 1 end end
+  return n
+end
+
+local function armedWithBurglaryAlarm()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Stay (Home1)')
+  SetPartitionAlarm(1, 'Burglary', true, 'partition')
+  assert(EffectivePartitionState(1) == 'Alarm', 'precondition: partition 1 in alarm')
+  calls.ServerSend = {}
+  calls.FireEvent = {}
+  return h
+end
+
+test('a disarm reported without a partition makes the driver ask, and the answer clears the alarm (v61)', function()
+  local h = armedWithBurglaryAlarm()
+  -- Keypad disarm reported with partition 0 (field case: app stayed on Burglary Alarm).
+  OnServerDataIn(h, '{"frame_type":"event","counter":700,"account":"1234","type":401,"qualifier":1,"zone":1,"partition":0}',
+    '10.0.0.50', 5555)
+  answerSyncQueries(h, 2)
+  assert(PartitionStatusFor(1).base == 'Disarmed', 'panel said disarmed, driver has ' .. tostring(PartitionStatusFor(1).base))
+  assert(EffectivePartitionState(1) == 'Disarmed', 'the burglary alarm must be cleared by the confirmed disarm')
+  assert(countFired('Partition 1 Disarmed') == 1, 'the Disarmed event fires once: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
+test('the periodic state check corrects a partition the driver has wrong (v61)', function()
+  local h = armedWithBurglaryAlarm()
+  assert(StateCheckTimerId, 'the state check is scheduled once the panel is verified')
+  OnTimerExpired(StateCheckTimerId)
+  answerSyncQueries(h, 2)
+  assert(EffectivePartitionState(1) == 'Disarmed', 'periodic check did not correct the state')
+  assert(countFired('Partition 1 Disarmed') == 1, 'a correction fires the partition event')
+  assert(StateCheckTimerId, 'the check is rescheduled')
+end)
+
+test('the periodic state check changes nothing and fires nothing when the driver already agrees (v61)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Disarmed')
+  calls.FireEvent = {}
+  OnTimerExpired(StateCheckTimerId)
+  answerSyncQueries(h, 2)
+  assert(#calls.FireEvent == 0, 'an unchanged state fired: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
+test('the state check leaves a partition alone during an exit delay (v61)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Disarmed')
+  ExitTimeSec = 60
+  BeginExitDelay(1, 'Away')
+  assert(PartitionStatusFor(1).exit, 'precondition: exit delay running')
+  calls.ServerSend = {}
+  CheckPartitionStatesWithPanel('test')
+  for _, s in ipairs(calls.ServerSend) do
+    local f = JSON.decode(s[2])
+    assert(not (f and tonumber(f.id) == 2310 and tonumber(f.start_order) == 1), 'asked about partition 1 mid exit delay')
+  end
+  assert(PartitionStatusFor(1).exit, 'the countdown must survive the check')
+end)
+
+--=============================================================================
+section('Arm failures say why (v62)')
+--=============================================================================
+
+local function nakLastOperation(h, reason)
+  local op
+  for _, s in ipairs(calls.ServerSend) do
+    local f = JSON.decode(s[2])
+    if f and f.frame_type == 'OPERATION' then op = f end
+  end
+  assert(op, 'precondition: an OPERATION was sent')
+  OnServerDataIn(h, string.format('{"frame_type":"NAK","account":"1234","counter":%d,"DATA":"%s"}',
+    op.counter, reason), '10.0.0.50', 5555)
+end
+
+local function lastDisplayText(binding)
+  local text
+  for _, c in ipairs(calls.SendToProxy) do
+    if c[1] == binding and c[2] == 'DISPLAY_TEXT' then text = c[3] end
+  end
+  return text
+end
+
+test('a refused arm names the open zone, fires Arm Failed and shows it on the status line (v62)', function()
+  freshDriver({ ['Zones Config'] = '31,Pantry Leak,leak,1' })
+  local h = connectPanel()
+  NotifyProxyZoneState(31, true, false, 1)
+  calls.FireEvent = {}
+  calls.SendToProxy = {}
+  ArmPartition(1, 'stay')
+  nakLastOperation(h, 'zone open')
+  local failed = 0
+  for _, e in ipairs(calls.FireEvent) do if e == 'Arm Failed' then failed = failed + 1 end end
+  assert(failed == 1, 'Arm Failed must fire once: ' .. table.concat(calls.FireEvent, ' | '))
+  local v = tostring(Variables['ARM_FAILED_TEXT'])
+  assert(v:find('Pantry Leak', 1, true) and v:find('bypass', 1, true), 'variable must name the zone: ' .. v)
+  assert(#proxyCalls(5002, 'ARM_FAILED') == 1, 'the proxy is still told the arm failed')
+  local line = tostring(lastDisplayText(5002))
+  assert(line:find('Arm failed', 1, true) and line:find('Pantry Leak', 1, true), 'status line: ' .. line)
+end)
+
+test('the arm-failed line clears on the next arm attempt (v62)', function()
+  freshDriver({ ['Zones Config'] = '31,Pantry Leak,leak,1' })
+  local h = connectPanel()
+  NotifyProxyZoneState(31, true, false, 1)
+  ArmPartition(1, 'stay')
+  nakLastOperation(h, 'zone open')
+  calls.SendToProxy = {}
+  ArmPartition(1, 'stay')
+  local line = lastDisplayText(5002)
+  assert(line ~= nil and not line:find('Arm failed', 1, true), 'the stale failure must be cleared: ' .. tostring(line))
+end)
+
+test('an arm that ends disarmed after the exit delay also reports Arm Failed (v62)', function()
+  freshDriver()
+  local h = connectPanel()
+  ExitTimeSec = 60
+  SetPartitionState(1, 'Disarmed')
+  BeginExitDelay(1, 'away')
+  calls.FireEvent = {}
+  EndExitDelay(1)
+  answerSyncQueries(h, 2)
+  local failed = 0
+  for _, e in ipairs(calls.FireEvent) do if e == 'Arm Failed' then failed = failed + 1 end end
+  assert(failed == 1, 'Arm Failed after the exit delay: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)

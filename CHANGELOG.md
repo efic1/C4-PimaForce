@@ -10,6 +10,47 @@ changes hot-reload.
 
 ---
 
+## v62 — a failed arm says why
+
+- **Fixed: arming from Control4 with a zone open or in alarm appeared to do
+  nothing.** The panel refuses the arm (its keypad says to bypass first), and
+  the driver only sent Control4 a bare `ARM_FAILED`, which adds an "Arm
+  failed" line to History but shows nothing at the time, cannot trigger a
+  push, and gives no reason.
+  - The partition's status line now reads e.g. `Arm failed: open הצפה מזווה
+    -- bypass to arm`, until the next arm or disarm command or until the
+    partition is armed.
+  - New driver event **Arm Failed** and variable **ARM_FAILED_TEXT** (partition,
+    open zones, and the panel's reason) for a push notification. The event is
+    appended to the end of the list, so existing programming is unaffected.
+  - Covers every way an arm fails: refused by the panel, no reply, still
+    disarmed when the exit delay ends, an arm mode not enabled in Partitions
+    Config. The zones named are those the driver knows to be open and not
+    bypassed in that partition.
+
+---
+
+## v61 — the driver checks the panel's real state
+
+- **Fixed: the app kept showing Armed / Burglary Alarm after the panel was
+  disarmed at its keypad.** Nothing asked the panel again: the only re-check
+  was for a partition whose state was Unknown, and an arm/disarm report
+  without a partition number was dropped on purpose (applying it to a guessed
+  partition could disarm a whole house in Control4).
+  - Such a report now makes the driver ask the panel for each partition's
+    state and apply the answer.
+  - Every 5 minutes the driver also asks the panel for each partition's state.
+    A difference is corrected, logged ("the panel says Disarmed, Control4 had
+    ..."), and fires the partition's event, as if the panel had reported it.
+    A confirmed disarm also clears a burglary alarm.
+  - A partition in an exit delay, with an arm re-check pending, or with an
+    arm/disarm command awaiting the panel is not checked, so a countdown is
+    never cancelled by an early "disarmed".
+- Not confirmed which report the panel sent for the keypad disarm in the field
+  case; the periodic check corrects it within 5 minutes whatever it was.
+
+---
+
 ## v60 — no "trouble cleared" on every driver load
 
 - **Fixed: a "Trouble cleared" event (and push notification) every time the

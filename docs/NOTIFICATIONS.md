@@ -216,6 +216,7 @@ describing what actually happened:
 | --- | --- |
 | `ALERT_TYPE` | `Fire`, `Burglary`, `Tamper`, `AC Power`, `Panel Offline` |
 | `ALERT_TEXT` | `Fire alarm -- Kitchen Smoke`, `Mains power lost` |
+| `ARM_FAILED_TEXT` | `Partition 1: Arm failed: open Pantry Leak -- bypass to arm (panel refused the arm: ...)` — set before the **Arm Failed** event (v62) |
 
 If the Push Notification agent can interpolate a variable into its message,
 those two scripts give fully specific alerts. If it cannot, the detail is one

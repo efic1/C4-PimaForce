@@ -36,7 +36,7 @@ MAX_PARTITIONS = 3
 # MUST MATCH `DRIVER_VERSION` in driver.lua, which logs it at startup so the
 # log proves which build is actually loaded. test_regressions.lua fails if
 # the two drift apart.
-DRIVER_VERSION = 60
+DRIVER_VERSION = 62
 
 # Arm-mode labels, carrying both the Control4-conventional name and PIMA's own
 # name for the same mode (as shown on the panel keypad and in PIMA's
@@ -278,6 +278,8 @@ generic_events = [
     ('Output Activated', 'A panel output (e.g. siren) activated. See Last Output Number.'),
     ('Output Deactivated', 'A panel output deactivated.'),
     ('Unmapped Panel Event', 'A panel event this driver does not have a specific mapping for. See Last Event Type/Qualifier/Zone/Partition or Last Event Summary.'),
+    # Appended, never inserted: event ids are positional and programming binds by id.
+    ('Arm Failed', 'An arm from Control4 was refused or did not complete. ARM_FAILED_TEXT says why and names any open zones.'),
 ]
 for name, desc in generic_events:
     add_event(name, desc)
