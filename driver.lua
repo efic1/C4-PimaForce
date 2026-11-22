@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 63
+local DRIVER_VERSION = 64
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2985,7 +2985,7 @@ function ArmPartition(partitionId, mode)
       -- A failed arm MUST be visible on the native widget. Silently logging
       -- it leaves the shield showing whatever it showed before, so someone
       -- can walk out of the house believing they armed it.
-      ArmFailed(partitionId, 'panel refused the arm: ' .. tostring(err))
+      ArmFailed(partitionId, 'panel refused the arm: ' .. tostring(err), ArmFailShort(err))
     else
       Dbg('Arm (' .. tostring(mode) .. ') partition ' .. partitionId .. ' ACKed')
       SetProp('Last Command Result', 'Arm ' .. tostring(mode) .. ' partition ' .. partitionId .. ' accepted by panel')
@@ -3059,7 +3059,7 @@ function ArmAllPartitions()
     if err then
       LogError('Arm All failed: ' .. tostring(err))
       SetProp('Last Command Result', 'Arm All FAILED: ' .. tostring(err))
-      for pid in pairs(Partitions) do ArmFailed(pid, 'panel refused the arm: ' .. tostring(err)) end
+      for pid in pairs(Partitions) do ArmFailed(pid, 'panel refused the arm: ' .. tostring(err), ArmFailShort(err)) end
     else
       Dbg('Arm All ACKed')
       for pid in pairs(Partitions) do BeginExitDelay(pid, 'away') end
@@ -4184,7 +4184,8 @@ function EndExitDelay(partitionId)
           'at the end of the delay is the usual cause)')
         SetProp('Last Command Result', 'Arm partition ' .. partitionId ..
           ' did not complete after the exit delay')
-        ArmFailed(partitionId, 'still disarmed when the exit delay ended')
+        ArmFailed(partitionId, 'still disarmed when the exit delay ended',
+          'not armed at end of exit delay -- check zones')
       end
     end,
   })
@@ -4459,7 +4460,7 @@ function OpenZonesForPartition(partitionId)
   local names = {}
   for _, z in ipairs(SortedZoneNumbers()) do
     local st = ZoneState[z]
-    if st and st.open and not st.bypassed and ZonePartition(z) == partitionId then
+    if st and (st.open or st.alarm) and not st.bypassed and ZonePartition(z) == partitionId then
       local zcfg = Zones[z]
       local nm = zcfg and trim(tostring(zcfg.name or '')) or ''
       names[#names + 1] = (nm ~= '') and nm or ('Zone ' .. z)
@@ -4473,12 +4474,15 @@ end
 -- adds a bare "Arm failed" line to History: the app said nothing at the time,
 -- nothing could send a push, and nobody was told the usual reason -- a zone
 -- that is open or in alarm (the panel's own keypad says "bypass first").
-function ArmFailed(partitionId, reason)
+function ArmFailed(partitionId, reason, short)
   NotifyProxyArmFailed(partitionId)
   local open = OpenZonesForPartition(partitionId)
   local text = 'Arm failed'
   if #open > 0 then
-    text = text .. ': open ' .. table.concat(open, ', ') .. ' -- bypass to arm'
+    text = text .. ': ' .. table.concat(open, ', ') .. ' -- bypass to arm'
+  elseif short and short ~= '' then
+    -- No zone to name: say what happened instead of a bare "Arm failed" (v64).
+    text = text .. ': ' .. short
   end
   local full = 'Partition ' .. partitionId .. ': ' .. text ..
     (reason and reason ~= '' and (' (' .. tostring(reason) .. ')') or '')
@@ -4487,6 +4491,18 @@ function ArmFailed(partitionId, reason)
   FireDriverEvent('Arm Failed')
   ArmFailedText[partitionId] = text
   NotifyPartitionDisplayText(partitionId)
+end
+
+-- A few words for the status line from the error an arm command got.
+function ArmFailShort(err)
+  local e = tostring(err or '')
+  if e == '' or e == 'unknown' then return 'refused by panel -- check zones' end
+  if e:find('no ACK', 1, true) or e:find('timeout', 1, true) then
+    return 'no reply from panel'
+  end
+  if e:find('no user code', 1, true) then return 'no user code in driver' end
+  if e:find('no verified panel', 1, true) then return 'panel not connected' end
+  return 'refused by panel (' .. e .. ')'
 end
 
 function ClearArmFailed(partitionId)
@@ -4968,7 +4984,7 @@ DISPLAY_TEXT_SEPARATOR = ' | '
 -- Keypad display lines are narrow and this is a status line, not a report:
 -- past roughly this width the app truncates it and the interesting part is
 -- as likely to be the half that got cut.
-DISPLAY_TEXT_MAX = 64
+DISPLAY_TEXT_MAX = 96
 -- Above this many bypassed zones, naming them all is what blows the budget,
 -- so the count replaces the list. The count is the safety-relevant part.
 DISPLAY_TEXT_MAX_NAMED_ZONES = 3
@@ -5021,8 +5037,16 @@ function PartitionStatusText(partitionId)
 
   local text = table.concat(parts, DISPLAY_TEXT_SEPARATOR)
   if #text > DISPLAY_TEXT_MAX then
-    -- Truncating mid-word would be worse than saying so.
-    text = text:sub(1, DISPLAY_TEXT_MAX - 3) .. '...'
+    -- Truncating mid-word would be worse than saying so. Cut on a character
+    -- boundary: a Hebrew zone name is two bytes a letter, and a cut through
+    -- one left an invalid byte on the line (v64).
+    local cut = DISPLAY_TEXT_MAX - 3
+    while cut > 0 do
+      local b = text:byte(cut + 1)
+      if not b or b < 0x80 or b >= 0xC0 then break end
+      cut = cut - 1
+    end
+    text = text:sub(1, cut) .. '...'
   end
   return text
 end
@@ -6313,7 +6337,7 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     if not mode then
       LogInfo('ReceivedFromProxy: PARTITION_ARM partition ' .. partitionId ..
         ' ArmType=' .. tostring(tParams.ArmType) .. ' is not a recognised arm state; ignoring')
-      ArmFailed(partitionId, 'arm type ' .. tostring(tParams.ArmType) .. ' not supported')
+      ArmFailed(partitionId, 'arm type ' .. tostring(tParams.ArmType) .. ' not supported', 'mode not supported')
       return
     end
     -- Honour the per-partition `modes` field from Partitions Config. A
@@ -6322,7 +6346,8 @@ function ReceivedFromProxy(idBinding, sCommand, tParams)
     if not ArmModeAllowed(partitionId, mode) then
       LogWarn('ReceivedFromProxy: partition ' .. partitionId .. ' is not configured for ' ..
         tostring(tParams.ArmType) .. ' (Partitions Config modes); refusing')
-      ArmFailed(partitionId, tostring(tParams.ArmType) .. ' is not enabled in Partitions Config')
+      ArmFailed(partitionId, tostring(tParams.ArmType) .. ' is not enabled in Partitions Config',
+        tostring(tParams.ArmType) .. ' not enabled in driver')
       return
     end
     ArmPartition(partitionId, mode)
@@ -6663,6 +6688,10 @@ function DispatchEvent(frame)
   -- produce no event and no state change at all.
   if etype == EV_BURGLARY then
     local isNew = (qualifier == QUALIFIER_NEW)
+    -- Remember which zone is in alarm (v64): the panel refuses to arm while a
+    -- zone is in alarm, and naming it is the only useful thing an arm-failed
+    -- message can say. A leak sensor in alarm is "in alarm", not "open".
+    if zone > 0 then ZoneStateFor(zone).alarm = isNew or nil end
     local targets = PartitionTargets(partition)
     if #targets == 0 then
       -- An intrusion alarm must never vanish silently, but nor should it be
@@ -6717,6 +6746,7 @@ function DispatchEvent(frame)
       Police = { 'Duress Alarm', 'Duress Alarm Restored' },
     }
     local isNew = (qualifier == QUALIFIER_NEW)
+    if zone > 0 then ZoneStateFor(zone).alarm = isNew or nil end
     LogInfo((isNew and (emergency:upper() .. ' ALARM') or (emergency .. ' alarm restored')) ..
       ' -- partition ' .. tostring(partition) .. (zone > 0 and (', zone ' .. zone) or ''))
     FireDriverEvent(isNew and names[emergency][1] or names[emergency][2])

@@ -2839,6 +2839,50 @@ test('a failed state query on a known partition does not claim it reads Offline 
   assert(text:find('Disarmed', 1, true), 'the message names the state that stands')
 end)
 
+test('an arm refused while a zone is in alarm names that zone (v64)', function()
+  local heb = string.char(0xD7,0x94,0xD7,0xA6,0xD7,0xA4,0xD7,0x94,0x20,0xD7,0x9E,0xD7,0x96,0xD7,0x95,0xD7,0x95,0xD7,0x94)
+  freshDriver({ ['Zones Config'] = '31,' .. heb .. ',leak,1' })
+  local h = connectPanel()
+  OnServerDataIn(h, '{"frame_type":"event","counter":801,"account":"1234","type":130,"qualifier":1,"zone":31,"partition":1}',
+    '10.0.0.50', 5555)
+  calls.SendToProxy = {}
+  ArmPartition(1, 'stay')
+  nakLastOperation(h, 'unknown')
+  local line = tostring(lastDisplayText(5002))
+  assert(line:find(heb, 1, true) and line:find('bypass', 1, true), 'zone in alarm must be named: ' .. line)
+  -- Restored: no longer named.
+  OnServerDataIn(h, '{"frame_type":"event","counter":802,"account":"1234","type":130,"qualifier":3,"zone":31,"partition":1}',
+    '10.0.0.50', 5555)
+  assert(#OpenZonesForPartition(1) == 0, 'a restored zone is not in alarm any more')
+end)
+
+test('with no zone to name, the arm-failed line says what happened (v64)', function()
+  freshDriver()
+  local h = connectPanel()
+  calls.SendToProxy = {}
+  ArmPartition(1, 'away')
+  nakLastOperation(h, 'unknown')
+  local line = tostring(lastDisplayText(5002))
+  assert(line ~= 'Arm failed' and line:find('Arm failed: ', 1, true), 'a bare "Arm failed": ' .. line)
+end)
+
+test('the status line is never cut through a Hebrew letter (v64)', function()
+  local letter = string.char(0xD7, 0x90)
+  freshDriver({ ['Zones Config'] = '31,' .. string.rep(letter, 80) .. ',leak,1' })
+  local h = connectPanel()
+  NotifyProxyZoneState(31, true, false, 1)
+  ArmPartition(1, 'stay')
+  nakLastOperation(h, 'x')
+  local line = PartitionStatusText(1)
+  local body = line:sub(1, #line - 3)
+  local last = body:byte(#body)
+  assert(not (last and last >= 0xC0), 'ends on a lead byte')
+  -- every lead byte 0xD7 is followed by a continuation byte
+  for i = 1, #body do
+    if body:byte(i) == 0xD7 then assert(body:byte(i + 1) and body:byte(i + 1) >= 0x80 and body:byte(i + 1) < 0xC0, 'split at ' .. i) end
+  end
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
