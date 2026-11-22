@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 60
+local DRIVER_VERSION = 61
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -2426,6 +2426,7 @@ function HandleInboundFrame(handle, frame)
     end
     PanelVerified = true
     VerifyFailures = 0
+    ScheduleStateCheck()
     SetProp('Connection Status', 'Connected')
     if not PanelWasConnected then
       PanelWasConnected = true
@@ -2762,6 +2763,10 @@ function OnTimerExpired(idTimer)
   end
   if PartitionResyncTimerId and idTimer == PartitionResyncTimerId then
     RunUnknownResync()
+    return
+  end
+  if StateCheckTimerId and idTimer == StateCheckTimerId then
+    RunStateCheck()
     return
   end
   for pid, r in pairs(ArmRecheck) do
@@ -3730,6 +3735,58 @@ function RunUnknownResync()
   for _, pid in ipairs(unknown) do
     QueryPartitionArmState(pid, { fireEvents = false })
   end
+end
+
+--[[ State check (v61).
+  The app showed Armed (then Burglary Alarm) for half an hour after the panel
+  had been disarmed at its keypad. Nothing asked the panel again: the only
+  re-check was for partitions whose state is Unknown, and an arm/disarm
+  report without a partition number was deliberately dropped (applying it
+  to a guessed partition is how one event once disarmed a whole house).
+  Instead of guessing, ASK: check what the panel says about every partition
+  when such a report arrives, and every STATE_CHECK_INTERVAL_S anyway.
+  A change found this way is applied and fires the partition's event, as if
+  the panel had reported it; a confirmed disarm also clears a burglary alarm
+  (SetPartitionState). Skipped for a partition that is in an exit delay, has
+  an arm re-check pending, or while an arm/disarm we sent is unanswered:
+  mid-arm the panel can still say "disarmed", and acting on that would cancel
+  a countdown that is about to complete. ]]
+STATE_CHECK_INTERVAL_S = 300
+StateCheckTimerId = nil
+
+function CheckPartitionStatesWithPanel(reason)
+  if not (ConnHandle and PanelVerified) then return end
+  if next(PendingOperations) ~= nil then
+    Dbg('State check (' .. tostring(reason) .. ') skipped: a command is awaiting the panel')
+    return
+  end
+  for pid in pairs(Partitions) do
+    local st = PartitionStatusFor(pid)
+    if st.exit or ArmRecheck[pid] then
+      Dbg('State check skips partition ' .. pid .. ': arming in progress')
+    else
+      local before = st.base
+      QueryPartitionArmState(pid, { fireEvents = false, onApplied = function(state)
+        if state ~= before and before ~= 'Unknown' then
+          LogInfo('Partition ' .. pid .. ': the panel says ' .. state .. ', Control4 had ' ..
+            tostring(before) .. ' (' .. tostring(reason) .. ') -- corrected')
+          FirePartitionEvent(pid, state)
+        end
+      end })
+    end
+  end
+end
+
+function ScheduleStateCheck()
+  if StateCheckTimerId then return end
+  StateCheckTimerId = C4:AddTimer(STATE_CHECK_INTERVAL_S, 'SECONDS')
+end
+
+function RunStateCheck()
+  StateCheckTimerId = nil
+  if not (ConnHandle and PanelVerified) then return end   -- restarted on the next verify
+  CheckPartitionStatesWithPanel('periodic check')
+  ScheduleStateCheck()
 end
 
 -- Cold sync of every configured partition. Runs when the panel verifies, and
@@ -6511,7 +6568,10 @@ function DispatchEvent(frame)
       -- No partition named: report it rather than guessing which partitions
       -- it applies to. Acting on a guess here changes security state.
       LogInfo('Arm/disarm event with no usable partition (raw: ' ..
-        tostring(frame.partition) .. ') -- not applied to any partition')
+        tostring(frame.partition) .. ') -- asking the panel for each partition\'s state')
+      -- Not applied as reported (that would be a guess); asked instead (v61).
+      CheckPartitionStatesWithPanel((qualifier == QUALIFIER_NEW and 'disarm' or 'arm') ..
+        ' reported without a partition')
       SetProp('Last Event Summary',
         'Arm/disarm event with no partition (type=' .. etype .. ' qualifier=' .. qualifier .. ')')
       FireDriverEvent('Unmapped Panel Event')

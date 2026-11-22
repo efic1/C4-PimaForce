@@ -10,6 +10,27 @@ changes hot-reload.
 
 ---
 
+## v61 — the driver checks the panel's real state
+
+- **Fixed: the app kept showing Armed / Burglary Alarm after the panel was
+  disarmed at its keypad.** Nothing asked the panel again: the only re-check
+  was for a partition whose state was Unknown, and an arm/disarm report
+  without a partition number was dropped on purpose (applying it to a guessed
+  partition could disarm a whole house in Control4).
+  - Such a report now makes the driver ask the panel for each partition's
+    state and apply the answer.
+  - Every 5 minutes the driver also asks the panel for each partition's state.
+    A difference is corrected, logged ("the panel says Disarmed, Control4 had
+    ..."), and fires the partition's event, as if the panel had reported it.
+    A confirmed disarm also clears a burglary alarm.
+  - A partition in an exit delay, with an arm re-check pending, or with an
+    arm/disarm command awaiting the panel is not checked, so a countdown is
+    never cancelled by an early "disarmed".
+- Not confirmed which report the panel sent for the keypad disarm in the field
+  case; the periodic check corrects it within 5 minutes whatever it was.
+
+---
+
 ## v60 — no "trouble cleared" on every driver load
 
 - **Fixed: a "Trouble cleared" event (and push notification) every time the

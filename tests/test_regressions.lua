@@ -2676,6 +2676,74 @@ test('loading the driver sends no trouble clear for a trouble that was never rai
   end
 end)
 
+--=============================================================================
+section('State check with the panel (v61)')
+--=============================================================================
+
+local function countFired(name)
+  local n = 0
+  for _, e in ipairs(calls.FireEvent) do if e == name then n = n + 1 end end
+  return n
+end
+
+local function armedWithBurglaryAlarm()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Armed Stay (Home1)')
+  SetPartitionAlarm(1, 'Burglary', true, 'partition')
+  assert(EffectivePartitionState(1) == 'Alarm', 'precondition: partition 1 in alarm')
+  calls.ServerSend = {}
+  calls.FireEvent = {}
+  return h
+end
+
+test('a disarm reported without a partition makes the driver ask, and the answer clears the alarm (v61)', function()
+  local h = armedWithBurglaryAlarm()
+  -- Keypad disarm reported with partition 0 (field case: app stayed on Burglary Alarm).
+  OnServerDataIn(h, '{"frame_type":"event","counter":700,"account":"1234","type":401,"qualifier":1,"zone":1,"partition":0}',
+    '10.0.0.50', 5555)
+  answerSyncQueries(h, 2)
+  assert(PartitionStatusFor(1).base == 'Disarmed', 'panel said disarmed, driver has ' .. tostring(PartitionStatusFor(1).base))
+  assert(EffectivePartitionState(1) == 'Disarmed', 'the burglary alarm must be cleared by the confirmed disarm')
+  assert(countFired('Partition 1 Disarmed') == 1, 'the Disarmed event fires once: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
+test('the periodic state check corrects a partition the driver has wrong (v61)', function()
+  local h = armedWithBurglaryAlarm()
+  assert(StateCheckTimerId, 'the state check is scheduled once the panel is verified')
+  OnTimerExpired(StateCheckTimerId)
+  answerSyncQueries(h, 2)
+  assert(EffectivePartitionState(1) == 'Disarmed', 'periodic check did not correct the state')
+  assert(countFired('Partition 1 Disarmed') == 1, 'a correction fires the partition event')
+  assert(StateCheckTimerId, 'the check is rescheduled')
+end)
+
+test('the periodic state check changes nothing and fires nothing when the driver already agrees (v61)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Disarmed')
+  calls.FireEvent = {}
+  OnTimerExpired(StateCheckTimerId)
+  answerSyncQueries(h, 2)
+  assert(#calls.FireEvent == 0, 'an unchanged state fired: ' .. table.concat(calls.FireEvent, ' | '))
+end)
+
+test('the state check leaves a partition alone during an exit delay (v61)', function()
+  freshDriver()
+  local h = connectPanel()
+  SetPartitionState(1, 'Disarmed')
+  ExitTimeSec = 60
+  BeginExitDelay(1, 'Away')
+  assert(PartitionStatusFor(1).exit, 'precondition: exit delay running')
+  calls.ServerSend = {}
+  CheckPartitionStatesWithPanel('test')
+  for _, s in ipairs(calls.ServerSend) do
+    local f = JSON.decode(s[2])
+    assert(not (f and tonumber(f.id) == 2310 and tonumber(f.start_order) == 1), 'asked about partition 1 mid exit delay')
+  end
+  assert(PartitionStatusFor(1).exit, 'the countdown must survive the check')
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
