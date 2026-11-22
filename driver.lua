@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 62
+local DRIVER_VERSION = 63
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -3488,10 +3488,25 @@ function QueryPartitionArmState(partitionId, opts)
         -- offline in the Control4 app above the zone list, and without this
         -- there is nothing anywhere explaining that the state query is what
         -- failed.
+        -- The routine state check (v61) asks every 5 minutes about a state
+        -- the driver already knows. A missed answer there changes nothing --
+        -- the known state stands, the next check asks again -- so it is not
+        -- an error, and must not claim the partition is Offline (v63).
+        local base = tostring(PartitionStatusFor(partitionId).base)
+        -- (An Unknown partition has its own retry, RunUnknownResync, which
+        -- reports loudly; the routine check stays quiet either way.)
+        if opts.routine then
+          Dbg('Partition ' .. partitionId .. ': state check unanswered (' ..
+            tostring(err or 'no data') .. '); keeping ' .. base)
+          settle(nil)
+          return
+        end
         local msg = 'Partition ' .. partitionId .. ' state query FAILED (' ..
-          tostring(err or 'no data') .. '). Retrying automatically; until it succeeds ' ..
-          'the partition reads Offline in the app. If it keeps failing, check the ' ..
-          'partition user code in Partitions Config.'
+          tostring(err or 'no data') .. '). Retrying automatically. ' ..
+          (base == 'Unknown'
+            and 'Until it succeeds the partition reads Offline in the app. '
+            or ('The partition keeps its last known state (' .. base .. ') meanwhile. ')) ..
+          'If it keeps failing, check the partition user code in Partitions Config.'
         LogError(msg)
         SetProp('Last Command Result', msg)
         settle(nil)
@@ -3768,7 +3783,7 @@ function CheckPartitionStatesWithPanel(reason)
       Dbg('State check skips partition ' .. pid .. ': arming in progress')
     else
       local before = st.base
-      QueryPartitionArmState(pid, { fireEvents = false, onApplied = function(state)
+      QueryPartitionArmState(pid, { fireEvents = false, routine = true, onApplied = function(state)
         if state ~= before and before ~= 'Unknown' then
           LogInfo('Partition ' .. pid .. ': the panel says ' .. state .. ', Control4 had ' ..
             tostring(before) .. ' (' .. tostring(reason) .. ') -- corrected')

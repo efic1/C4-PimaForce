@@ -10,6 +10,20 @@ changes hot-reload.
 
 ---
 
+## v63 — a missed state check is not an error
+
+- **Fixed: a misleading ERROR after v61.** When the panel did not answer a
+  partition state question, the log said the partition "reads Offline in the
+  app" even when its state was known and nothing had changed. Now:
+  - The 5-minute state check (v61) is silent when unanswered: the known state
+    stands and the next check asks again (Debug trace only).
+  - Any other unanswered state question still logs an error, but only says
+    "Offline" if the partition's state is actually unknown; otherwise it names
+    the state that stands.
+- The cause of the panel not answering is still unknown.
+
+---
+
 ## v62 — a failed arm says why
 
 - **Fixed: arming from Control4 with a zone open or in alarm appeared to do
