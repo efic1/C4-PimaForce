@@ -5985,6 +5985,14 @@ function DeclareDriverVariables()
   add('LAST_CLEARED_TYPE', '', 'STRING')
   add('LAST_CLEARED_TEXT', '', 'STRING')
   add('ARM_FAILED_TEXT', '', 'STRING')
+  -- ORDER IS PART OF THE INTERFACE. Control4 programming refers to a driver
+  -- variable by its id, and the id is the order of declaration here. v51
+  -- (LAST_CLEARED_*) and v62 (ARM_FAILED_TEXT) inserted variables above this
+  -- point, every later id moved by one, and push notifications using
+  -- ${...PARTITION_1_STATE} silently started showing EVENTS_ENABLED. The
+  -- current order is what installed programming is bound to: new variables
+  -- go at the very END of this function, after the partition variables, and
+  -- the regression test pins the order.
   add('PANEL_CONNECTED', false, 'BOOL')
   add('EVENTS_ENABLED', true, 'BOOL')
   -- Only for partitions that are actually configured. Declaring all

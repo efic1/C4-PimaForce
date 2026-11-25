@@ -2883,6 +2883,25 @@ test('the status line is never cut through a Hebrew letter (v64)', function()
   end
 end)
 
+test('driver variables keep their declaration order, so programming ids never shift', function()
+  freshDriver()
+  -- Programming binds variables by id = declaration order. This is the
+  -- v62-v64 order that installed programming is bound to (one configured
+  -- partition). Append new variables at the END; never insert or reorder.
+  local expected = {
+    'ALERT_TEXT', 'ALERT_TYPE', 'LAST_TROUBLE_TEXT', 'LAST_TROUBLE_TYPE',
+    'LAST_CLEARED_TYPE', 'LAST_CLEARED_TEXT', 'ARM_FAILED_TEXT',
+    'PANEL_CONNECTED', 'EVENTS_ENABLED', 'PARTITION_1_STATE', 'PARTITION_1_ARMED',
+  }
+  local got = {}
+  for _, n in ipairs(DriverVariableNames) do
+    if not n:find('^PARTITION_[2-9]') then got[#got + 1] = n end
+  end
+  assert(table.concat(got, ',') == table.concat(expected, ','),
+    'variable order changed:\n  got      ' .. table.concat(got, ',') ..
+    '\n  expected ' .. table.concat(expected, ','))
+end)
+
 test('a successful sync records the raw system key it acted on', function()
   freshDriver()
   local h = connectPanel(1, true)
