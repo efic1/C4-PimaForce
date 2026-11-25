@@ -101,7 +101,7 @@ local QUALIFIER_RESTORE = 3  -- restore / arm
 -- build handed to an installer. Logged at startup so the log itself proves
 -- which build Director actually loaded -- otherwise "my change had no
 -- effect" and "Composer never installed my change" look identical.
-local DRIVER_VERSION = 64
+local DRIVER_VERSION = 65
 
 local MAX_DATA_WRITE_BYTES = 250
 -- Partitions with a dedicated Control4 surface (state property, named events,
@@ -5984,7 +5984,6 @@ function DeclareDriverVariables()
   -- two are standing.
   add('LAST_CLEARED_TYPE', '', 'STRING')
   add('LAST_CLEARED_TEXT', '', 'STRING')
-  add('ARM_FAILED_TEXT', '', 'STRING')
   add('PANEL_CONNECTED', false, 'BOOL')
   add('EVENTS_ENABLED', true, 'BOOL')
   -- Only for partitions that are actually configured. Declaring all
@@ -5998,6 +5997,14 @@ function DeclareDriverVariables()
       add('PARTITION_' .. pid .. '_ARMED', false, 'BOOL')
     end
   end
+  -- ORDER IS PART OF THE INTERFACE (v65). Control4 programming refers to a
+  -- driver variable by its id, and the id is the order of declaration here.
+  -- v51 (LAST_CLEARED_*) and v62 (ARM_FAILED_TEXT) inserted variables in the
+  -- middle, every later id moved by one, and push notifications that used
+  -- ${...PARTITION_1_STATE} silently started showing EVENTS_ENABLED.
+  -- New variables go BELOW this line, at the end, and never anywhere else;
+  -- the regression test pins the order.
+  add('ARM_FAILED_TEXT', '', 'STRING')
   -- Loudly, on purpose. v30 wrapped this in a pcall that logged only at
   -- Debug level, so if variable creation failed the only symptom was
   -- notification text resolving empty, with nothing in the log to explain

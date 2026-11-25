@@ -10,6 +10,22 @@ changes hot-reload.
 
 ---
 
+## v65 — driver variable numbers restored
+
+- **Fixed: push notifications showing the wrong variable after an update.**
+  Control4 programming refers to a driver variable by its number, and the
+  number comes from the order the driver declares its variables. v62 added
+  `ARM_FAILED_TEXT` in the middle of the list, so every later variable moved
+  by one: a push using `PARTITION_1_STATE` started showing `EVENTS_ENABLED`
+  (v51 did the same with `LAST_CLEARED_*`). `ARM_FAILED_TEXT` now comes last,
+  which restores the v51-v61 numbering, and a test fails if a variable is ever
+  inserted anywhere but the end again.
+- **If you re-picked variables in programming after installing v62-v64**, those
+  now point one place off the other way: re-pick them once more. Variables
+  chosen before v62 are correct again.
+
+---
+
 ## v64 — arm failures name the zone in alarm, and say why
 
 - **Fixed: the status line said only "Arm failed".** The driver named open
